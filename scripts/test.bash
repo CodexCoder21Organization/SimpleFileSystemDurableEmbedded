@@ -11,4 +11,7 @@ fi
 
 REPO_PATH=$(cd "$SCRIPT_PATH/.." && pwd)
 CACHE_PATH="$HOME/.aibuildcaches/$(echo "$REPO_PATH" | sed 's|/|_|g')"
+if [ "$#" -eq 0 ]; then
+  set -- --test .
+fi
 "$JAR_PATH" --cache-location "$CACHE_PATH" "$@"
