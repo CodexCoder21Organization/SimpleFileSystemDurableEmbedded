@@ -15,6 +15,7 @@ import simplefilesystem.PathNotFoundException
 import simplefilesystem.PathTypeMismatchException
 import simplefilesystem.QuotaExceededException
 import simplefilesystem.SimpleFileSystem
+import simplefilesystem.SimpleFileSystemException
 import simplefilesystem.SimpleFileSystemManager
 import sql.Database
 import java.io.ByteArrayInputStream
@@ -191,6 +192,7 @@ class DurableSimpleFileSystemManager(
             try {
                 return metadataDatabase.execute(operation)
             } catch (failure: SQLException) {
+                failure.domainFailure()?.let { throw it }
                 if (!failure.hasSqlState(SERIALIZATION_FAILURE_SQL_STATE) || retryCount >= MAX_TRANSACTION_RETRIES) {
                     throw failure
                 }
@@ -206,6 +208,15 @@ class DurableSimpleFileSystemManager(
             current = current.cause
         }
         return false
+    }
+
+    private fun SQLException.domainFailure(): SimpleFileSystemException? {
+        var current: Throwable? = cause
+        while (current != null) {
+            if (current is SimpleFileSystemException) return current
+            current = current.cause
+        }
+        return null
     }
 
     internal fun parseUuid(uuid: String): UUID {

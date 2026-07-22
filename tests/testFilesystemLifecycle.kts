@@ -17,7 +17,6 @@ import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import java.util.UUID
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import simplefilesystem.FilesystemNotFoundException
 import sql.Database
@@ -46,7 +45,8 @@ fun testFilesystemLifecycle() {
             manager.setExpiration(created.uuid, 9_000L)
             assertEquals(9_000L, manager.getExpiration(created.uuid))
             manager.deleteFilesystem(created.uuid)
-            assertFailsWith<FilesystemNotFoundException> { manager.getFilesystemInfo(created.uuid) }
+            val missing = runCatching { manager.getFilesystemInfo(created.uuid) }.exceptionOrNull()
+            assertEquals("simplefilesystem.FilesystemNotFoundException", missing?.javaClass?.name)
         } finally {
             database.close()
         }

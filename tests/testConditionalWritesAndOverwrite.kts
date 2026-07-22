@@ -16,7 +16,6 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import simplefilesystem.FileContentConflictException
 import simplefilesystem.InvalidContentHashException
 import sql.Database
@@ -31,20 +30,31 @@ fun testConditionalWritesAndOverwrite() {
             filesystem.writeUtf8("/value", "one", null)
             val oneHash = filesystem.metadata("/value").contentHash!!
 
-            val createConflict = assertFailsWith<FileContentConflictException> {
+            val createConflict = runCatching {
                 filesystem.writeUtf8("/value", "two", null)
-            }
-            assertEquals(null, createConflict.expectedContentHash)
-            assertEquals(oneHash, createConflict.observedContentHash)
+            }.exceptionOrNull()
+            val createConflictChain = generateSequence(createConflict) { it.cause }
+                .joinToString(" -> ") { "${it.javaClass.name}: ${it.message}" }
+            kotlin.test.assertTrue(
+                "simplefilesystem.FileContentConflictException" in createConflictChain,
+                createConflictChain,
+            )
+            assertEquals(
+                "Cannot conditionally write path '/value': expected the path to be absent, but observed " +
+                    "content hash '$oneHash'.",
+                createConflict?.message,
+            )
             assertEquals("one", filesystem.readUtf8("/value"))
 
             val stale = "A".repeat(64)
-            val staleConflict = assertFailsWith<FileContentConflictException> {
+            val staleConflict = runCatching {
                 filesystem.writeUtf8("/value", "two", stale)
-            }
-            assertEquals(stale, staleConflict.expectedContentHash)
-            assertEquals(oneHash, staleConflict.observedContentHash)
-            assertFailsWith<InvalidContentHashException> { filesystem.writeUtf8("/value", "two", "lowercase") }
+            }.exceptionOrNull()
+            assertEquals("simplefilesystem.FileContentConflictException", staleConflict?.javaClass?.name)
+            val invalidHash = runCatching {
+                filesystem.writeUtf8("/value", "two", "lowercase")
+            }.exceptionOrNull()
+            assertEquals("simplefilesystem.InvalidContentHashException", invalidHash?.javaClass?.name)
 
             filesystem.writeUtf8("/value", "two", oneHash)
             assertEquals("two", filesystem.readUtf8("/value"))

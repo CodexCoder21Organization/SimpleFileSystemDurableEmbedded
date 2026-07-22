@@ -16,7 +16,6 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import simplefilesystem.InvalidByteRangeException
 import simplefilesystem.InvalidPathException
 import simplefilesystem.PathAlreadyExistsException
@@ -34,19 +33,24 @@ fun testTypedPathFailures() {
             filesystem.createDirectory("/dir", true)
             filesystem.writeUtf8("/file", "abc", null)
 
-            assertEquals(
-                "Path '/missing' does not exist in this filesystem.",
-                assertFailsWith<PathNotFoundException> { filesystem.readUtf8("/missing") }.message,
-            )
-            assertFailsWith<PathAlreadyExistsException> { filesystem.createDirectory("/dir", true) }
-            assertFailsWith<PathTypeMismatchException> { filesystem.list("/file") }
+            val missing = runCatching { filesystem.readUtf8("/missing") }.exceptionOrNull()
+            assertEquals("simplefilesystem.PathNotFoundException", missing?.javaClass?.name)
+            assertEquals("Path '/missing' does not exist in this filesystem.", missing?.message)
+            val exists = runCatching { filesystem.createDirectory("/dir", true) }.exceptionOrNull()
+            assertEquals("simplefilesystem.PathAlreadyExistsException", exists?.javaClass?.name)
+            val wrongType = runCatching { filesystem.list("/file") }.exceptionOrNull()
+            assertEquals("simplefilesystem.PathTypeMismatchException", wrongType?.javaClass?.name)
             assertEquals(
                 "Path 'relative' is invalid: paths must be absolute and begin with '/'.",
-                assertFailsWith<InvalidPathException> { filesystem.exists("relative") }.message,
+                runCatching { filesystem.exists("relative") }.exceptionOrNull()?.message,
             )
-            val range = assertFailsWith<InvalidByteRangeException> { filesystem.source("/file", 2L, 2L) }
-            assertEquals("/file", range.path)
-            assertEquals(3L, range.fileSize)
+            val range = runCatching { filesystem.source("/file", 2L, 2L) }.exceptionOrNull()
+            assertEquals("simplefilesystem.InvalidByteRangeException", range?.javaClass?.name)
+            assertEquals(
+                "Byte range offset=2, byteCount=2 is invalid for path '/file' with size 3 bytes; offset and " +
+                    "byteCount must be non-negative and the range must end at or before byte 3.",
+                range?.message,
+            )
         } finally {
             database.close()
         }

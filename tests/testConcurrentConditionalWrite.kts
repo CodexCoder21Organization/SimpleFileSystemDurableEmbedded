@@ -18,7 +18,6 @@ import community.kotlin.clocks.simple.SystemClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import kotlin.test.assertEquals
-import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import simplefilesystem.FileContentConflictException
 import sql.Database
@@ -52,7 +51,8 @@ fun testConcurrentConditionalWrite() {
                 start.countDown()
                 val outcomes = futures.map { it.get() }
                 assertEquals(1, outcomes.count { it.second == null })
-                assertIs<FileContentConflictException>(outcomes.single { it.second != null }.second)
+                val failure = outcomes.single { it.second != null }.second!!
+                assertEquals("simplefilesystem.FileContentConflictException", failure.javaClass.name)
                 assertTrue(filesystem.readUtf8("/value") in setOf("first", "second"))
             } finally {
                 executor.shutdownNow()

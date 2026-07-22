@@ -16,7 +16,6 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
 import simplefilesystem.FilesystemExpiredException
 import simplefilesystem.InvalidFilesystemUuidException
@@ -37,16 +36,21 @@ fun testFilesystemIdentityAndExpiration() {
             assertEquals(setOf(first.uuid, second.uuid), manager.listFilesystems().map { it.uuid }.toSet())
             assertEquals("duplicate description", first.description)
             assertNull(first.owner)
-            assertFailsWith<InvalidMaxSizeBytesException> { manager.createFilesystem("bad", 0L) }
-            assertFailsWith<InvalidFilesystemUuidException> { manager.openFilesystem(first.uuid.uppercase()) }
+            val invalidSize = runCatching { manager.createFilesystem("bad", 0L) }.exceptionOrNull()
+            assertEquals("simplefilesystem.InvalidMaxSizeBytesException", invalidSize?.javaClass?.name)
+            val invalidUuid = runCatching { manager.openFilesystem(first.uuid.uppercase()) }.exceptionOrNull()
+            assertEquals("simplefilesystem.InvalidFilesystemUuidException", invalidUuid?.javaClass?.name)
 
             manager.setExpiration(first.uuid, 5_001L)
             assertEquals(5_001L, manager.getExpiration(first.uuid))
             clock.advanceBy(1L)
-            val expired = assertFailsWith<FilesystemExpiredException> { manager.openFilesystem(first.uuid) }
-            assertEquals(first.uuid, expired.uuid)
-            assertEquals(5_001L, expired.expiresAtMillis)
-            assertEquals(5_001L, expired.observedAtMillis)
+            val expired = runCatching { manager.openFilesystem(first.uuid) }.exceptionOrNull()
+            assertEquals("simplefilesystem.FilesystemExpiredException", expired?.javaClass?.name)
+            assertEquals(
+                "Filesystem '${first.uuid}' expired at epoch millisecond 5001; the attempted operation was " +
+                    "observed at epoch millisecond 5001 and is therefore not allowed.",
+                expired?.message,
+            )
 
             manager.setExpiration(first.uuid, null)
             assertNull(manager.getExpiration(first.uuid))

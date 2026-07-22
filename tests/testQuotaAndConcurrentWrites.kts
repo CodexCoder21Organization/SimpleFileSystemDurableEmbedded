@@ -18,7 +18,6 @@ import community.kotlin.clocks.simple.SystemClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import kotlin.test.assertEquals
-import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import simplefilesystem.QuotaExceededException
 import sql.Database
@@ -51,14 +50,16 @@ fun testQuotaAndConcurrentWrites() {
                 start.countDown()
                 val failures = futures.map { it.get() }
                 assertEquals(1, failures.count { it == null })
-                val quotaFailure = failures.single { it != null }
-                assertIs<QuotaExceededException>(quotaFailure)
-                assertEquals(12L, quotaFailure.maxSizeBytes)
-                assertEquals(8L, quotaFailure.usedBytes)
-                assertEquals(16L, quotaFailure.attemptedUsedBytes)
+                val quotaFailure = failures.single { it != null }!!
+                assertEquals("simplefilesystem.QuotaExceededException", quotaFailure.javaClass.name)
                 assertEquals(8L, manager.getUsedBytes(uuid))
                 assertEquals(1, listOf("/a", "/b").count { filesystem.exists(it) })
-                assertTrue(quotaFailure.message!!.contains("current usage is 8 bytes"))
+                assertEquals(
+                    "Cannot mutate path '${listOf("/a", "/b").single { !filesystem.exists(it) }}': the " +
+                        "filesystem limit is 12 bytes and current usage is 8 bytes, but the mutation would " +
+                        "increase usage to 16 bytes.",
+                    quotaFailure.message,
+                )
             } finally {
                 executor.shutdownNow()
             }

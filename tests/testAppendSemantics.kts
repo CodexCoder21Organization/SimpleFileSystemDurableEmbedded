@@ -16,7 +16,6 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import okio.Buffer
 import okio.buffer
 import simplefilesystem.PathNotFoundException
@@ -30,7 +29,10 @@ fun testAppendSemantics() {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(3L))
             val uuid = manager.createFilesystem("append", 1_000L).uuid
             val filesystem = manager.openFilesystem(uuid)
-            assertFailsWith<PathNotFoundException> { filesystem.appendingWriteUtf8("/log", "x", mustExist = true) }
+            val missing = runCatching {
+                filesystem.appendingWriteUtf8("/log", "x", mustExist = true)
+            }.exceptionOrNull()
+            assertEquals("simplefilesystem.PathNotFoundException", missing?.javaClass?.name)
             filesystem.appendingWriteUtf8("/log", "alpha", mustExist = false)
             filesystem.appendingWriteUtf8("/log", "-beta", mustExist = true)
             filesystem.appendingSink("/log").buffer().use { it.writeUtf8("-gamma") }
