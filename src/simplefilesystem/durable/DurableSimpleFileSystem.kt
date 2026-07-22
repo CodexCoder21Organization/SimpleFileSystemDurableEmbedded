@@ -183,7 +183,6 @@ class DurableSimpleFileSystem internal constructor(
         val normalizedSource = manager.normalizePath(source)
         val normalizedTarget = manager.normalizePath(target)
         if (normalizedTarget == "/") throw InvalidPathException(target, "copy cannot replace the filesystem root.")
-        if (normalizedSource == normalizedTarget) return
         manager.ensureSchema()
         manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = true)
@@ -191,6 +190,7 @@ class DurableSimpleFileSystem internal constructor(
             if (!sourceEntry.isFile) {
                 throw PathTypeMismatchException(normalizedSource, "FILE", sourceEntry.kind)
             }
+            if (normalizedSource == normalizedTarget) return@transactionally
             manager.requireDirectory(transaction, filesystemUuid, manager.parentPath(normalizedTarget), lock = true)
             val targetEntry = manager.findEntry(transaction, filesystemUuid, normalizedTarget, lock = true)
             if (targetEntry?.isDirectory == true) {
@@ -247,7 +247,6 @@ class DurableSimpleFileSystem internal constructor(
                 "atomicMove cannot move or replace the filesystem root.",
             )
         }
-        if (normalizedSource == normalizedTarget) return
         if (normalizedTarget.startsWith("$normalizedSource/") || normalizedSource.startsWith("$normalizedTarget/")) {
             throw InvalidPathException(
                 target,
@@ -258,6 +257,7 @@ class DurableSimpleFileSystem internal constructor(
         manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = true)
             manager.requireEntry(transaction, filesystemUuid, normalizedSource, lock = true)
+            if (normalizedSource == normalizedTarget) return@transactionally
             manager.requireDirectory(transaction, filesystemUuid, manager.parentPath(normalizedTarget), lock = true)
             val moving = subtree(transaction, normalizedSource)
             val replaced = manager.findEntry(transaction, filesystemUuid, normalizedTarget, lock = true)
