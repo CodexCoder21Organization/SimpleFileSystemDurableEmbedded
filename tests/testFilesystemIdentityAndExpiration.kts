@@ -43,6 +43,7 @@ fun testFilesystemIdentityAndExpiration() {
 
             manager.setExpiration(first.uuid, 5_001L)
             assertEquals(5_001L, manager.getExpiration(first.uuid))
+            val handleThatWillExpire = manager.openFilesystem(first.uuid)
             clock.advanceBy(1L)
             val expired = runCatching { manager.openFilesystem(first.uuid) }.exceptionOrNull()
             assertEquals("simplefilesystem.FilesystemExpiredException", expired?.javaClass?.name)
@@ -51,6 +52,11 @@ fun testFilesystemIdentityAndExpiration() {
                     "observed at epoch millisecond 5001 and is therefore not allowed.",
                 expired?.message,
             )
+            val expiredRootNoOp = runCatching {
+                handleThatWillExpire.createDirectories("/", mustCreate = false)
+            }.exceptionOrNull()
+            assertEquals("simplefilesystem.FilesystemExpiredException", expiredRootNoOp?.javaClass?.name)
+            assertEquals(expired?.message, expiredRootNoOp?.message)
 
             manager.setExpiration(first.uuid, null)
             assertNull(manager.getExpiration(first.uuid))
