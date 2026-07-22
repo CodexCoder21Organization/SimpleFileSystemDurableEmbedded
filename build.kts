@@ -22,7 +22,7 @@ val dependencies = listOf(
 
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-embedded:")
 fun buildMaven(): File = buildSimpleKotlinMavenArtifact2(
-    coordinates = "simplefilesystem.durable:simplefilesystem-durable-embedded:0.1.0",
+    coordinates = "simplefilesystem.durable:simplefilesystem-durable-embedded:0.1.1",
     src = File("src"),
     compileDependencies = dependencies,
 )
@@ -37,7 +37,7 @@ val testSupportDependencies = listOf(
 
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-support:")
 fun buildTestSupportMaven(): File = buildSimpleKotlinMavenArtifact2(
-    coordinates = "simplefilesystem.durable:simplefilesystem-durable-test-support:0.1.0",
+    coordinates = "simplefilesystem.durable:simplefilesystem-durable-test-support:0.1.1",
     src = File("test-support"),
     compileDependencies = testSupportDependencies,
 )
