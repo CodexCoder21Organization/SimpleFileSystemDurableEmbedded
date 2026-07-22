@@ -67,26 +67,26 @@ private fun runDurableConformanceArea(area: ConformanceArea, expectedCount: Int)
     assertEquals(expectedCount, result.totalScenarioCount)
 }
 
-fun testConformanceSuiteCockroachBlobstorePrecedenceAndMessages() =
+fun testConformanceSuiteCockroachBlobstorePrecedenceAndMessages(): Unit =
     runDurableConformanceArea(ConformanceArea.PRECEDENCE_AND_MESSAGES, 12)
 
-fun testConformanceSuiteCockroachBlobstoreOperationMatrix() =
+fun testConformanceSuiteCockroachBlobstoreOperationMatrix(): Unit =
     runDurableConformanceArea(ConformanceArea.OPERATION_MATRIX, 12)
 
-fun testConformanceSuiteCockroachBlobstoreContentCas() =
+fun testConformanceSuiteCockroachBlobstoreContentCas(): Unit =
     runDurableConformanceArea(ConformanceArea.CONTENT_CAS, 7)
 
-fun testConformanceSuiteCockroachBlobstoreSnapshotsAndPagination() =
+fun testConformanceSuiteCockroachBlobstoreSnapshotsAndPagination(): Unit =
     runDurableConformanceArea(ConformanceArea.SNAPSHOTS_AND_PAGINATION, 4)
 
-fun testConformanceSuiteCockroachBlobstoreStreaming() =
+fun testConformanceSuiteCockroachBlobstoreStreaming(): Unit =
     runDurableConformanceArea(ConformanceArea.STREAMING, 6)
 
-fun testConformanceSuiteCockroachBlobstoreLifecycle() =
+fun testConformanceSuiteCockroachBlobstoreLifecycle(): Unit =
     runDurableConformanceArea(ConformanceArea.LIFECYCLE, 8)
 
-fun testConformanceSuiteCockroachBlobstoreWatchLog() =
+fun testConformanceSuiteCockroachBlobstoreWatchLog(): Unit =
     runDurableConformanceArea(ConformanceArea.WATCH_LOG, 11)
 
-fun testConformanceSuiteCockroachBlobstoreInlineCodecsAndArithmetic() =
+fun testConformanceSuiteCockroachBlobstoreInlineCodecsAndArithmetic(): Unit =
     runDurableConformanceArea(ConformanceArea.INLINE_CODECS_AND_ARITHMETIC, 9)
