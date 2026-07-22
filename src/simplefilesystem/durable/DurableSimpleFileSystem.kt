@@ -356,6 +356,7 @@ class DurableSimpleFileSystem internal constructor(
     private fun createDirectoriesInternal(path: String, mustCreate: Boolean, recursive: Boolean) {
         val normalized = manager.normalizePath(path)
         if (normalized == "/") {
+            active()
             if (mustCreate) throw PathAlreadyExistsException(normalized)
             return
         }
