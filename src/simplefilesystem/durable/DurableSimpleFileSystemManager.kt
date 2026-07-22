@@ -15,7 +15,6 @@ import simplefilesystem.PathNotFoundException
 import simplefilesystem.PathTypeMismatchException
 import simplefilesystem.QuotaExceededException
 import simplefilesystem.SimpleFileSystem
-import simplefilesystem.SimpleFileSystemException
 import simplefilesystem.SimpleFileSystemManager
 import sql.Database
 import java.io.ByteArrayInputStream
@@ -210,10 +209,10 @@ class DurableSimpleFileSystemManager(
         return false
     }
 
-    private fun SQLException.domainFailure(): SimpleFileSystemException? {
+    private fun SQLException.domainFailure(): RuntimeException? {
         var current: Throwable? = cause
         while (current != null) {
-            if (current is SimpleFileSystemException) return current
+            if (current is RuntimeException && current.javaClass.name in DOMAIN_FAILURE_CLASS_NAMES) return current
             current = current.cause
         }
         return null
@@ -578,5 +577,19 @@ class DurableSimpleFileSystemManager(
         val EXPECTED_HASH = Regex("[0-9A-F]{64}")
         const val SERIALIZATION_FAILURE_SQL_STATE = "40001"
         const val MAX_TRANSACTION_RETRIES = 32
+        val DOMAIN_FAILURE_CLASS_NAMES = setOf(
+            "simplefilesystem.FileContentConflictException",
+            "simplefilesystem.FilesystemExpiredException",
+            "simplefilesystem.FilesystemNotFoundException",
+            "simplefilesystem.InvalidByteRangeException",
+            "simplefilesystem.InvalidContentHashException",
+            "simplefilesystem.InvalidFilesystemUuidException",
+            "simplefilesystem.InvalidMaxSizeBytesException",
+            "simplefilesystem.InvalidPathException",
+            "simplefilesystem.PathAlreadyExistsException",
+            "simplefilesystem.PathNotFoundException",
+            "simplefilesystem.PathTypeMismatchException",
+            "simplefilesystem.QuotaExceededException",
+        )
     }
 }
