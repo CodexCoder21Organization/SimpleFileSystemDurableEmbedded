@@ -2,6 +2,7 @@ package simplefilesystem.durable
 
 import blobstore.api.BlobstoreService
 import community.kotlin.clocks.simple.Clock
+import community.kotlin.clocks.simple.Scheduled
 import community.kotlin.clocks.simple.SystemClock
 import simplefilesystem.FILESYSTEM_DESCRIPTION_MAX_UTF8_BYTES
 import simplefilesystem.FileContentConflictException
@@ -41,9 +42,30 @@ class DurableSimpleFileSystemManager(
     internal val blobstoreService: BlobstoreService,
     internal val metadataDatabase: Database,
     internal val clock: Clock = SystemClock(),
-) : SimpleFileSystemManager {
+    private val sessionLeaseMillis: Long = DEFAULT_SESSION_LEASE_MILLIS,
+    private val maintenanceIntervalMillis: Long? = null,
+    private val maintenanceBatchSize: Int = DEFAULT_MAINTENANCE_BATCH_SIZE,
+) : SimpleFileSystemManager, AutoCloseable {
     @Volatile
     private var schemaReady: Boolean = false
+    @Volatile
+    private var closed: Boolean = false
+    private var scheduledMaintenance: Scheduled? = null
+
+    init {
+        require(sessionLeaseMillis > 0L) {
+            "Write-session lease duration must be positive, but was $sessionLeaseMillis milliseconds."
+        }
+        require(maintenanceIntervalMillis == null || maintenanceIntervalMillis > 0L) {
+            "Background maintenance interval must be positive when enabled, but was $maintenanceIntervalMillis milliseconds."
+        }
+        require(maintenanceBatchSize > 0) {
+            "Maintenance batch size must be positive, but was $maintenanceBatchSize."
+        }
+        ensureSchema()
+        reconcileInterruptedWork(maintenanceBatchSize)
+        if (maintenanceIntervalMillis != null) scheduleNextMaintenance()
+    }
 
     override fun createFilesystem(description: String, maxSizeBytes: Long): FilesystemInfo {
         ensureSchema()
@@ -121,26 +143,8 @@ class DurableSimpleFileSystemManager(
         val parsed = parseUuid(uuid)
         ensureSchema()
         transactionally { transaction ->
-            requireFilesystem(transaction, parsed, lock = true)
-            val entries = transaction.getRows(
-                "SELECT * FROM entries WHERE filesystem_uuid = ? AND entry_kind = 'FILE' FOR UPDATE",
-                parsed,
-            ).map { it.toEntryRecord() }
-            entries.forEach { entry -> entry.generationUuid?.let { releaseGeneration(transaction, it) } }
-            val staged = transaction.getUuids(
-                "SELECT session_uuid FROM write_sessions WHERE filesystem_uuid = ?",
-                parsed,
-            )
-            staged.forEach { generation ->
-                val hashes = transaction.getStrings(
-                    "SELECT blob_hash FROM file_blocks WHERE generation_uuid = ?",
-                    generation,
-                )
-                hashes.forEach { enqueueBlobForGc(transaction, it) }
-                transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", generation)
-            }
-            transaction.execute("DELETE FROM filesystems WHERE uuid = ?", parsed)
-            bumpManagerRevision(transaction)
+            val filesystem = requireFilesystem(transaction, parsed, lock = true)
+            purgeFilesystem(transaction, filesystem)
         }
     }
 
@@ -165,6 +169,92 @@ class DurableSimpleFileSystemManager(
     override fun getMaxSizeBytes(uuid: String): Long = requireFilesystem(parseUuid(uuid)).maxSizeBytes
 
     override fun getUsedBytes(uuid: String): Long = requireFilesystem(parseUuid(uuid)).usedBytes
+
+    /**
+     * Resolves at most [limit] durable Blobstore-unpin intents and returns the number of outbox rows resolved.
+     *
+     * The hash's outbox row is the mutex shared by the collector and every normal block writer. A writer pins
+     * before entering its Cockroach transaction, locks (or creates) that row, pins once more after it owns the
+     * lock, publishes the `file_blocks` reference, and removes the stale GC intent in that same transaction.
+     * The collector locks the same row, checks every `file_blocks` row (committed generations and staged sessions
+     * alike), performs the idempotent unpin only when the count is zero, re-verifies the count, and then removes
+     * the intent. A serialization retry that observes a newly committed reference always re-pins before clearing
+     * the stale intent, compensating for an unpin performed by an earlier transaction attempt.
+     *
+     * Consequently the dangerous `writer pin -> collector unpin -> writer commit` ordering is safe: when the
+     * collector wins the row lock, the waiting writer's post-lock pin repairs the external pin before its SQL
+     * reference commits; when the writer wins, the collector observes that reference and skips unpinning. An
+     * outbox transaction may retry after an external unpin, so Blobstore unpin must remain idempotent, while the
+     * row's deletion makes repeat maintenance calls no-ops after a successful commit.
+     */
+    fun processBlobGcOutbox(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): Int {
+        validateMaintenanceLimit(limit)
+        ensureSchema()
+        val hashes = metadataDatabase.getStrings(
+            "SELECT blob_hash FROM blob_gc_outbox ORDER BY created_at_millis, blob_hash LIMIT ?",
+            limit,
+        )
+        return hashes.count { hash -> resolveBlobGcIntent(hash) }
+    }
+
+    /** Reclaims expired open sessions and explicitly aborted sessions without changing filesystem quota. */
+    fun reapAbandonedWriteSessions(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): Int {
+        validateMaintenanceLimit(limit)
+        ensureSchema()
+        val now = clock.currentTimeMillis()
+        val sessions = metadataDatabase.getUuids(
+            """SELECT session_uuid FROM write_sessions
+                WHERE state = 'ABORTED' OR (state = 'OPEN' AND lease_expires_at_millis <= ?)
+                ORDER BY lease_expires_at_millis, session_uuid LIMIT ?""".trimIndent(),
+            now,
+            limit,
+        )
+        return sessions.count { sessionUuid -> reapSessionIfEligible(sessionUuid, now) }
+    }
+
+    /** Permanently removes filesystems whose expiration has passed, preserving revival until the row is locked. */
+    fun purgeExpiredFilesystems(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): Int {
+        validateMaintenanceLimit(limit)
+        ensureSchema()
+        val now = clock.currentTimeMillis()
+        val filesystems = metadataDatabase.getUuids(
+            """SELECT uuid FROM filesystems
+                WHERE expires_at_millis IS NOT NULL AND expires_at_millis <= ?
+                ORDER BY expires_at_millis, uuid LIMIT ?""".trimIndent(),
+            now,
+            limit,
+        )
+        return filesystems.count { uuid -> purgeFilesystemIfExpired(uuid, now) }
+    }
+
+    /** Reconciles crash leftovers that are safe to resolve at startup; ordinary expiration purge remains explicit. */
+    fun reconcileInterruptedWork(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): MaintenanceResult {
+        validateMaintenanceLimit(limit)
+        val reaped = reapAbandonedWriteSessions(limit)
+        enqueueUnreferencedPinnedBlobs(limit)
+        val resolved = processBlobGcOutbox(limit)
+        return MaintenanceResult(
+            reapedSessions = reaped,
+            purgedFilesystems = 0,
+            resolvedGcIntents = resolved,
+        )
+    }
+
+    /** Runs one bounded pass of every maintenance operation. */
+    fun runMaintenance(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): MaintenanceResult {
+        validateMaintenanceLimit(limit)
+        val reaped = reapAbandonedWriteSessions(limit)
+        val purged = purgeExpiredFilesystems(limit)
+        val resolved = processBlobGcOutbox(limit)
+        return MaintenanceResult(reaped, purged, resolved)
+    }
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        scheduledMaintenance?.cancel()
+        scheduledMaintenance = null
+    }
 
     internal fun ensureSchema() {
         if (schemaReady) return
@@ -231,8 +321,12 @@ class DurableSimpleFileSystemManager(
                     expected_hash STRING NULL,
                     bytes_received INT8 NOT NULL,
                     created_at_millis INT8 NOT NULL,
-                    state STRING NOT NULL
+                    lease_expires_at_millis INT8 NOT NULL,
+                    state STRING NOT NULL CHECK (state IN ('OPEN', 'COMMITTED', 'ABORTED', 'REAPED'))
                 )""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                "CREATE INDEX IF NOT EXISTS write_sessions_by_lease ON write_sessions (state, lease_expires_at_millis)",
             )
             metadataDatabase.execute(
                 """CREATE TABLE IF NOT EXISTS blob_gc_outbox (
@@ -445,15 +539,18 @@ class DurableSimpleFileSystemManager(
         transactionally { transaction ->
             requireActiveFilesystem(transaction, filesystemUuid, lock = false)
             if (path != "/") requireDirectoryPath(transaction, filesystemUuid, parentPath(path))
+            val now = clock.currentTimeMillis()
             transaction.execute(
                 """INSERT INTO write_sessions
-                    (session_uuid, filesystem_uuid, path, expected_hash, bytes_received, created_at_millis, state)
-                    VALUES (?, ?, ?, ?, 0, ?, 'OPEN')""".trimIndent(),
+                    (session_uuid, filesystem_uuid, path, expected_hash, bytes_received, created_at_millis,
+                     lease_expires_at_millis, state)
+                    VALUES (?, ?, ?, ?, 0, ?, ?, 'OPEN')""".trimIndent(),
                 session,
                 filesystemUuid,
                 path,
                 expectedHash,
-                clock.currentTimeMillis(),
+                now,
+                leaseDeadline(now),
             )
         }
         return session to path
@@ -465,6 +562,11 @@ class DurableSimpleFileSystemManager(
         ordinal: Int,
         bytes: ByteArray,
     ): BlockRecord {
+        val hash = uploadAndPinBlock(bytes)
+        return publishPinnedBlock(database, generationUuid, ordinal, hash, bytes.size)
+    }
+
+    private fun uploadAndPinBlock(bytes: ByteArray): String {
         val hash = sha256(bytes)
         if (!blobstoreService.pinBlob(BLOB_PIN_OWNER, hash)) {
             blobstoreService.putBlob(BLOB_PIN_OWNER, hash, bytes.size.toLong(), ByteArrayInputStream(bytes))
@@ -475,6 +577,17 @@ class DurableSimpleFileSystemManager(
                 )
             }
         }
+        return hash
+    }
+
+    private fun publishPinnedBlock(
+        database: Database,
+        generationUuid: UUID,
+        ordinal: Int,
+        hash: String,
+        sizeBytes: Int,
+    ): BlockRecord {
+        prepareBlobReference(database, hash)
         database.execute(
             """INSERT INTO file_blocks
                 (generation_uuid, ordinal, blob_hash, size_bytes, reference_count)
@@ -482,17 +595,55 @@ class DurableSimpleFileSystemManager(
             generationUuid,
             ordinal,
             hash,
-            bytes.size,
+            sizeBytes,
         )
-        return BlockRecord(generationUuid, ordinal, hash, bytes.size, 0L)
+        database.execute("DELETE FROM blob_gc_outbox WHERE blob_hash = ?", hash)
+        return BlockRecord(generationUuid, ordinal, hash, sizeBytes, 0L)
+    }
+
+    internal fun stageSessionBlock(
+        sessionUuid: UUID,
+        ordinal: Int,
+        bytes: ByteArray,
+        bytesReceived: Long,
+    ): BlockRecord {
+        val hash = uploadAndPinBlock(bytes)
+        return transactionally { transaction ->
+            requireRenewableSession(transaction, sessionUuid)
+            val block = publishPinnedBlock(transaction, sessionUuid, ordinal, hash, bytes.size)
+            transaction.execute(
+                """UPDATE write_sessions SET bytes_received = ?, lease_expires_at_millis = ?
+                    WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
+                bytesReceived,
+                leaseDeadline(clock.currentTimeMillis()),
+                sessionUuid,
+            )
+            block
+        }
+    }
+
+    internal fun renewSessionLease(sessionUuid: UUID) {
+        transactionally { transaction ->
+            requireRenewableSession(transaction, sessionUuid)
+            transaction.execute(
+                "UPDATE write_sessions SET lease_expires_at_millis = ? WHERE session_uuid = ? AND state = 'OPEN'",
+                leaseDeadline(clock.currentTimeMillis()),
+                sessionUuid,
+            )
+        }
     }
 
     internal fun updateSessionBytes(sessionUuid: UUID, bytesReceived: Long) {
-        metadataDatabase.execute(
-            "UPDATE write_sessions SET bytes_received = ? WHERE session_uuid = ? AND state = 'OPEN'",
-            bytesReceived,
-            sessionUuid,
-        )
+        transactionally { transaction ->
+            requireRenewableSession(transaction, sessionUuid)
+            transaction.execute(
+                """UPDATE write_sessions SET bytes_received = ?, lease_expires_at_millis = ?
+                    WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
+                bytesReceived,
+                leaseDeadline(clock.currentTimeMillis()),
+                sessionUuid,
+            )
+        }
     }
 
     internal fun abortSession(sessionUuid: UUID) {
@@ -739,6 +890,17 @@ class DurableSimpleFileSystemManager(
         }
     }
 
+    internal fun prepareBlobReference(database: Database, hash: String) {
+        enqueueBlobForGc(database, hash)
+        database.getRows("SELECT blob_hash FROM blob_gc_outbox WHERE blob_hash = ? FOR UPDATE", hash).single()
+        if (!blobstoreService.pinBlob(BLOB_PIN_OWNER, hash)) {
+            throw IllegalStateException(
+                "Blob '$hash' disappeared after upload while acquiring its GC coordination lock; " +
+                    "the required '$BLOB_PIN_OWNER' durability pin could not be renewed before metadata commit.",
+            )
+        }
+    }
+
     internal fun enqueueBlobForGc(database: Database, hash: String) {
         database.execute(
             """INSERT INTO blob_gc_outbox (blob_hash, action, created_at_millis)
@@ -748,6 +910,171 @@ class DurableSimpleFileSystemManager(
             hash,
             clock.currentTimeMillis(),
         )
+    }
+
+    private fun resolveBlobGcIntent(hash: String): Boolean = transactionally { transaction ->
+        val intent = transaction.getRows(
+            "SELECT blob_hash FROM blob_gc_outbox WHERE blob_hash = ? FOR UPDATE",
+            hash,
+        ).firstOrNull() ?: return@transactionally false
+        check(intent.stringValue("blob_hash") == hash)
+        val referencesBefore = transaction.getLong(
+            "SELECT count(*) FROM file_blocks WHERE blob_hash = ?",
+            hash,
+        ) ?: 0L
+        if (referencesBefore > 0L) {
+            if (!blobstoreService.pinBlob(BLOB_PIN_OWNER, hash)) {
+                throw IllegalStateException(
+                    "Blob '$hash' has $referencesBefore live SQL reference(s), but Blobstore refused the " +
+                        "required compensating '$BLOB_PIN_OWNER' pin while resolving its stale GC intent.",
+                )
+            }
+        } else {
+            blobstoreService.unpinBlob(BLOB_PIN_OWNER, hash)
+            val referencesAfter = transaction.getLong(
+                "SELECT count(*) FROM file_blocks WHERE blob_hash = ?",
+                hash,
+            ) ?: 0L
+            if (referencesAfter > 0L && !blobstoreService.pinBlob(BLOB_PIN_OWNER, hash)) {
+                throw IllegalStateException(
+                    "Blob '$hash' gained $referencesAfter SQL reference(s) during GC re-verification, but " +
+                        "Blobstore refused the compensating '$BLOB_PIN_OWNER' pin.",
+                )
+            }
+        }
+        transaction.execute("DELETE FROM blob_gc_outbox WHERE blob_hash = ?", hash)
+        true
+    }
+
+    private fun enqueueUnreferencedPinnedBlobs(limit: Int): Int {
+        var enqueued = 0
+        for (hash in blobstoreService.listBlobs(BLOB_PIN_OWNER).sorted()) {
+            if (enqueued >= limit) break
+            val newlyEnqueued = transactionally { transaction ->
+                val references = transaction.getLong(
+                    "SELECT count(*) FROM file_blocks WHERE blob_hash = ?",
+                    hash,
+                ) ?: 0L
+                if (references > 0L) return@transactionally false
+                enqueueBlobForGc(transaction, hash)
+                true
+            }
+            if (newlyEnqueued) enqueued += 1
+        }
+        return enqueued
+    }
+
+    private fun reapSessionIfEligible(sessionUuid: UUID, observedNow: Long): Boolean = transactionally { transaction ->
+        val session = transaction.getRows(
+            """SELECT state, lease_expires_at_millis FROM write_sessions
+                WHERE session_uuid = ? FOR UPDATE""".trimIndent(),
+            sessionUuid,
+        ).firstOrNull() ?: return@transactionally false
+        val state = session.stringValue("state")
+        val leaseExpiresAt = session.longValue("lease_expires_at_millis")
+        if (state != "ABORTED" && (state != "OPEN" || leaseExpiresAt > observedNow)) {
+            return@transactionally false
+        }
+        transaction.getStrings(
+            "SELECT blob_hash FROM file_blocks WHERE generation_uuid = ?",
+            sessionUuid,
+        ).forEach { hash -> enqueueBlobForGc(transaction, hash) }
+        transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", sessionUuid)
+        transaction.execute(
+            "UPDATE write_sessions SET state = 'REAPED' WHERE session_uuid = ? AND state IN ('OPEN', 'ABORTED')",
+            sessionUuid,
+        )
+        true
+    }
+
+    private fun purgeFilesystemIfExpired(uuid: UUID, observedNow: Long): Boolean = transactionally { transaction ->
+        val filesystem = transaction.getRows(
+            "SELECT * FROM filesystems WHERE uuid = ? FOR UPDATE",
+            uuid,
+        ).firstOrNull()?.toFilesystemRecord() ?: return@transactionally false
+        val expiration = filesystem.expiresAtMillis
+        if (expiration == null || expiration > observedNow) return@transactionally false
+        purgeFilesystem(transaction, filesystem)
+        true
+    }
+
+    private fun purgeFilesystem(database: Database, filesystem: FilesystemRecord) {
+        database.getRows(
+            "SELECT * FROM entries WHERE filesystem_uuid = ? AND entry_kind = 'FILE' FOR UPDATE",
+            filesystem.uuid,
+        ).map { it.toEntryRecord() }.forEach { entry ->
+            entry.generationUuid?.let { releaseGeneration(database, it) }
+        }
+        database.getUuids(
+            "SELECT session_uuid FROM write_sessions WHERE filesystem_uuid = ? FOR UPDATE",
+            filesystem.uuid,
+        ).forEach { generation ->
+            database.getStrings(
+                "SELECT blob_hash FROM file_blocks WHERE generation_uuid = ?",
+                generation,
+            ).forEach { hash -> enqueueBlobForGc(database, hash) }
+            database.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", generation)
+        }
+        database.execute("DELETE FROM filesystems WHERE uuid = ?", filesystem.uuid)
+        bumpManagerRevision(database)
+    }
+
+    private fun requireRenewableSession(database: Database, sessionUuid: UUID) {
+        val session = database.getRows(
+            """SELECT state, lease_expires_at_millis FROM write_sessions
+                WHERE session_uuid = ? FOR UPDATE""".trimIndent(),
+            sessionUuid,
+        ).firstOrNull() ?: throw IllegalStateException(
+            "Write session '$sessionUuid' no longer exists and cannot renew its lease.",
+        )
+        val state = session.stringValue("state")
+        if (state != "OPEN") {
+            throw IllegalStateException(
+                "Write session '$sessionUuid' cannot renew its lease because its state is '$state', not 'OPEN'.",
+            )
+        }
+        val now = clock.currentTimeMillis()
+        val leaseExpiresAt = session.longValue("lease_expires_at_millis")
+        if (leaseExpiresAt <= now) {
+            throw IllegalStateException(
+                "Write session '$sessionUuid' lease expired at epoch millisecond $leaseExpiresAt; " +
+                    "the attempted chunk was observed at epoch millisecond $now.",
+            )
+        }
+    }
+
+    private fun leaseDeadline(now: Long): Long = try {
+        Math.addExact(now, sessionLeaseMillis)
+    } catch (_: ArithmeticException) {
+        throw SimpleFileSystemException(
+            "Write-session lease deadline overflowed: current epoch millisecond $now plus " +
+                "$sessionLeaseMillis lease milliseconds is outside the signed 64-bit range.",
+        )
+    }
+
+    private fun validateMaintenanceLimit(limit: Int) {
+        require(limit > 0) { "Maintenance batch limit must be positive, but was $limit." }
+    }
+
+    /** Clock.schedule accepts an absolute epoch-millisecond deadline, not a relative delay. */
+    private fun scheduleNextMaintenance() {
+        if (closed) return
+        val interval = requireNotNull(maintenanceIntervalMillis)
+        val deadline = try {
+            Math.addExact(clock.currentTimeMillis(), interval)
+        } catch (_: ArithmeticException) {
+            throw SimpleFileSystemException(
+                "Background maintenance deadline overflowed while adding $interval milliseconds to " +
+                    "epoch millisecond ${clock.currentTimeMillis()}.",
+            )
+        }
+        scheduledMaintenance = clock.schedule(deadline) {
+            try {
+                runMaintenance(maintenanceBatchSize)
+            } finally {
+                scheduleNextMaintenance()
+            }
+        }
     }
 
     internal fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
@@ -844,6 +1171,8 @@ class DurableSimpleFileSystemManager(
         val UNSIGNED_DECIMAL = Regex("[0-9]+")
         const val SERIALIZATION_FAILURE_SQL_STATE = "40001"
         const val MAX_TRANSACTION_RETRIES = 32
+        const val DEFAULT_SESSION_LEASE_MILLIS = 5L * 60L * 1000L
+        const val DEFAULT_MAINTENANCE_BATCH_SIZE = 1_000
     }
 }
 

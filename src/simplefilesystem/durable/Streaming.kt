@@ -38,6 +38,7 @@ internal class StagedBlockSink(
             require(byteCount >= 0L && byteCount <= source.size) {
                 "Cannot consume $byteCount bytes from an Okio buffer containing ${source.size} bytes."
             }
+            manager.renewSessionLease(sessionUuid)
             var remaining = byteCount
             while (remaining > 0L) {
                 val requested = minOf(remaining, (pending.size - pendingSize).toLong()).toInt()
@@ -117,10 +118,9 @@ internal class StagedBlockSink(
     private fun flushBlock() {
         if (pendingSize == 0) return
         val bytes = pending.copyOf(pendingSize)
-        manager.stageBlock(manager.metadataDatabase, sessionUuid, ordinal, bytes)
+        manager.stageSessionBlock(sessionUuid, ordinal, bytes, totalBytes)
         ordinal += 1
         pendingSize = 0
-        manager.updateSessionBytes(sessionUuid, totalBytes)
     }
 
     private fun ensureWritable() {
@@ -184,6 +184,7 @@ internal class TransactionalBlockAssembler(
             "Blob '${block.blobHash}' for complete block ${block.ordinal} contains $observedBytes bytes, but metadata " +
                 "declares ${block.sizeBytes} bytes."
         }
+        manager.prepareBlobReference(transaction, block.blobHash)
         transaction.execute(
             """INSERT INTO file_blocks
                 (generation_uuid, ordinal, blob_hash, size_bytes, reference_count)
@@ -193,6 +194,7 @@ internal class TransactionalBlockAssembler(
             block.blobHash,
             block.sizeBytes,
         )
+        transaction.execute("DELETE FROM blob_gc_outbox WHERE blob_hash = ?", block.blobHash)
         ordinal += 1
         totalBytes += observedBytes
     }

@@ -12,6 +12,12 @@ import java.util.UUID
 internal const val BLOCK_SIZE_BYTES: Int = 4 * 1024 * 1024
 internal const val BLOB_PIN_OWNER: String = "simplefilesystem-durable-embedded"
 
+data class MaintenanceResult(
+    val reapedSessions: Int,
+    val purgedFilesystems: Int,
+    val resolvedGcIntents: Int,
+)
+
 internal data class FilesystemRecord(
     val uuid: UUID,
     val description: String,

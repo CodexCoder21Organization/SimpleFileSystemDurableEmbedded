@@ -2,7 +2,7 @@
 
 Durable, in-process implementation of the [`simplefilesystem`](https://github.com/CodexCoder21Organization/SimpleFileSystemApi) 0.2.0 contract. File and directory metadata is stored transactionally in CockroachDB while immutable 4 MiB content blocks are stored directly in Blobstore by uppercase SHA-256 hash.
 
-`DurableSimpleFileSystemManager` implements the multi-filesystem lifecycle API and vends `DurableSimpleFileSystem` handles. Writes upload and pin staged blocks before one metadata transaction atomically publishes a new immutable generation, updates quota usage, and queues superseded blocks for later garbage collection.
+`DurableSimpleFileSystemManager` implements the multi-filesystem lifecycle API and vends `DurableSimpleFileSystem` handles. Writes upload and pin staged blocks before one metadata transaction atomically publishes a new immutable generation, updates quota usage, and queues superseded blocks for idempotent garbage collection.
 
 ## Building
 
@@ -47,6 +47,9 @@ fun useDurableFilesystem(blobstore: BlobstoreService, metadataDatabase: Database
     val hash = requireNotNull(filesystem.metadata("/artifacts/jvm/result.txt").contentHash)
     filesystem.writeUtf8("/artifacts/jvm/result.txt", "recompiled", ifMatches = hash)
     println(filesystem.readUtf8("/artifacts/jvm/result.txt"))
+
+    val maintenance = manager.runMaintenance()
+    println("Reaped ${maintenance.reapedSessions} sessions and purged ${maintenance.purgedFilesystems} filesystems")
 }
 ```
 
@@ -54,14 +57,34 @@ Callers own the injected services and database handle; the manager does not clos
 
 Directory and manager listings are cursor-paginated and expose durable snapshot revisions. Paths, filesystem descriptions, Base64, and UTF-8 are validated strictly; inline conveniences are capped at 4 MiB, while `source` and `FileSink` provide streaming access for larger files.
 
+## Maintenance and reconciliation
+
+Maintenance is explicit by default. Call `reapAbandonedWriteSessions()`, `purgeExpiredFilesystems()`, and `processBlobGcOutbox()` separately, or call `runMaintenance()` for one bounded pass of all three. Every manager construction also performs crash reconciliation: expired or explicitly aborted sessions are reaped and previously committed GC-outbox intents are resumed, while expiration purge remains explicit so an expired-but-unpurged filesystem can still be revived with `setExpiration(uuid, null)`.
+
+Background maintenance is opt-in through `maintenanceIntervalMillis`; the default is `null`, so constructing a manager does not start recurring work. The interval is converted to the absolute deadline required by `Clock.schedule`, and `close()` cancels the scheduled callback without shutting down the caller-owned clock:
+
+```kotlin
+val manager = DurableSimpleFileSystemManager(
+    blobstoreService = blobstore,
+    metadataDatabase = metadataDatabase,
+    maintenanceIntervalMillis = 60_000L,
+)
+try {
+    // Use the manager and its filesystems.
+} finally {
+    manager.close()
+}
+```
+
 ## Durability model
 
 - `filesystems` stores UUID identity, free-text descriptions, quota accounting, expiration, and a durable per-filesystem namespace revision.
 - `simple_filesystem_manager_state` stores the durable manager-descriptor revision used by filesystem-listing pages.
 - `entries` stores the directory tree and atomically points files at immutable generation UUIDs.
 - `file_blocks` maps each generation to ordered 4 MiB Blobstore blocks and tracks how many entries share that generation.
-- `write_sessions` records staged uploads. An explicit commit transaction revalidates lifecycle, parent and target types, compare-and-swap state, and checked quota constraints before publishing.
-- `blob_gc_outbox` records blocks that may be unpinned after a generation loses its final reference. Outbox processing, abandoned-session reaping, and expiration purge are intentionally phase-2 work.
+- `write_sessions` records staged uploads, terminal state, and a renewable lease. Chunk writes renew the lease; reaping deletes an expired session's staged `file_blocks`, queues their hashes for GC evaluation, and leaves the durable session row in `REAPED` state without changing quota.
+- `blob_gc_outbox` records blocks that may be unpinned after a generation loses its final reference. Writers and collectors serialize on each hash's outbox row; writers re-pin after acquiring the row lock before publishing `file_blocks`, while collectors re-check every committed and staged SQL reference before an idempotent unpin.
+- Expiration is a two-step lifecycle: operations reject an expired filesystem, but callers may revive it until `purgeExpiredFilesystems()` locks and deletes it. Purge releases generations and staged blocks through the same GC outbox, so a content hash shared by another filesystem stays pinned.
 
 Blobstore access uses the raw `BlobstoreService` API rather than `BlobstoreClient`, so blocks are neither encrypted nor compressed by this module. Production wiring is expected to supply a dedicated metadata database and a stable service-owned Blobstore pin identity.
 
