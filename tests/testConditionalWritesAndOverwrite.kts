@@ -33,16 +33,7 @@ fun testConditionalWritesAndOverwrite() {
             val createConflict = runCatching {
                 filesystem.writeUtf8("/value", "two", null)
             }.exceptionOrNull()
-            val createConflictChain = generateSequence(createConflict) { it.cause }
-                .joinToString(" -> ") { "${it.javaClass.name}: ${it.message}" }
-            kotlin.test.assertTrue(
-                "simplefilesystem.FileContentConflictException" in createConflictChain,
-                createConflictChain,
-            )
-            kotlin.test.assertTrue(
-                createConflict?.javaClass?.name == "simplefilesystem.FileContentConflictException",
-                createConflict?.stackTraceToString() ?: "No failure was captured.",
-            )
+            assertEquals("simplefilesystem.FileContentConflictException", createConflict?.javaClass?.name)
             assertEquals(
                 "Cannot conditionally write path '/value': expected the path to be absent, but observed " +
                     "content hash '$oneHash'.",
