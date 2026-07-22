@@ -139,8 +139,8 @@ class DurableSimpleFileSystemManager(
 
     override fun listFilesystems(after: String?, limit: Int): FilesystemPage {
         ensureSchema()
-        val pageLimit = validatePageLimit(limit)
         val cursor = parseFilesystemCursor(after)
+        val pageLimit = validatePageLimit(limit)
         return transactionally { transaction ->
             val revision = managerRevision(transaction)
             val rows = if (cursor == null) {
