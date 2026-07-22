@@ -119,7 +119,7 @@ class DurableSimpleFileSystem internal constructor(
             val entry = manager.findEntry(transaction, filesystemUuid, normalized, lock = true)
             if (entry == null) {
                 if (mustExist) throw PathNotFoundException(normalized)
-                return@execute
+                return@transactionally
             }
             if (entry.isDirectory) {
                 val child = transaction.getRows(
@@ -158,7 +158,7 @@ class DurableSimpleFileSystem internal constructor(
             val root = manager.findEntry(transaction, filesystemUuid, normalized, lock = true)
             if (root == null) {
                 if (mustExist) throw PathNotFoundException(normalized)
-                return@execute
+                return@transactionally
             }
             val entries = subtree(transaction, normalized)
                 .filterNot { normalized == "/" && it.path == "/" }
@@ -370,13 +370,13 @@ class DurableSimpleFileSystem internal constructor(
             if (existing != null) {
                 if (!existing.isDirectory) throw PathTypeMismatchException(normalized, "DIRECTORY", existing.kind)
                 if (mustCreate) throw PathAlreadyExistsException(normalized)
-                return@execute
+                return@transactionally
             }
             val now = manager.clock.currentTimeMillis()
             if (!recursive) {
                 manager.requireDirectory(transaction, filesystemUuid, manager.parentPath(normalized), lock = true)
                 insertDirectory(transaction, normalized, now)
-                return@execute
+                return@transactionally
             }
             var current = ""
             normalized.removePrefix("/").split('/').forEach { component ->
