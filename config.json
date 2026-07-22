@@ -1,0 +1,6 @@
+{
+  "name": "simplefilesystem-durable-embedded",
+  "source": "src",
+  "buildscript": "build.kts",
+  "readme": "README.md"
+}

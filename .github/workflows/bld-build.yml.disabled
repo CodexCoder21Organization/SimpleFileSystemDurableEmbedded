@@ -1,0 +1,24 @@
+name: Bld - Build and Test
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  merge_group:
+    branches: [ main, master ]
+
+jobs:
+  bld-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: eclipse-temurin:21-jdk-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with kompile
+        run: |
+          apt update
+          apt install -y curl
+          scripts/build.bash simplefilesystem.durable.buildMaven
+      - name: Run tests
+        run: scripts/test.bash --test . --log test_log_file.xml
