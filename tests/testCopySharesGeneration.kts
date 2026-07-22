@@ -1,0 +1,49 @@
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
+@file:WithArtifact("build.kotlin.annotations:build-kotlin-annotations:0.0.2")
+@file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
+@file:WithArtifact("cockroachdb.testharness:cockroachdb-test-harness:0.0.4")
+@file:WithArtifact("sql:sql-api:0.0.1")
+@file:WithArtifact("sql:sql:0.0.2")
+@file:WithArtifact("community.kotlin.clocks.simple:community-kotlin-clocks-simple:0.0.3")
+@file:WithArtifact("org.postgresql:postgresql:42.6.0")
+@file:WithArtifact("org.jetbrains.kotlin:kotlin-stdlib:1.9.22")
+@file:WithArtifact("org.jetbrains.kotlin:kotlin-test:1.9.22")
+package simplefilesystem.durable
+
+import build.kotlin.withartifact.WithArtifact
+import cockroachdb.testharness.LocalCockroachCluster
+import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
+import community.kotlin.clocks.simple.ManualClock
+import community.kotlin.clocks.simple.SystemClock
+import kotlin.test.assertEquals
+import sql.Database
+
+fun testCopySharesGeneration() {
+    val cluster = LocalCockroachCluster(clock = SystemClock()).start()
+    try {
+        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        try {
+            val blobs = InMemoryBlobstoreService()
+            val manager = DurableSimpleFileSystemManager(blobs, database, ManualClock(7L))
+            val uuid = manager.createFilesystem("copy", 20L * 1024L * 1024L).uuid
+            val filesystem = manager.openFilesystem(uuid)
+            val content = "same immutable generation"
+            filesystem.writeUtf8("/source", content, null)
+            filesystem.copy("/source", "/target")
+
+            assertEquals(content, filesystem.readUtf8("/target"))
+            assertEquals(2L * content.toByteArray().size, manager.getUsedBytes(uuid))
+            assertEquals(1, blobs.storedBlobCount())
+            assertEquals(listOf(2L), database.getLongs("SELECT DISTINCT reference_count FROM file_blocks"))
+            assertEquals(1L, database.getLong("SELECT count(DISTINCT generation_uuid) FROM file_blocks"))
+
+            filesystem.overwriteUtf8("/source", "changed")
+            assertEquals(content, filesystem.readUtf8("/target"))
+            assertEquals(listOf(1L, 1L), database.getLongs("SELECT reference_count FROM file_blocks ORDER BY generation_uuid"))
+        } finally {
+            database.close()
+        }
+    } finally {
+        cluster.close()
+    }
+}
