@@ -24,7 +24,8 @@ import simplefilesystem.conformance.SimpleFileSystemManagerFactory
 import simplefilesystem.conformance.SimpleFileSystemManagerFixture
 import sql.Database
 
-private val durableConformanceFactory = object : SimpleFileSystemManagerFactory {
+private fun runDurableConformanceArea(area: ConformanceArea, expectedCount: Int) {
+    val factory = object : SimpleFileSystemManagerFactory {
             override val backendName: String = "Durable CockroachDB + in-memory Blobstore"
 
             override fun create(initialTimeMillis: Long): SimpleFileSystemManagerFixture {
@@ -59,10 +60,8 @@ private val durableConformanceFactory = object : SimpleFileSystemManagerFactory 
                     }
                 }
             }
-}
-
-private fun runDurableConformanceArea(area: ConformanceArea, expectedCount: Int) {
-    val result = SimpleFileSystemConformanceSuite.run(durableConformanceFactory, setOf(area))
+    }
+    val result = SimpleFileSystemConformanceSuite.run(factory, setOf(area))
     assertEquals(expectedCount, result.totalScenarioCount)
 }
 
