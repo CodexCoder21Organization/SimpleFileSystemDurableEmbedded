@@ -18,14 +18,14 @@ import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
 import simplefilesystem.conformance.ConformanceClockHandle
+import simplefilesystem.conformance.ConformanceArea
 import simplefilesystem.conformance.SimpleFileSystemConformanceSuite
 import simplefilesystem.conformance.SimpleFileSystemManagerFactory
 import simplefilesystem.conformance.SimpleFileSystemManagerFixture
 import sql.Database
 
-fun testConformanceSuiteCockroachBlobstore() {
-    val result = SimpleFileSystemConformanceSuite.runAll(
-        object : SimpleFileSystemManagerFactory {
+private fun durableConformanceFactory(): SimpleFileSystemManagerFactory =
+    object : SimpleFileSystemManagerFactory {
             override val backendName: String = "Durable CockroachDB + in-memory Blobstore"
 
             override fun create(initialTimeMillis: Long): SimpleFileSystemManagerFixture {
@@ -60,8 +60,33 @@ fun testConformanceSuiteCockroachBlobstore() {
                     }
                 }
             }
-        },
-    )
-    assertEquals(69, result.totalScenarioCount)
+    }
+
+private fun runDurableConformanceArea(area: ConformanceArea, expectedCount: Int) {
+    val result = SimpleFileSystemConformanceSuite.run(durableConformanceFactory(), setOf(area))
+    assertEquals(expectedCount, result.totalScenarioCount)
 }
 
+fun testConformanceSuiteCockroachBlobstorePrecedenceAndMessages() =
+    runDurableConformanceArea(ConformanceArea.PRECEDENCE_AND_MESSAGES, 12)
+
+fun testConformanceSuiteCockroachBlobstoreOperationMatrix() =
+    runDurableConformanceArea(ConformanceArea.OPERATION_MATRIX, 12)
+
+fun testConformanceSuiteCockroachBlobstoreContentCas() =
+    runDurableConformanceArea(ConformanceArea.CONTENT_CAS, 7)
+
+fun testConformanceSuiteCockroachBlobstoreSnapshotsAndPagination() =
+    runDurableConformanceArea(ConformanceArea.SNAPSHOTS_AND_PAGINATION, 4)
+
+fun testConformanceSuiteCockroachBlobstoreStreaming() =
+    runDurableConformanceArea(ConformanceArea.STREAMING, 6)
+
+fun testConformanceSuiteCockroachBlobstoreLifecycle() =
+    runDurableConformanceArea(ConformanceArea.LIFECYCLE, 8)
+
+fun testConformanceSuiteCockroachBlobstoreWatchLog() =
+    runDurableConformanceArea(ConformanceArea.WATCH_LOG, 11)
+
+fun testConformanceSuiteCockroachBlobstoreInlineCodecsAndArithmetic() =
+    runDurableConformanceArea(ConformanceArea.INLINE_CODECS_AND_ARITHMETIC, 9)
