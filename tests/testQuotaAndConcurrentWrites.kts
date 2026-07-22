@@ -18,8 +18,12 @@ import community.kotlin.clocks.simple.SystemClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
+import okio.Buffer
 import simplefilesystem.QuotaExceededException
+import simplefilesystem.QuotaArithmeticOverflowException
 import sql.Database
 
 fun testQuotaAndConcurrentWrites() {
@@ -57,9 +61,25 @@ fun testQuotaAndConcurrentWrites() {
                 assertEquals(
                     "Cannot mutate path '${listOf("/a", "/b").single { !filesystem.exists(it) }}': the " +
                         "filesystem limit is 12 bytes and current usage is 8 bytes, but the mutation would " +
-                        "increase usage to 16 bytes.",
+                        "change usage to 16 bytes.",
                     quotaFailure.message,
                 )
+
+                val rejected = filesystem.sink("/too-large", null)
+                rejected.write(Buffer().writeUtf8("12345678"), 8L)
+                val commitFailure = assertFailsWith<QuotaExceededException> { rejected.commit() }
+                assertSame(commitFailure, assertFailsWith<QuotaExceededException> { rejected.commit() })
+                rejected.close()
+
+                database.execute(
+                    "UPDATE filesystems SET max_size_bytes = ?, used_bytes = ? WHERE uuid = ?",
+                    Long.MAX_VALUE,
+                    Long.MAX_VALUE,
+                    java.util.UUID.fromString(uuid),
+                )
+                val overflow = filesystem.sink("/overflow", null)
+                overflow.write(Buffer().writeByte(1), 1L)
+                assertFailsWith<QuotaArithmeticOverflowException> { overflow.commit() }
             } finally {
                 executor.shutdownNow()
             }

@@ -16,9 +16,11 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import okio.Buffer
 import okio.buffer
 import simplefilesystem.PathNotFoundException
+import simplefilesystem.PathTypeMismatchException
 import sql.Database
 
 fun testAppendSemantics() {
@@ -35,9 +37,34 @@ fun testAppendSemantics() {
             assertEquals("simplefilesystem.PathNotFoundException", missing?.javaClass?.name)
             filesystem.appendingWriteUtf8("/log", "alpha", mustExist = false)
             filesystem.appendingWriteUtf8("/log", "-beta", mustExist = true)
-            filesystem.appendingSink("/log").buffer().use { it.writeUtf8("-gamma") }
+            val appendingSink = filesystem.appendingSink("/log")
+            val bufferedAppend = appendingSink.buffer()
+            try {
+                bufferedAppend.writeUtf8("-gamma")
+                bufferedAppend.flush()
+                appendingSink.commit()
+            } finally {
+                bufferedAppend.close()
+            }
             assertEquals("alpha-beta-gamma", filesystem.readUtf8("/log"))
             assertEquals(16L, manager.getUsedBytes(uuid))
+
+            val lateAppend = filesystem.appendingSink("/log")
+            lateAppend.write(Buffer().writeUtf8("-late"), 5L)
+            filesystem.overwriteUtf8("/log", "winner")
+            lateAppend.commit()
+            assertEquals("winner-late", filesystem.readUtf8("/log"))
+
+            val typeWinner = filesystem.appendingSink("/directory-winner")
+            typeWinner.write(Buffer().writeUtf8("bytes"), 5L)
+            filesystem.createDirectory("/directory-winner", true)
+            assertFailsWith<PathTypeMismatchException> { typeWinner.commit() }
+
+            filesystem.createDirectory("/parent", true)
+            val missingParent = filesystem.appendingSink("/parent/file")
+            missingParent.write(Buffer().writeUtf8("bytes"), 5L)
+            filesystem.delete("/parent", true)
+            assertFailsWith<PathNotFoundException> { missingParent.commit() }
         } finally {
             database.close()
         }

@@ -17,7 +17,9 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertSame
 import okio.Buffer
 import sql.Database
 
@@ -36,6 +38,33 @@ fun testAbandonedSinkIsolation() {
             assertEquals(0L, manager.getUsedBytes(uuid))
             assertEquals(listOf("OPEN"), database.getStrings("SELECT state FROM write_sessions"))
             assertEquals(1L, database.getLong("SELECT count(*) FROM file_blocks"))
+            sink.close()
+            sink.close()
+            assertEquals(listOf("ABORTED"), database.getStrings("SELECT state FROM write_sessions"))
+            assertFalse(filesystem.exists("/incomplete"))
+
+            val aborted = filesystem.sink("/aborted", null)
+            aborted.write(Buffer().writeUtf8("discarded"), 9L)
+            aborted.abort()
+            aborted.abort()
+            aborted.close()
+            assertFalse(filesystem.exists("/aborted"))
+            assertFailsWith<IllegalStateException> { aborted.commit() }
+
+            val closed = filesystem.sink("/closed", null)
+            closed.write(Buffer().writeUtf8("discarded"), 9L)
+            closed.close()
+            assertFalse(filesystem.exists("/closed"))
+            assertFailsWith<IllegalStateException> { closed.commit() }
+
+            val committed = filesystem.sink("/committed", null)
+            committed.write(Buffer().writeUtf8("visible"), 7L)
+            val metadata = committed.commit()
+            assertEquals(7L, metadata.size)
+            assertSame(metadata, committed.commit())
+            committed.abort()
+            committed.close()
+            assertEquals("visible", filesystem.readUtf8("/committed"))
         } finally {
             database.close()
         }

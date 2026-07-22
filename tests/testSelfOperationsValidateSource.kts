@@ -16,6 +16,7 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
+import simplefilesystem.FileEntryType
 import sql.Database
 
 fun testSelfOperationsValidateSource() {
@@ -38,13 +39,15 @@ fun testSelfOperationsValidateSource() {
             val directoryCopy = runCatching { filesystem.copy("/directory", "/directory") }.exceptionOrNull()
             assertEquals("simplefilesystem.PathTypeMismatchException", directoryCopy?.javaClass?.name)
             assertEquals(
-                "Path '/directory' has type 'DIRECTORY', but this operation requires type 'FILE'.",
+                "Path '/directory' has type DIRECTORY, but this operation requires type REGULAR_FILE.",
                 directoryCopy?.message,
             )
 
             filesystem.writeUtf8("/file", "unchanged", null)
-            filesystem.copy("/file", "/file")
-            filesystem.atomicMove("/file", "/file")
+            val copied = filesystem.copy("/file", "/file")
+            val moved = filesystem.atomicMove("/file", "/file")
+            assertEquals(FileEntryType.REGULAR_FILE, copied.type)
+            assertEquals(copied.contentHash, moved.contentHash)
             assertEquals("unchanged", filesystem.readUtf8("/file"))
         } finally {
             database.close()

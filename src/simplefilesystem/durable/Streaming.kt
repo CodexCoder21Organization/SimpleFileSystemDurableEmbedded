@@ -1,9 +1,11 @@
 package simplefilesystem.durable
 
 import okio.Buffer
-import okio.Sink
 import okio.Source
 import okio.Timeout
+import simplefilesystem.FileMetadataInfo
+import simplefilesystem.FileSink
+import simplefilesystem.QuotaArithmeticOverflowException
 import sql.Database
 import java.io.InputStream
 import java.security.MessageDigest
@@ -17,7 +19,7 @@ internal class StagedBlockSink(
     private val unconditional: Boolean,
     private val append: Boolean,
     private val appendMustExist: Boolean = false,
-) : Sink {
+) : FileSink {
     private val sessionAndPath = manager.beginSession(filesystemUuid, rawPath, expectedHash)
     private val sessionUuid: UUID = sessionAndPath.first
     private val path: String = sessionAndPath.second
@@ -26,17 +28,17 @@ internal class StagedBlockSink(
     private var pendingSize: Int = 0
     private var ordinal: Int = 0
     private var totalBytes: Long = 0L
-    private var closed: Boolean = false
-    private var failed: Throwable? = null
+    private var state: SinkState = SinkState.OPEN
+    private var committedMetadata: FileMetadataInfo? = null
+    private var commitFailure: Throwable? = null
 
     override fun write(source: Buffer, byteCount: Long) {
-        check(!closed) { "Cannot write to the staged sink for '$path' after it has been closed." }
-        require(byteCount >= 0L && byteCount <= source.size) {
-            "Cannot consume $byteCount bytes from an Okio buffer containing ${source.size} bytes."
-        }
-        failed?.let { throw it }
-        var remaining = byteCount
+        ensureWritable()
         try {
+            require(byteCount >= 0L && byteCount <= source.size) {
+                "Cannot consume $byteCount bytes from an Okio buffer containing ${source.size} bytes."
+            }
+            var remaining = byteCount
             while (remaining > 0L) {
                 val requested = minOf(remaining, (pending.size - pendingSize).toLong()).toInt()
                 val read = source.read(pending, pendingSize, requested)
@@ -45,28 +47,34 @@ internal class StagedBlockSink(
                 }
                 digest.update(pending, pendingSize, read)
                 pendingSize += read
-                totalBytes += read.toLong()
+                totalBytes = try {
+                    Math.addExact(totalBytes, read.toLong())
+                } catch (_: ArithmeticException) {
+                    throw QuotaArithmeticOverflowException(path, totalBytes, 0L, read.toLong())
+                }
                 remaining -= read.toLong()
                 if (pendingSize == pending.size) flushBlock()
             }
         } catch (failure: Throwable) {
-            failed = failure
-            manager.abortSession(sessionUuid)
+            poison(failure)
             throw failure
         }
     }
 
     override fun flush() {
-        check(!closed) { "Cannot flush the staged sink for '$path' after it has been closed." }
+        ensureWritable()
     }
 
     override fun timeout(): Timeout = Timeout.NONE
 
-    override fun close() {
-        if (closed) return
-        closed = true
-        failed?.let { throw it }
-        try {
+    override fun commit(): FileMetadataInfo {
+        committedMetadata?.let { return it }
+        commitFailure?.let { throw it }
+        check(state == SinkState.OPEN) {
+            "Cannot commit staged sink '$path' after it was ${state.name.lowercase()}."
+        }
+        return try {
+            manager.requireActiveFilesystem(filesystemUuid)
             if (pendingSize > 0) flushBlock()
             manager.updateSessionBytes(sessionUuid, totalBytes)
             val contentHash = digest.digest().toUpperHex()
@@ -78,15 +86,32 @@ internal class StagedBlockSink(
                 sizeBytes = totalBytes,
                 contentHash = contentHash,
             )
-            if (append) {
+            val metadata = if (append) {
                 manager.commitAppend(stage, appendMustExist)
             } else {
                 manager.commitGeneration(stage, unconditional)
             }
+            committedMetadata = metadata
+            state = SinkState.COMMITTED
+            metadata
         } catch (failure: Throwable) {
-            manager.abortSession(sessionUuid)
+            commitFailure = failure
+            state = SinkState.FAILED
+            abortAfterFailure(failure)
             throw failure
         }
+    }
+
+    override fun abort() {
+        if (state != SinkState.OPEN) return
+        state = SinkState.ABORTED
+        manager.abortSession(sessionUuid)
+    }
+
+    override fun close() {
+        if (state != SinkState.OPEN) return
+        state = SinkState.CLOSED
+        manager.abortSession(sessionUuid)
     }
 
     private fun flushBlock() {
@@ -97,6 +122,29 @@ internal class StagedBlockSink(
         pendingSize = 0
         manager.updateSessionBytes(sessionUuid, totalBytes)
     }
+
+    private fun ensureWritable() {
+        commitFailure?.let { throw it }
+        check(state == SinkState.OPEN) {
+            "Cannot write or flush staged sink '$path' after it became ${state.name.lowercase()}."
+        }
+    }
+
+    private fun poison(failure: Throwable) {
+        if (commitFailure == null) commitFailure = failure
+        state = SinkState.FAILED
+        abortAfterFailure(failure)
+    }
+
+    private fun abortAfterFailure(failure: Throwable) {
+        try {
+            manager.abortSession(sessionUuid)
+        } catch (cleanupFailure: Throwable) {
+            failure.addSuppressed(cleanupFailure)
+        }
+    }
+
+    private enum class SinkState { OPEN, COMMITTED, FAILED, ABORTED, CLOSED }
 }
 
 internal class TransactionalBlockAssembler(

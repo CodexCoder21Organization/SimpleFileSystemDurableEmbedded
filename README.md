@@ -1,6 +1,6 @@
 # SimpleFileSystemDurableEmbedded
 
-Durable, in-process implementation of the [`simplefilesystem`](https://github.com/CodexCoder21Organization/SimpleFileSystemApi) contract. File and directory metadata is stored transactionally in CockroachDB while immutable 4 MiB content blocks are stored directly in Blobstore by uppercase SHA-256 hash.
+Durable, in-process implementation of the [`simplefilesystem`](https://github.com/CodexCoder21Organization/SimpleFileSystemApi) 0.2.0 contract. File and directory metadata is stored transactionally in CockroachDB while immutable 4 MiB content blocks are stored directly in Blobstore by uppercase SHA-256 hash.
 
 `DurableSimpleFileSystemManager` implements the multi-filesystem lifecycle API and vends `DurableSimpleFileSystem` handles. Writes upload and pin staged blocks before one metadata transaction atomically publishes a new immutable generation, updates quota usage, and queues superseded blocks for later garbage collection.
 
@@ -41,7 +41,8 @@ fun useDurableFilesystem(blobstore: BlobstoreService, metadataDatabase: Database
 
     val filesystem: SimpleFileSystem = manager.openFilesystem(descriptor.uuid)
     filesystem.createDirectories("/artifacts/jvm", mustCreate = false)
-    filesystem.writeUtf8("/artifacts/jvm/result.txt", "compiled", ifMatches = null)
+    val committed = filesystem.writeUtf8("/artifacts/jvm/result.txt", "compiled", ifMatches = null)
+    println("Committed ${committed.size} bytes as ${committed.contentHash}")
 
     val hash = requireNotNull(filesystem.metadata("/artifacts/jvm/result.txt").contentHash)
     filesystem.writeUtf8("/artifacts/jvm/result.txt", "recompiled", ifMatches = hash)
@@ -49,14 +50,17 @@ fun useDurableFilesystem(blobstore: BlobstoreService, metadataDatabase: Database
 }
 ```
 
-Callers own the injected services and database handle; the manager does not close them. Every returned `Source`, `Sink`, and `InputStream` must be closed by its caller. `sink` commits only on a successful close, so an abandoned writer never exposes partial content or changes `usedBytes`.
+Callers own the injected services and database handle; the manager does not close them. Every returned `Source`, `FileSink`, and `InputStream` must be closed by its caller. A `FileSink` publishes data only when `commit()` succeeds; `abort()` discards an open stage, and `close()` aborts an uncommitted stage. Successful and failed commits are repeatable.
+
+Directory and manager listings are cursor-paginated and expose durable snapshot revisions. Paths, filesystem descriptions, Base64, and UTF-8 are validated strictly; inline conveniences are capped at 4 MiB, while `source` and `FileSink` provide streaming access for larger files.
 
 ## Durability model
 
-- `filesystems` stores UUID identity, free-text descriptions, quota accounting, and expiration.
+- `filesystems` stores UUID identity, free-text descriptions, quota accounting, expiration, and a durable per-filesystem namespace revision.
+- `simple_filesystem_manager_state` stores the durable manager-descriptor revision used by filesystem-listing pages.
 - `entries` stores the directory tree and atomically points files at immutable generation UUIDs.
 - `file_blocks` maps each generation to ordered 4 MiB Blobstore blocks and tracks how many entries share that generation.
-- `write_sessions` records staged uploads. A close transaction validates compare-and-swap and quota constraints before publishing.
+- `write_sessions` records staged uploads. An explicit commit transaction revalidates lifecycle, parent and target types, compare-and-swap state, and checked quota constraints before publishing.
 - `blob_gc_outbox` records blocks that may be unpinned after a generation loses its final reference. Outbox processing, abandoned-session reaping, and expiration purge are intentionally phase-2 work.
 
 Blobstore access uses the raw `BlobstoreService` API rather than `BlobstoreClient`, so blocks are neither encrypted nor compressed by this module. Production wiring is expected to supply a dedicated metadata database and a stable service-owned Blobstore pin identity.

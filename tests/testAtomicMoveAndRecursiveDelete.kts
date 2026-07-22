@@ -18,6 +18,11 @@ import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
+import simplefilesystem.DirectoryNotEmptyException
+import simplefilesystem.FileEntryType
+import simplefilesystem.InvalidMoveException
+import simplefilesystem.PathTypeMismatchException
 import sql.Database
 
 fun testAtomicMoveAndRecursiveDelete() {
@@ -32,6 +37,21 @@ fun testAtomicMoveAndRecursiveDelete() {
             filesystem.writeUtf8("/from/nested/a", "alpha", null)
             filesystem.writeUtf8("/replace", "old", null)
 
+            assertFailsWith<DirectoryNotEmptyException> { filesystem.delete("/from", true) }
+            assertFailsWith<InvalidMoveException> { filesystem.atomicMove("/", "/root-copy") }
+            assertFailsWith<InvalidMoveException> { filesystem.atomicMove("/replace", "/") }
+            assertFailsWith<InvalidMoveException> {
+                filesystem.atomicMove("/from", "/from/nested/descendant")
+            }
+            filesystem.createDirectories("/occupied/child", true)
+            assertFailsWith<DirectoryNotEmptyException> { filesystem.atomicMove("/from", "/occupied") }
+            filesystem.createDirectory("/target-directory", true)
+            val crossKind = assertFailsWith<PathTypeMismatchException> {
+                filesystem.atomicMove("/replace", "/target-directory")
+            }
+            assertEquals(FileEntryType.REGULAR_FILE, crossKind.expectedType)
+            assertEquals(FileEntryType.DIRECTORY, crossKind.observedType)
+
             filesystem.atomicMove("/from", "/moved")
             assertFalse(filesystem.exists("/from"))
             assertEquals("alpha", filesystem.readUtf8("/moved/nested/a"))
@@ -42,9 +62,11 @@ fun testAtomicMoveAndRecursiveDelete() {
 
             filesystem.deleteRecursively("/moved", true)
             filesystem.delete("/replace", true)
+            filesystem.deleteRecursively("/", true)
             assertFalse(filesystem.exists("/moved"))
             assertEquals(0L, manager.getUsedBytes(uuid))
-            assertEquals(emptyList(), filesystem.list("/").map { it.path })
+            assertEquals(emptyList(), filesystem.list("/", null, 100).entries.map { it.path })
+            assertTrue(filesystem.exists("/"))
         } finally {
             database.close()
         }

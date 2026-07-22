@@ -18,6 +18,7 @@ import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
 import simplefilesystem.InvalidByteRangeException
 import simplefilesystem.InvalidPathException
+import simplefilesystem.InvalidPathReason
 import simplefilesystem.PathAlreadyExistsException
 import simplefilesystem.PathNotFoundException
 import simplefilesystem.PathTypeMismatchException
@@ -38,17 +39,38 @@ fun testTypedPathFailures() {
             assertEquals("Path '/missing' does not exist in this filesystem.", missing?.message)
             val exists = runCatching { filesystem.createDirectory("/dir", true) }.exceptionOrNull()
             assertEquals("simplefilesystem.PathAlreadyExistsException", exists?.javaClass?.name)
-            val wrongType = runCatching { filesystem.list("/file") }.exceptionOrNull()
+            val wrongType = runCatching { filesystem.list("/file", null, 100) }.exceptionOrNull()
             assertEquals("simplefilesystem.PathTypeMismatchException", wrongType?.javaClass?.name)
             assertEquals(
-                "Path 'relative' is invalid: paths must be absolute and begin with '/'.",
+                "Path 'relative' is invalid for reason NOT_ABSOLUTE: every non-root path must begin with '/'.",
                 runCatching { filesystem.exists("relative") }.exceptionOrNull()?.message,
             )
+            val grammar = listOf(
+                "" to InvalidPathReason.EMPTY,
+                "/trailing/" to InvalidPathReason.TRAILING_SEPARATOR,
+                "/repeated//separator" to InvalidPathReason.REPEATED_SEPARATOR,
+                "/./dot" to InvalidPathReason.DOT_SEGMENT,
+                "/../parent" to InvalidPathReason.PARENT_SEGMENT,
+                "/nul\u0000value" to InvalidPathReason.NUL_CHARACTER,
+                "/malformed-\uD800" to InvalidPathReason.MALFORMED_UNICODE,
+                ("/" + "a".repeat(256)) to InvalidPathReason.SEGMENT_TOO_LONG,
+                ("/" + List(17) { "a".repeat(240) }.joinToString("/")) to InvalidPathReason.PATH_TOO_LONG,
+                ("/" + List(129) { "a" }.joinToString("/")) to InvalidPathReason.TOO_DEEP,
+            )
+            grammar.forEach { (invalidPath, reason) ->
+                val failure = runCatching { filesystem.exists(invalidPath) }.exceptionOrNull() as InvalidPathException
+                assertEquals(reason, failure.reason)
+            }
+            val rootDelete = runCatching { filesystem.delete("/", false) }.exceptionOrNull() as InvalidPathException
+            assertEquals(InvalidPathReason.ROOT_NOT_ALLOWED_FOR_OPERATION, rootDelete.reason)
+
+            val intermediateType = runCatching { filesystem.metadata("/file/child") }.exceptionOrNull()
+            assertEquals("simplefilesystem.PathTypeMismatchException", intermediateType?.javaClass?.name)
             val range = runCatching { filesystem.source("/file", 2L, 2L) }.exceptionOrNull()
             assertEquals("simplefilesystem.InvalidByteRangeException", range?.javaClass?.name)
             assertEquals(
                 "Byte range offset=2, byteCount=2 is invalid for path '/file' with size 3 bytes; offset and " +
-                    "byteCount must be non-negative and the range must end at or before byte 3.",
+                    "byteCount must be non-negative, addition must not overflow, and the range must end at or before byte 3.",
                 range?.message,
             )
         } finally {

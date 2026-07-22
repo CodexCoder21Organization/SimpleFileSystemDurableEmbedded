@@ -16,10 +16,15 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 import simplefilesystem.FilesystemExpiredException
+import simplefilesystem.InvalidCursorException
+import simplefilesystem.InvalidFilesystemDescriptionException
 import simplefilesystem.InvalidFilesystemUuidException
 import simplefilesystem.InvalidMaxSizeBytesException
+import simplefilesystem.InvalidPageLimitException
 import sql.Database
 
 fun testFilesystemIdentityAndExpiration() {
@@ -32,10 +37,19 @@ fun testFilesystemIdentityAndExpiration() {
             val first = manager.createFilesystem("duplicate description", 100L)
             val second = manager.createFilesystem("duplicate description", 200L)
 
-            assertEquals(2, manager.listFilesystems().size)
-            assertEquals(setOf(first.uuid, second.uuid), manager.listFilesystems().map { it.uuid }.toSet())
+            assertEquals(2, manager.listFilesystems(null, 100).filesystems.size)
+            assertEquals(
+                setOf(first.uuid, second.uuid),
+                manager.listFilesystems(null, 100).filesystems.map { it.uuid }.toSet(),
+            )
             assertEquals("duplicate description", first.description)
             assertNull(first.owner)
+            assertFailsWith<InvalidFilesystemDescriptionException> {
+                manager.createFilesystem("\uD800", 1L)
+            }
+            assertFailsWith<InvalidFilesystemDescriptionException> {
+                manager.createFilesystem("é".repeat(513), 1L)
+            }
             val invalidSize = runCatching { manager.createFilesystem("bad", 0L) }.exceptionOrNull()
             assertEquals("simplefilesystem.InvalidMaxSizeBytesException", invalidSize?.javaClass?.name)
             val invalidUuid = runCatching { manager.openFilesystem(first.uuid.uppercase()) }.exceptionOrNull()
@@ -60,7 +74,23 @@ fun testFilesystemIdentityAndExpiration() {
 
             manager.setExpiration(first.uuid, null)
             assertNull(manager.getExpiration(first.uuid))
-            manager.openFilesystem(first.uuid)
+            val active = manager.openFilesystem(first.uuid)
+
+            val beforeUsageChange = manager.listFilesystems(null, 100).snapshotRevision
+            active.writeUtf8("/changes-descriptor-usage", "x", null)
+            val afterUsageChange = manager.listFilesystems(null, 100)
+            assertTrue(afterUsageChange.snapshotRevision > beforeUsageChange)
+            assertEquals(afterUsageChange.filesystems.map { it.uuid }.sorted(), afterUsageChange.filesystems.map { it.uuid })
+
+            val firstPage = manager.listFilesystems(null, 1)
+            val secondPage = manager.listFilesystems(firstPage.nextAfter, 1)
+            assertEquals(firstPage.snapshotRevision, secondPage.snapshotRevision)
+            val deletedBoundary = firstPage.filesystems.single().uuid
+            manager.deleteFilesystem(deletedBoundary)
+            val afterDeletedBoundary = manager.listFilesystems(firstPage.nextAfter, 100)
+            assertTrue(afterDeletedBoundary.filesystems.none { it.uuid == deletedBoundary })
+            assertFailsWith<InvalidPageLimitException> { manager.listFilesystems(null, 0) }
+            assertFailsWith<InvalidCursorException> { manager.listFilesystems("bad", 1) }
         } finally {
             database.close()
         }

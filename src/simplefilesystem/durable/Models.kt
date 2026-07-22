@@ -1,8 +1,11 @@
 package simplefilesystem.durable
 
 import simplefilesystem.FileEntryInfo
+import simplefilesystem.FileEntryPage
+import simplefilesystem.FileEntryType
 import simplefilesystem.FileMetadataInfo
 import simplefilesystem.FilesystemInfo
+import simplefilesystem.FilesystemPage
 import sql.DatabaseRow
 import java.util.UUID
 
@@ -17,6 +20,7 @@ internal data class FilesystemRecord(
     val usedBytes: Long,
     val expiresAtMillis: Long?,
     val createdAtMillis: Long,
+    val namespaceRevision: Long,
 )
 
 internal data class EntryRecord(
@@ -70,6 +74,7 @@ internal data class FilesystemInfoValue(
 internal data class FileEntryInfoValue(
     override val name: String,
     override val path: String,
+    override val type: FileEntryType,
     override val isDirectory: Boolean,
     override val isRegularFile: Boolean,
     override val size: Long?,
@@ -77,6 +82,7 @@ internal data class FileEntryInfoValue(
 ) : FileEntryInfo
 
 internal data class FileMetadataInfoValue(
+    override val type: FileEntryType,
     override val isRegularFile: Boolean,
     override val isDirectory: Boolean,
     override val symlinkTarget: String? = null,
@@ -86,6 +92,18 @@ internal data class FileMetadataInfoValue(
     override val lastAccessedAtMillis: Long? = null,
     override val contentHash: String?,
 ) : FileMetadataInfo
+
+internal data class FileEntryPageValue(
+    override val entries: List<FileEntryInfo>,
+    override val nextAfter: String?,
+    override val snapshotRevision: Long,
+) : FileEntryPage
+
+internal data class FilesystemPageValue(
+    override val filesystems: List<FilesystemInfo>,
+    override val nextAfter: String?,
+    override val snapshotRevision: Long,
+) : FilesystemPage
 
 internal fun DatabaseRow.uuidValue(column: String): UUID = when (val value = results[column]) {
     is UUID -> value
@@ -121,6 +139,7 @@ internal fun DatabaseRow.toFilesystemRecord(): FilesystemRecord = FilesystemReco
     usedBytes = longValue("used_bytes"),
     expiresAtMillis = nullableLongValue("expires_at_millis"),
     createdAtMillis = longValue("created_at_millis"),
+    namespaceRevision = longValue("namespace_revision"),
 )
 
 internal fun DatabaseRow.toEntryRecord(): EntryRecord = EntryRecord(
@@ -157,6 +176,7 @@ internal fun FilesystemRecord.toInfo(): FilesystemInfo = FilesystemInfoValue(
 internal fun EntryRecord.toInfo(): FileEntryInfo = FileEntryInfoValue(
     name = name,
     path = path,
+    type = entryType,
     isDirectory = isDirectory,
     isRegularFile = isFile,
     size = sizeBytes,
@@ -164,6 +184,7 @@ internal fun EntryRecord.toInfo(): FileEntryInfo = FileEntryInfoValue(
 )
 
 internal fun EntryRecord.toMetadata(): FileMetadataInfo = FileMetadataInfoValue(
+    type = entryType,
     isRegularFile = isFile,
     isDirectory = isDirectory,
     size = sizeBytes,
@@ -171,3 +192,10 @@ internal fun EntryRecord.toMetadata(): FileMetadataInfo = FileMetadataInfoValue(
     lastModifiedAtMillis = modifiedAtMillis,
     contentHash = contentHash,
 )
+
+internal val EntryRecord.entryType: FileEntryType
+    get() = when (kind) {
+        "FILE" -> FileEntryType.REGULAR_FILE
+        "DIRECTORY" -> FileEntryType.DIRECTORY
+        else -> FileEntryType.OTHER
+    }

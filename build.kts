@@ -9,7 +9,7 @@ import build.kotlin.withartifact.WithArtifact
 import java.io.File
 
 val dependencies = listOf(
-    MavenPrebuilt2("simplefilesystem:simplefilesystem-api:0.1.0"),
+    MavenPrebuilt2("simplefilesystem:simplefilesystem-api:0.2.0"),
     MavenPrebuilt2("blobstore.api:blobstore-api:0.0.2"),
     MavenPrebuilt2("sql:sql-api:0.0.1"),
     MavenPrebuilt2("community.kotlin.clocks.simple:community-kotlin-clocks-simple:0.0.3"),

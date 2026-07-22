@@ -17,7 +17,10 @@ import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import java.util.UUID
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import okio.Buffer
+import simplefilesystem.FilesystemExpiredException
 import simplefilesystem.FilesystemNotFoundException
 import sql.Database
 
@@ -26,10 +29,11 @@ fun testFilesystemLifecycle() {
     try {
         val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
         try {
+            val clock = ManualClock(1_000L)
             val manager = DurableSimpleFileSystemManager(
                 InMemoryBlobstoreService(),
                 database,
-                ManualClock(1_000L),
+                clock,
             )
             val created = manager.createFilesystem("scratch", 1024L)
             UUID.fromString(created.uuid)
@@ -38,13 +42,22 @@ fun testFilesystemLifecycle() {
             assertEquals(1024L, created.maxSizeBytes)
             assertEquals(0L, created.usedBytes)
             assertEquals(1_000L, created.createdAtMillis)
-            assertEquals(listOf(created.uuid), manager.listFilesystems().map { it.uuid })
+            assertEquals(listOf(created.uuid), manager.listFilesystems(null, 100).filesystems.map { it.uuid })
             assertEquals(created.uuid, manager.getFilesystemInfo(created.uuid).uuid)
             manager.openFilesystem(created.uuid).writeUtf8("/hello.txt", "hello", null)
             assertEquals(5L, manager.getUsedBytes(created.uuid))
+            val staleOnExpiration = manager.openFilesystem(created.uuid).sink("/staged", null)
+            staleOnExpiration.write(Buffer().writeUtf8("bytes"), 5L)
+            manager.setExpiration(created.uuid, 1_000L)
+            assertFailsWith<FilesystemExpiredException> { staleOnExpiration.commit() }
+            manager.setExpiration(created.uuid, null)
+
+            val staleOnDeletion = manager.openFilesystem(created.uuid).sink("/deleted-stage", null)
+            staleOnDeletion.write(Buffer().writeUtf8("bytes"), 5L)
             manager.setExpiration(created.uuid, 9_000L)
             assertEquals(9_000L, manager.getExpiration(created.uuid))
             manager.deleteFilesystem(created.uuid)
+            assertFailsWith<FilesystemNotFoundException> { staleOnDeletion.commit() }
             val missing = runCatching { manager.getFilesystemInfo(created.uuid) }.exceptionOrNull()
             assertEquals("simplefilesystem.FilesystemNotFoundException", missing?.javaClass?.name)
             assertEquals(0L, database.getLong("SELECT count(*) FROM filesystems"))

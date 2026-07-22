@@ -21,6 +21,10 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
+import simplefilesystem.FileEntryType
+import simplefilesystem.InvalidCursorException
+import simplefilesystem.InvalidPageLimitException
 import sql.Database
 
 fun testDirectoriesWholeFilesAndMetadata() {
@@ -40,13 +44,33 @@ fun testDirectoriesWholeFilesAndMetadata() {
 
             assertEquals("hello", filesystem.readUtf8("/docs/hello.txt"))
             assertContentEquals(binary, Base64.getDecoder().decode(filesystem.read("/docs/archive/data.bin")))
-            assertEquals(listOf("/docs/archive", "/docs/hello.txt"), filesystem.list("/docs").map { it.path })
+            assertEquals(
+                listOf("/docs/archive", "/docs/hello.txt"),
+                filesystem.list("/docs", null, 100).entries.map { it.path },
+            )
+            val firstPage = filesystem.list("/docs", null, 1)
+            val secondPage = filesystem.list("/docs", firstPage.nextAfter, 1)
+            assertEquals(listOf("/docs/archive"), firstPage.entries.map { it.path })
+            assertEquals(listOf("/docs/hello.txt"), secondPage.entries.map { it.path })
+            assertEquals(firstPage.snapshotRevision, secondPage.snapshotRevision)
+            assertNull(secondPage.nextAfter)
+            assertFailsWith<InvalidPageLimitException> { filesystem.list("/docs", null, 0) }
+            assertFailsWith<InvalidCursorException> { filesystem.list("/docs", "/outside", 1) }
             assertEquals(
                 listOf("/docs/archive", "/docs/archive/data.bin", "/docs/hello.txt"),
-                filesystem.listRecursively("/docs").map { it.path },
+                filesystem.listRecursively("/docs", null, 100).entries.map { it.path },
             )
+            val firstRecursivePage = filesystem.listRecursively("/docs", null, 1)
+            val secondRecursivePage = filesystem.listRecursively("/docs", firstRecursivePage.nextAfter, 1)
+            assertEquals(listOf("/docs/archive"), firstRecursivePage.entries.map { it.path })
+            assertEquals(listOf("/docs/archive/data.bin"), secondRecursivePage.entries.map { it.path })
+            assertEquals(firstRecursivePage.snapshotRevision, secondRecursivePage.snapshotRevision)
+            assertFailsWith<InvalidCursorException> {
+                filesystem.listRecursively("/docs", "/outside", 1)
+            }
 
             val metadata = filesystem.metadata("/docs/hello.txt")
+            assertEquals(FileEntryType.REGULAR_FILE, metadata.type)
             assertTrue(metadata.isRegularFile)
             assertFalse(metadata.isDirectory)
             assertEquals(5L, metadata.size)
@@ -57,6 +81,34 @@ fun testDirectoriesWholeFilesAndMetadata() {
             assertNull(metadata.symlinkTarget)
             assertNull(filesystem.metadataOrNull("/missing"))
             assertEquals(10L, manager.getUsedBytes(created.uuid))
+
+            filesystem.createDirectories("/cursor", true)
+            filesystem.createDirectory("/cursor/a", true)
+            filesystem.createDirectory("/cursor/b", true)
+            val deletedBoundary = filesystem.list("/cursor", null, 1).nextAfter
+            filesystem.delete("/cursor/a", true)
+            assertEquals(
+                listOf("/cursor/b"),
+                filesystem.list("/cursor", deletedBoundary, Int.MAX_VALUE).entries.map { it.path },
+            )
+
+            filesystem.createDirectories("/order", true)
+            filesystem.createDirectory("/order/\uE000", true)
+            filesystem.createDirectory("/order/\uD800\uDC00", true)
+            assertEquals(
+                listOf("/order/\uE000", "/order/\uD800\uDC00"),
+                filesystem.list("/order", null, 100).entries.map { it.path },
+            )
+
+            val durableRevision = filesystem.list("/docs", null, 100).snapshotRevision
+            val reopened = DurableSimpleFileSystemManager(
+                InMemoryBlobstoreService(),
+                database,
+                ManualClock(8_001L),
+            ).openFilesystem(created.uuid)
+            assertEquals(durableRevision, reopened.list("/docs", null, 100).snapshotRevision)
+            reopened.createDirectory("/docs/revision", true)
+            assertTrue(reopened.list("/docs", null, 100).snapshotRevision > durableRevision)
         } finally {
             database.close()
         }

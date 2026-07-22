@@ -16,8 +16,13 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertSame
+import okio.Buffer
 import simplefilesystem.FileContentConflictException
+import simplefilesystem.FileEntryType
 import simplefilesystem.InvalidContentHashException
+import simplefilesystem.PathTypeMismatchException
 import sql.Database
 
 fun testConditionalWritesAndOverwrite() {
@@ -51,11 +56,25 @@ fun testConditionalWritesAndOverwrite() {
             }.exceptionOrNull()
             assertEquals("simplefilesystem.InvalidContentHashException", invalidHash?.javaClass?.name)
 
-            filesystem.writeUtf8("/value", "two", oneHash)
+            val staged = filesystem.sink("/value", oneHash)
+            staged.write(Buffer().writeUtf8("staged"), 6L)
+            filesystem.overwriteUtf8("/value", "winner")
+            val commitFailure = assertFailsWith<FileContentConflictException> { staged.commit() }
+            assertSame(commitFailure, assertFailsWith<FileContentConflictException> { staged.commit() })
+            staged.close()
+
+            filesystem.createDirectory("/directory", true)
+            val typeBeforeCas = assertFailsWith<PathTypeMismatchException> {
+                filesystem.writeUtf8("/directory", "two", "0".repeat(64))
+            }
+            assertEquals(FileEntryType.DIRECTORY, typeBeforeCas.observedType)
+
+            val winnerHash = filesystem.metadata("/value").contentHash!!
+            filesystem.writeUtf8("/value", "two", winnerHash)
             assertEquals("two", filesystem.readUtf8("/value"))
             filesystem.overwriteUtf8("/value", "unconditional")
             assertEquals("unconditional", filesystem.readUtf8("/value"))
-            assertEquals(13L, manager.getUsedBytes(manager.listFilesystems().single().uuid))
+            assertEquals(13L, manager.getUsedBytes(manager.listFilesystems(null, 100).filesystems.single().uuid))
         } finally {
             database.close()
         }
