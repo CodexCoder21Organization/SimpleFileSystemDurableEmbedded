@@ -73,6 +73,12 @@ class DurableSimpleFileSystemManager(
         if (maxSizeBytes <= 0L) throw InvalidMaxSizeBytesException(maxSizeBytes)
         val uuid = UUID.randomUUID()
         val now = clock.currentTimeMillis()
+        if (now < 0L) {
+            throw SimpleFileSystemException(
+                "Cannot create a filesystem: the injected clock reported currentTimeMillis=$now, but " +
+                    "filesystem creation timestamps must be non-negative.",
+            )
+        }
         transactionally { transaction ->
             transaction.execute(
                 """INSERT INTO filesystems
@@ -143,6 +149,7 @@ class DurableSimpleFileSystemManager(
         val parsed = parseUuid(uuid)
         ensureSchema()
         transactionally { transaction ->
+            lockWriteSessionsForFilesystem(transaction, parsed)
             val filesystem = requireFilesystem(transaction, parsed, lock = true)
             purgeFilesystem(transaction, filesystem)
         }
@@ -212,6 +219,21 @@ class DurableSimpleFileSystemManager(
         return sessions.count { sessionUuid -> reapSessionIfEligible(sessionUuid, now) }
     }
 
+    /** Releases generation pins held by readers whose renewable lease has expired. */
+    fun reapAbandonedReaderSessions(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): Int {
+        validateMaintenanceLimit(limit)
+        ensureSchema()
+        val now = clock.currentTimeMillis()
+        val readers = metadataDatabase.getUuids(
+            """SELECT reader_uuid FROM reader_sessions
+                WHERE state = 'OPEN' AND lease_expires_at_millis <= ?
+                ORDER BY lease_expires_at_millis, reader_uuid LIMIT ?""".trimIndent(),
+            now,
+            limit,
+        )
+        return readers.count { readerUuid -> reapReaderIfEligible(readerUuid, now) }
+    }
+
     /** Permanently removes filesystems whose expiration has passed, preserving revival until the row is locked. */
     fun purgeExpiredFilesystems(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): Int {
         validateMaintenanceLimit(limit)
@@ -230,7 +252,7 @@ class DurableSimpleFileSystemManager(
     /** Reconciles crash leftovers that are safe to resolve at startup; ordinary expiration purge remains explicit. */
     fun reconcileInterruptedWork(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): MaintenanceResult {
         validateMaintenanceLimit(limit)
-        val reaped = reapAbandonedWriteSessions(limit)
+        val reaped = reapAbandonedWriteSessions(limit) + reapAbandonedReaderSessions(limit)
         enqueueUnreferencedPinnedBlobs(limit)
         val resolved = processBlobGcOutbox(limit)
         return MaintenanceResult(
@@ -243,8 +265,9 @@ class DurableSimpleFileSystemManager(
     /** Runs one bounded pass of every maintenance operation. */
     fun runMaintenance(limit: Int = DEFAULT_MAINTENANCE_BATCH_SIZE): MaintenanceResult {
         validateMaintenanceLimit(limit)
-        val reaped = reapAbandonedWriteSessions(limit)
+        val reaped = reapAbandonedWriteSessions(limit) + reapAbandonedReaderSessions(limit)
         val purged = purgeExpiredFilesystems(limit)
+        enqueueUnreferencedPinnedBlobs(limit)
         val resolved = processBlobGcOutbox(limit)
         return MaintenanceResult(reaped, purged, resolved)
     }
@@ -327,6 +350,17 @@ class DurableSimpleFileSystemManager(
             )
             metadataDatabase.execute(
                 "CREATE INDEX IF NOT EXISTS write_sessions_by_lease ON write_sessions (state, lease_expires_at_millis)",
+            )
+            metadataDatabase.execute(
+                """CREATE TABLE IF NOT EXISTS reader_sessions (
+                    reader_uuid UUID PRIMARY KEY,
+                    generation_uuid UUID NOT NULL,
+                    lease_expires_at_millis INT8 NOT NULL,
+                    state STRING NOT NULL CHECK (state IN ('OPEN', 'RELEASED', 'REAPED'))
+                )""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                "CREATE INDEX IF NOT EXISTS reader_sessions_by_lease ON reader_sessions (state, lease_expires_at_millis)",
             )
             metadataDatabase.execute(
                 """CREATE TABLE IF NOT EXISTS blob_gc_outbox (
@@ -518,6 +552,12 @@ class DurableSimpleFileSystemManager(
         generationUuid,
     ).map { it.toBlockRecord() }
 
+    internal fun block(generationUuid: UUID, ordinal: Int): BlockRecord? = metadataDatabase.getRows(
+        "SELECT * FROM file_blocks WHERE generation_uuid = ? AND ordinal = ? LIMIT 1",
+        generationUuid,
+        ordinal,
+    ).firstOrNull()?.toBlockRecord()
+
     internal fun fileGenerationSnapshot(filesystemUuid: UUID, path: String): FileGenerationSnapshot {
         ensureSchema()
         return transactionally { transaction ->
@@ -527,12 +567,50 @@ class DurableSimpleFileSystemManager(
             if (!entry.isFile) {
                 throw PathTypeMismatchException(path, FileEntryType.REGULAR_FILE, entry.entryType)
             }
-            FileGenerationSnapshot(entry, blocks(transaction, requireNotNull(entry.generationUuid)))
+            val generation = requireNotNull(entry.generationUuid)
+            retainGeneration(transaction, generation)
+            val readerUuid = UUID.randomUUID()
+            transaction.execute(
+                """INSERT INTO reader_sessions
+                    (reader_uuid, generation_uuid, lease_expires_at_millis, state)
+                    VALUES (?, ?, ?, 'OPEN')""".trimIndent(),
+                readerUuid,
+                generation,
+                leaseDeadline(clock.currentTimeMillis()),
+            )
+            FileGenerationSnapshot(entry, generation, readerUuid)
+        }
+    }
+
+    internal fun renewReaderSession(readerUuid: UUID) {
+        transactionally { transaction ->
+            transaction.execute(
+                """UPDATE reader_sessions SET lease_expires_at_millis = ?
+                    WHERE reader_uuid = ? AND state = 'OPEN'""".trimIndent(),
+                leaseDeadline(clock.currentTimeMillis()),
+                readerUuid,
+            )
+        }
+    }
+
+    internal fun releaseReaderSession(readerUuid: UUID) {
+        transactionally { transaction ->
+            val reader = transaction.getRows(
+                "SELECT generation_uuid, state FROM reader_sessions WHERE reader_uuid = ? FOR UPDATE",
+                readerUuid,
+            ).firstOrNull() ?: return@transactionally
+            if (reader.stringValue("state") != "OPEN") return@transactionally
+            releaseGeneration(transaction, reader.uuidValue("generation_uuid"))
+            transaction.execute(
+                "UPDATE reader_sessions SET state = 'RELEASED' WHERE reader_uuid = ? AND state = 'OPEN'",
+                readerUuid,
+            )
         }
     }
 
     internal fun beginSession(filesystemUuid: UUID, rawPath: String, expectedHash: String?): Pair<UUID, String> {
         ensureSchema()
+        requireActiveFilesystem(filesystemUuid)
         val path = normalizePath(rawPath)
         validateExpectedHash(expectedHash)
         val session = UUID.randomUUID()
@@ -608,17 +686,26 @@ class DurableSimpleFileSystemManager(
         bytesReceived: Long,
     ): BlockRecord {
         val hash = uploadAndPinBlock(bytes)
-        return transactionally { transaction ->
-            requireRenewableSession(transaction, sessionUuid)
-            val block = publishPinnedBlock(transaction, sessionUuid, ordinal, hash, bytes.size)
-            transaction.execute(
-                """UPDATE write_sessions SET bytes_received = ?, lease_expires_at_millis = ?
-                    WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
-                bytesReceived,
-                leaseDeadline(clock.currentTimeMillis()),
-                sessionUuid,
-            )
-            block
+        return try {
+            transactionally { transaction ->
+                requireRenewableSession(transaction, sessionUuid)
+                val block = publishPinnedBlock(transaction, sessionUuid, ordinal, hash, bytes.size)
+                transaction.execute(
+                    """UPDATE write_sessions SET bytes_received = ?, lease_expires_at_millis = ?
+                        WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
+                    bytesReceived,
+                    leaseDeadline(clock.currentTimeMillis()),
+                    sessionUuid,
+                )
+                block
+            }
+        } catch (failure: Throwable) {
+            try {
+                metadataDatabase.execute { transaction -> enqueueBlobForGc(transaction, hash) }
+            } catch (cleanupFailure: Throwable) {
+                failure.addSuppressed(cleanupFailure)
+            }
+            throw failure
         }
     }
 
@@ -656,6 +743,7 @@ class DurableSimpleFileSystemManager(
     internal fun commitGeneration(stage: StagedGeneration, unconditional: Boolean): FileMetadataInfo {
         return try {
             transactionally { transaction ->
+                claimAndVerifyStagedGeneration(transaction, stage)
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 if (stage.path != "/") {
                     requireDirectoryPath(
@@ -714,11 +802,13 @@ class DurableSimpleFileSystemManager(
                 )
                 bumpFilesystemRevision(transaction, filesystem)
                 if (attemptedUsage != filesystem.usedBytes) bumpManagerRevision(transaction)
-                transaction.execute(
-                    "UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ? WHERE session_uuid = ?",
+                val committed = transaction.execute(
+                    """UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ?
+                        WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
                     stage.sizeBytes,
                     stage.sessionUuid,
                 )
+                checkUpdateCount(committed, 1, "commit write session '${stage.sessionUuid}'")
                 requireEntry(transaction, stage.filesystemUuid, stage.path).toMetadata()
             }
         } catch (failure: Throwable) {
@@ -735,6 +825,7 @@ class DurableSimpleFileSystemManager(
         val assembledHashes = linkedSetOf<String>()
         return try {
             transactionally { transaction ->
+                val appendedBlocks = claimAndVerifyStagedGeneration(transaction, stage)
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 if (stage.path != "/") {
                     requireDirectoryPath(
@@ -757,7 +848,6 @@ class DurableSimpleFileSystemManager(
                 }
                 val attemptedUsage = checkedAttemptedUsage(filesystem, stage.path, oldSize, appendedSize)
                 val currentBlocks = current?.generationUuid?.let { blocks(transaction, it) }.orEmpty()
-                val appendedBlocks = blocks(transaction, stage.sessionUuid)
                 transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", stage.sessionUuid)
                 val assembler = TransactionalBlockAssembler(this, transaction, stage.sessionUuid) { hash ->
                     assembledHashes += hash
@@ -813,11 +903,13 @@ class DurableSimpleFileSystemManager(
                 )
                 bumpFilesystemRevision(transaction, filesystem)
                 if (attemptedUsage != filesystem.usedBytes) bumpManagerRevision(transaction)
-                transaction.execute(
-                    "UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ? WHERE session_uuid = ?",
+                val committed = transaction.execute(
+                    """UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ?
+                        WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
                     stage.sizeBytes,
                     stage.sessionUuid,
                 )
+                checkUpdateCount(committed, 1, "commit append session '${stage.sessionUuid}'")
                 requireEntry(transaction, stage.filesystemUuid, stage.path).toMetadata()
             }
         } catch (failure: Throwable) {
@@ -841,6 +933,94 @@ class DurableSimpleFileSystemManager(
         val observed = current?.contentHash
         val matches = if (expectedHash == null) current == null else current != null && observed == expectedHash
         if (!matches) throw FileContentConflictException(path, expectedHash, observed)
+    }
+
+    /**
+     * Global writer lock order starts with the write-session row, then the filesystem row, entry rows, and
+     * finally per-hash GC-outbox rows. Holding the OPEN session row through publication makes reaping and
+     * committing mutually exclusive across independently connected manager instances.
+     */
+    private fun claimAndVerifyStagedGeneration(database: Database, stage: StagedGeneration): List<BlockRecord> {
+        val session = database.getRows(
+            """SELECT filesystem_uuid, path, expected_hash, bytes_received, state
+                FROM write_sessions WHERE session_uuid = ? FOR UPDATE""".trimIndent(),
+            stage.sessionUuid,
+        ).firstOrNull() ?: throw SimpleFileSystemException(
+            "Write session '${stage.sessionUuid}' no longer exists and cannot publish path '${stage.path}'.",
+        )
+        val state = session.stringValue("state")
+        if (state != "OPEN") {
+            throw SimpleFileSystemException(
+                "Write session '${stage.sessionUuid}' cannot publish path '${stage.path}' because its state is " +
+                    "'$state', not 'OPEN'.",
+            )
+        }
+        val storedFilesystem = session.uuidValue("filesystem_uuid")
+        val storedPath = session.stringValue("path")
+        val storedExpectedHash = session.nullableStringValue("expected_hash")
+        val storedBytes = session.longValue("bytes_received")
+        if (storedFilesystem != stage.filesystemUuid || storedPath != stage.path ||
+            storedExpectedHash != stage.expectedHash || storedBytes != stage.sizeBytes
+        ) {
+            throw SimpleFileSystemException(
+                "Write session '${stage.sessionUuid}' publication metadata changed unexpectedly: expected " +
+                    "filesystem='${stage.filesystemUuid}', path='${stage.path}', expectedHash=${stage.expectedHash}, " +
+                    "bytes=${stage.sizeBytes}; stored filesystem='$storedFilesystem', path='$storedPath', " +
+                    "expectedHash=$storedExpectedHash, bytes=$storedBytes.",
+            )
+        }
+
+        val stagedBlocks = blocks(database, stage.sessionUuid)
+        val expectedBlockCount = if (stage.sizeBytes == 0L) 0L else
+            ((stage.sizeBytes - 1L) / BLOCK_SIZE_BYTES.toLong()) + 1L
+        if (stagedBlocks.size.toLong() != expectedBlockCount ||
+            stagedBlocks.withIndex().any { (index, block) -> block.ordinal != index }
+        ) {
+            throw SimpleFileSystemException(
+                "Write session '${stage.sessionUuid}' cannot publish path '${stage.path}': expected " +
+                    "$expectedBlockCount contiguous staged block(s) for ${stage.sizeBytes} bytes, but found " +
+                    "${stagedBlocks.size} block(s) with ordinals ${stagedBlocks.map { it.ordinal }}.",
+            )
+        }
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        var observedTotal = 0L
+        stagedBlocks.forEach { block ->
+            var observedBlock = 0L
+            blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { input ->
+                val transfer = ByteArray(8192)
+                while (true) {
+                    val count = input.read(transfer)
+                    if (count == -1) break
+                    if (count == 0) continue
+                    digest.update(transfer, 0, count)
+                    observedBlock = Math.addExact(observedBlock, count.toLong())
+                }
+            }
+            if (observedBlock != block.sizeBytes.toLong()) {
+                throw SimpleFileSystemException(
+                    "Write session '${stage.sessionUuid}' block ${block.ordinal} declares ${block.sizeBytes} bytes, " +
+                        "but Blobstore returned $observedBlock bytes for hash '${block.blobHash}'.",
+                )
+            }
+            observedTotal = Math.addExact(observedTotal, observedBlock)
+        }
+        val observedHash = digest.digest().toUpperHex()
+        if (observedTotal != stage.sizeBytes || observedHash != stage.contentHash) {
+            throw SimpleFileSystemException(
+                "Write session '${stage.sessionUuid}' cannot publish path '${stage.path}': staged content was " +
+                    "$observedTotal bytes with SHA-256 $observedHash, but the sink declared ${stage.sizeBytes} bytes " +
+                    "with SHA-256 ${stage.contentHash}.",
+            )
+        }
+        return stagedBlocks
+    }
+
+    private fun checkUpdateCount(result: sql.DatabaseRow, expected: Int, action: String) {
+        val observed = (result.results["UPDATE_COUNT"] as? Number)?.toInt()
+        check(observed == expected) {
+            "Expected to $action by updating exactly $expected row(s), but CockroachDB reported $observed row(s)."
+        }
     }
 
     internal fun checkedAttemptedUsage(
@@ -987,7 +1167,25 @@ class DurableSimpleFileSystemManager(
         true
     }
 
+    private fun reapReaderIfEligible(readerUuid: UUID, observedNow: Long): Boolean = transactionally { transaction ->
+        val reader = transaction.getRows(
+            """SELECT generation_uuid, state, lease_expires_at_millis FROM reader_sessions
+                WHERE reader_uuid = ? FOR UPDATE""".trimIndent(),
+            readerUuid,
+        ).firstOrNull() ?: return@transactionally false
+        if (reader.stringValue("state") != "OPEN" || reader.longValue("lease_expires_at_millis") > observedNow) {
+            return@transactionally false
+        }
+        releaseGeneration(transaction, reader.uuidValue("generation_uuid"))
+        transaction.execute(
+            "UPDATE reader_sessions SET state = 'REAPED' WHERE reader_uuid = ? AND state = 'OPEN'",
+            readerUuid,
+        )
+        true
+    }
+
     private fun purgeFilesystemIfExpired(uuid: UUID, observedNow: Long): Boolean = transactionally { transaction ->
+        lockWriteSessionsForFilesystem(transaction, uuid)
         val filesystem = transaction.getRows(
             "SELECT * FROM filesystems WHERE uuid = ? FOR UPDATE",
             uuid,
@@ -1006,7 +1204,8 @@ class DurableSimpleFileSystemManager(
             entry.generationUuid?.let { releaseGeneration(database, it) }
         }
         database.getUuids(
-            "SELECT session_uuid FROM write_sessions WHERE filesystem_uuid = ? FOR UPDATE",
+            """SELECT session_uuid FROM write_sessions
+                WHERE filesystem_uuid = ? AND state IN ('OPEN', 'ABORTED')""".trimIndent(),
             filesystem.uuid,
         ).forEach { generation ->
             database.getStrings(
@@ -1017,6 +1216,14 @@ class DurableSimpleFileSystemManager(
         }
         database.execute("DELETE FROM filesystems WHERE uuid = ?", filesystem.uuid)
         bumpManagerRevision(database)
+    }
+
+    private fun lockWriteSessionsForFilesystem(database: Database, filesystemUuid: UUID) {
+        database.getRows(
+            """SELECT session_uuid FROM write_sessions WHERE filesystem_uuid = ?
+                ORDER BY session_uuid FOR UPDATE""".trimIndent(),
+            filesystemUuid,
+        )
     }
 
     private fun requireRenewableSession(database: Database, sessionUuid: UUID) {

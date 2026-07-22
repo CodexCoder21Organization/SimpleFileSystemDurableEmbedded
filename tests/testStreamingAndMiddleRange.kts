@@ -120,11 +120,11 @@ fun testStreamingAndMiddleRange() {
             }
             assertEquals("injected staged block failure", poison.message)
             assertSame(poison, assertFailsWith<IllegalStateException> { poisoned.commit() })
-            assertSame(
-                poison,
+            assertEquals(
+                "FileSink for path '/poisoned' cannot accept data: the sink failed earlier and is poisoned.",
                 assertFailsWith<IllegalStateException> {
                     poisoned.write(Buffer().writeByte(1), 1L)
-                },
+                }.message,
             )
         } finally {
             database.close()

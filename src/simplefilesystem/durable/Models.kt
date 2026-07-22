@@ -64,7 +64,8 @@ internal data class StagedGeneration(
 
 internal data class FileGenerationSnapshot(
     val entry: EntryRecord,
-    val blocks: List<BlockRecord>,
+    val generationUuid: UUID,
+    val readerUuid: UUID,
 )
 
 internal data class FilesystemInfoValue(

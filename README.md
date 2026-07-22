@@ -59,7 +59,7 @@ Directory and manager listings are cursor-paginated and expose durable snapshot 
 
 ## Maintenance and reconciliation
 
-Maintenance is explicit by default. Call `reapAbandonedWriteSessions()`, `purgeExpiredFilesystems()`, and `processBlobGcOutbox()` separately, or call `runMaintenance()` for one bounded pass of all three. Every manager construction also performs crash reconciliation: expired or explicitly aborted sessions are reaped and previously committed GC-outbox intents are resumed, while expiration purge remains explicit so an expired-but-unpurged filesystem can still be revived with `setExpiration(uuid, null)`.
+Maintenance is explicit by default. Call `reapAbandonedWriteSessions()`, `reapAbandonedReaderSessions()`, `purgeExpiredFilesystems()`, and `processBlobGcOutbox()` separately, or call `runMaintenance()` for one bounded pass. Every manager construction also performs crash reconciliation: expired or explicitly aborted sessions are reaped, unreferenced pins are inventoried, and previously committed GC-outbox intents are resumed, while expiration purge remains explicit so an expired-but-unpurged filesystem can still be revived with `setExpiration(uuid, null)`.
 
 Background maintenance is opt-in through `maintenanceIntervalMillis`; the default is `null`, so constructing a manager does not start recurring work. The interval is converted to the absolute deadline required by `Clock.schedule`, and `close()` cancels the scheduled callback without shutting down the caller-owned clock:
 
@@ -81,8 +81,9 @@ try {
 - `filesystems` stores UUID identity, free-text descriptions, quota accounting, expiration, and a durable per-filesystem namespace revision.
 - `simple_filesystem_manager_state` stores the durable manager-descriptor revision used by filesystem-listing pages.
 - `entries` stores the directory tree and atomically points files at immutable generation UUIDs.
-- `file_blocks` maps each generation to ordered 4 MiB Blobstore blocks and tracks how many entries share that generation.
+- `file_blocks` maps each generation to ordered 4 MiB Blobstore blocks and tracks references from entries and open readers.
 - `write_sessions` records staged uploads, terminal state, and a renewable lease. Chunk writes renew the lease; reaping deletes an expired session's staged `file_blocks`, queues their hashes for GC evaluation, and leaves the durable session row in `REAPED` state without changing quota.
+- `reader_sessions` gives each open `Source` or `InputStream` a renewable generation pin. Reaching EOF or closing releases it; maintenance reaps abandoned expired readers. Therefore deletion, overwrite, purge, and Blobstore GC cannot invalidate a reader that was already opened and continues making progress.
 - `blob_gc_outbox` records blocks that may be unpinned after a generation loses its final reference. Writers and collectors serialize on each hash's outbox row; writers re-pin after acquiring the row lock before publishing `file_blocks`, while collectors re-check every committed and staged SQL reference before an idempotent unpin.
 - Expiration is a two-step lifecycle: operations reject an expired filesystem, but callers may revive it until `purgeExpiredFilesystems()` locks and deletes it. Purge releases generations and staged blocks through the same GC outbox, so a content hash shared by another filesystem stays pinned.
 

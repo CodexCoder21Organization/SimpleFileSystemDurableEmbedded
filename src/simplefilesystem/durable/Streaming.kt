@@ -71,13 +71,10 @@ internal class StagedBlockSink(
     override fun commit(): FileMetadataInfo {
         committedMetadata?.let { return it }
         commitFailure?.let { throw it }
-        check(state == SinkState.OPEN) {
-            "Cannot commit staged sink '$path' after it was ${state.name.lowercase()}."
-        }
+        checkCommitAllowed()
         return try {
             manager.requireActiveFilesystem(filesystemUuid)
             if (pendingSize > 0) flushBlock()
-            manager.updateSessionBytes(sessionUuid, totalBytes)
             val contentHash = digest.digest().toUpperHex()
             val stage = StagedGeneration(
                 sessionUuid = sessionUuid,
@@ -124,10 +121,22 @@ internal class StagedBlockSink(
     }
 
     private fun ensureWritable() {
-        commitFailure?.let { throw it }
-        check(state == SinkState.OPEN) {
-            "Cannot write or flush staged sink '$path' after it became ${state.name.lowercase()}."
+        val reason = when (state) {
+            SinkState.ABORTED, SinkState.CLOSED -> "the sink was aborted."
+            SinkState.COMMITTED -> "the sink was already committed."
+            SinkState.FAILED -> "the sink failed earlier and is poisoned."
+            SinkState.OPEN -> return
         }
+        throw IllegalStateException("FileSink for path '$path' cannot accept data: $reason")
+    }
+
+    private fun checkCommitAllowed() {
+        val reason = when (state) {
+            SinkState.ABORTED -> "the sink was aborted."
+            SinkState.CLOSED -> "the sink was closed without commit, which aborted it."
+            SinkState.OPEN, SinkState.COMMITTED, SinkState.FAILED -> return
+        }
+        throw IllegalStateException("FileSink for path '$path' cannot commit: $reason")
     }
 
     private fun poison(failure: Throwable) {
@@ -240,21 +249,28 @@ internal class TransactionalBlockAssembler(
 
 internal class GenerationSource(
     private val manager: DurableSimpleFileSystemManager,
-    private val blocks: List<BlockRecord>,
+    private val generationUuid: UUID,
+    private val readerUuid: UUID,
+    firstOrdinal: Int,
+    private val lastOrdinal: Int,
     private val initialSkip: Long,
     byteCount: Long,
 ) : Source {
     private var remaining: Long = byteCount
-    private var blockIndex: Int = 0
+    private var nextOrdinal: Int = firstOrdinal
     private var current: InputStream? = null
     private var closed: Boolean = false
+    private var readerReleased: Boolean = false
     private var skipForNextBlock: Long = initialSkip
 
     override fun read(sink: Buffer, byteCount: Long): Long {
         check(!closed) { "Cannot read from a closed durable filesystem source." }
         require(byteCount >= 0L) { "Source read byteCount must be non-negative, but was $byteCount." }
         if (byteCount == 0L) return 0L
-        if (remaining == 0L) return -1L
+        if (remaining == 0L) {
+            releaseReader()
+            return -1L
+        }
         while (true) {
             val stream = current ?: openNextBlock() ?: error(
                 "Generation ended with $remaining bytes still required by the requested file range.",
@@ -270,6 +286,7 @@ internal class GenerationSource(
             if (read == 0) continue
             sink.write(bytes, 0, read)
             remaining -= read.toLong()
+            if (remaining == 0L) releaseReader()
             return read.toLong()
         }
     }
@@ -281,11 +298,13 @@ internal class GenerationSource(
         closed = true
         current?.close()
         current = null
+        releaseReader()
     }
 
     private fun openNextBlock(): InputStream? {
-        if (blockIndex >= blocks.size) return null
-        val block = blocks[blockIndex++]
+        if (nextOrdinal > lastOrdinal) return null
+        manager.renewReaderSession(readerUuid)
+        val block = manager.block(generationUuid, nextOrdinal++) ?: return null
         val stream = manager.blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash)
         var toSkip = skipForNextBlock
         skipForNextBlock = 0L
@@ -304,6 +323,12 @@ internal class GenerationSource(
         }
         current = stream
         return stream
+    }
+
+    private fun releaseReader() {
+        if (readerReleased) return
+        manager.releaseReaderSession(readerUuid)
+        readerReleased = true
     }
 }
 

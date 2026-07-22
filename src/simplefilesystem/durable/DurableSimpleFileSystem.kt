@@ -35,6 +35,7 @@ class DurableSimpleFileSystem internal constructor(
     private val filesystemUuid: UUID,
 ) : SimpleFileSystem {
     override fun list(path: String, after: String?, limit: Int): FileEntryPage {
+        requireActive()
         val normalized = manager.normalizePath(path)
         val cursor = manager.validateListCursor(normalized, after, recursive = false)
         val pageLimit = manager.validatePageLimit(limit)
@@ -64,6 +65,7 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun listRecursively(path: String, after: String?, limit: Int): FileEntryPage {
+        requireActive()
         val normalized = manager.normalizePath(path)
         val cursor = manager.validateListCursor(normalized, after, recursive = true)
         val pageLimit = manager.validatePageLimit(limit)
@@ -112,36 +114,51 @@ class DurableSimpleFileSystem internal constructor(
     override fun readUtf8(path: String): String = decodeStrictUtf8(path, readInlineBytes(path))
 
     override fun write(path: String, data: String, ifMatches: String?): FileMetadataInfo {
+        requireActive()
+        manager.normalizePath(path)
         val bytes = decodeBase64(path, data)
+        manager.validateExpectedHash(ifMatches)
         return commitBytes(sink(path, ifMatches), bytes)
     }
 
     override fun writeUtf8(path: String, content: String, ifMatches: String?): FileMetadataInfo {
+        requireActive()
+        manager.normalizePath(path)
         val bytes = encodeStrictUtf8(path, content)
+        manager.validateExpectedHash(ifMatches)
         return commitBytes(sink(path, ifMatches), bytes)
     }
 
     override fun overwrite(path: String, data: String): FileMetadataInfo {
+        requireActive()
+        manager.normalizePath(path)
         val bytes = decodeBase64(path, data)
         return commitBytes(unconditionalSink(path), bytes)
     }
 
     override fun overwriteUtf8(path: String, content: String): FileMetadataInfo {
+        requireActive()
+        manager.normalizePath(path)
         val bytes = encodeStrictUtf8(path, content)
         return commitBytes(unconditionalSink(path), bytes)
     }
 
     override fun appendingWrite(path: String, data: String, mustExist: Boolean): FileMetadataInfo {
+        requireActive()
+        manager.normalizePath(path)
         val bytes = decodeBase64(path, data)
         return commitBytes(appendingSink(path, mustExist), bytes)
     }
 
     override fun appendingWriteUtf8(path: String, content: String, mustExist: Boolean): FileMetadataInfo {
+        requireActive()
+        manager.normalizePath(path)
         val bytes = encodeStrictUtf8(path, content)
         return commitBytes(appendingSink(path, mustExist), bytes)
     }
 
     override fun metadata(path: String): FileMetadataInfo {
+        requireActive()
         val normalized = manager.normalizePath(path)
         return manager.transactionally { transaction ->
             manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
@@ -151,6 +168,7 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun metadataOrNull(path: String): FileMetadataInfo? {
+        requireActive()
         val normalized = manager.normalizePath(path)
         return manager.transactionally { transaction ->
             manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
@@ -160,6 +178,7 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun exists(path: String): Boolean {
+        requireActive()
         val normalized = manager.normalizePath(path)
         return manager.transactionally { transaction ->
             manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
@@ -169,6 +188,7 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun delete(path: String, mustExist: Boolean) {
+        requireActive()
         val normalized = manager.normalizePath(path)
         if (normalized == "/") {
             throw InvalidPathException(path, InvalidPathReason.ROOT_NOT_ALLOWED_FOR_OPERATION)
@@ -208,6 +228,7 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun deleteRecursively(path: String, mustExist: Boolean) {
+        requireActive()
         val normalized = manager.normalizePath(path)
         manager.ensureSchema()
         manager.transactionally { transaction ->
@@ -250,6 +271,7 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun copy(source: String, target: String): FileMetadataInfo {
+        requireActive()
         val normalizedSource = manager.normalizePath(source)
         val normalizedTarget = manager.normalizePath(target)
         manager.ensureSchema()
@@ -328,6 +350,7 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun atomicMove(source: String, target: String): FileMetadataInfo {
+        requireActive()
         val normalizedSource = manager.normalizePath(source)
         val normalizedTarget = manager.normalizePath(target)
         manager.ensureSchema()
@@ -406,7 +429,10 @@ class DurableSimpleFileSystem internal constructor(
         val snapshot = fileSnapshot(path)
         return GenerationSource(
             manager,
-            snapshot.blocks,
+            snapshot.generationUuid,
+            snapshot.readerUuid,
+            firstOrdinal = 0,
+            lastOrdinal = ((requireNotNull(snapshot.entry.sizeBytes) - 1L) / BLOCK_SIZE_BYTES).toInt(),
             initialSkip = 0L,
             byteCount = requireNotNull(snapshot.entry.sizeBytes),
         )
@@ -416,15 +442,20 @@ class DurableSimpleFileSystem internal constructor(
         val snapshot = fileSnapshot(path)
         val size = requireNotNull(snapshot.entry.sizeBytes)
         if (offset < 0L || byteCount < 0L || offset > size || byteCount > size - offset) {
+            manager.releaseReaderSession(snapshot.readerUuid)
             throw InvalidByteRangeException(snapshot.entry.path, offset, byteCount, size)
         }
-        if (byteCount == 0L) return GenerationSource(manager, emptyList(), 0L, 0L)
+        if (byteCount == 0L) return GenerationSource(
+            manager, snapshot.generationUuid, snapshot.readerUuid, 0, -1, 0L, 0L,
+        )
         val firstOrdinal = (offset / BLOCK_SIZE_BYTES).toInt()
         val lastOrdinal = ((offset + byteCount - 1L) / BLOCK_SIZE_BYTES).toInt()
-        val relevant = snapshot.blocks.filter { it.ordinal in firstOrdinal..lastOrdinal }
         return GenerationSource(
             manager,
-            relevant,
+            snapshot.generationUuid,
+            snapshot.readerUuid,
+            firstOrdinal,
+            lastOrdinal,
             initialSkip = offset % BLOCK_SIZE_BYTES,
             byteCount = byteCount,
         )
@@ -461,6 +492,7 @@ class DurableSimpleFileSystem internal constructor(
     )
 
     private fun createDirectoriesInternal(path: String, mustCreate: Boolean, recursive: Boolean) {
+        requireActive()
         val normalized = manager.normalizePath(path)
         if (normalized == "/") {
             active()
@@ -533,8 +565,13 @@ class DurableSimpleFileSystem internal constructor(
     )
 
     private fun fileSnapshot(rawPath: String): FileGenerationSnapshot {
+        requireActive()
         val normalized = manager.normalizePath(rawPath)
         return manager.fileGenerationSnapshot(filesystemUuid, normalized)
+    }
+
+    private fun requireActive() {
+        manager.requireActiveFilesystem(filesystemUuid)
     }
 
     private fun readInlineBytes(path: String): ByteArray {
@@ -542,7 +579,8 @@ class DurableSimpleFileSystem internal constructor(
         val size = requireNotNull(snapshot.entry.sizeBytes)
         requireInlineSize(snapshot.entry.path, size)
         val buffer = Buffer()
-        GenerationSource(manager, snapshot.blocks, 0L, size).use { source ->
+        val lastOrdinal = if (size == 0L) -1 else ((size - 1L) / BLOCK_SIZE_BYTES).toInt()
+        GenerationSource(manager, snapshot.generationUuid, snapshot.readerUuid, 0, lastOrdinal, 0L, size).use { source ->
             while (source.read(buffer, 8192L) != -1L) Unit
         }
         return buffer.readByteArray()

@@ -49,13 +49,23 @@ fun testAbandonedSinkIsolation() {
             aborted.abort()
             aborted.close()
             assertFalse(filesystem.exists("/aborted"))
-            assertFailsWith<IllegalStateException> { aborted.commit() }
+            assertEquals(
+                "FileSink for path '/aborted' cannot accept data: the sink was aborted.",
+                assertFailsWith<IllegalStateException> { aborted.write(Buffer(), 0L) }.message,
+            )
+            assertEquals(
+                "FileSink for path '/aborted' cannot commit: the sink was aborted.",
+                assertFailsWith<IllegalStateException> { aborted.commit() }.message,
+            )
 
             val closed = filesystem.sink("/closed", null)
             closed.write(Buffer().writeUtf8("discarded"), 9L)
             closed.close()
             assertFalse(filesystem.exists("/closed"))
-            assertFailsWith<IllegalStateException> { closed.commit() }
+            assertEquals(
+                "FileSink for path '/closed' cannot commit: the sink was closed without commit, which aborted it.",
+                assertFailsWith<IllegalStateException> { closed.commit() }.message,
+            )
 
             val committed = filesystem.sink("/committed", null)
             committed.write(Buffer().writeUtf8("visible"), 7L)
@@ -64,6 +74,10 @@ fun testAbandonedSinkIsolation() {
             assertSame(metadata, committed.commit())
             committed.abort()
             committed.close()
+            assertEquals(
+                "FileSink for path '/committed' cannot accept data: the sink was already committed.",
+                assertFailsWith<IllegalStateException> { committed.flush() }.message,
+            )
             assertEquals("visible", filesystem.readUtf8("/committed"))
         } finally {
             database.close()
