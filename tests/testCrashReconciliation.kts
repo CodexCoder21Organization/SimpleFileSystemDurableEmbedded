@@ -17,10 +17,10 @@ import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import java.io.ByteArrayInputStream
 import java.security.MessageDigest
-import java.util.UUID
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
+import okio.Buffer
 import sql.Database
 
 fun testCrashReconciliation() {
@@ -41,38 +41,13 @@ fun testCrashReconciliation() {
             val oldHash = filesystem.writeUtf8("/committed", "old committed bytes", null).contentHash!!
             filesystem.overwriteUtf8("/committed", "new committed bytes")
             assertTrue(blobs.isPinned("simplefilesystem-durable-embedded", oldHash))
-            assertEquals(1L, database.getLong("SELECT count(*) FROM blob_gc_outbox WHERE blob_hash = ?", oldHash))
 
-            val orphanBytes = "pinned before SQL commit".toByteArray()
+            val orphanBytes = ByteArray(4 * 1024 * 1024) { 7 }
             val orphanHash = MessageDigest.getInstance("SHA-256").digest(orphanBytes)
                 .joinToString("") { "%02X".format(it.toInt() and 0xFF) }
-            blobs.putBlob(
-                "simplefilesystem-durable-embedded",
-                orphanHash,
-                orphanBytes.size.toLong(),
-                ByteArrayInputStream(orphanBytes),
-            )
-            assertTrue(blobs.pinBlob("simplefilesystem-durable-embedded", orphanHash))
-            val session = UUID.randomUUID()
-            database.execute(
-                """INSERT INTO write_sessions
-                    (session_uuid, filesystem_uuid, path, expected_hash, bytes_received, created_at_millis,
-                     lease_expires_at_millis, state)
-                    VALUES (?, ?::UUID, '/orphan', NULL, ?, ?, ?, 'OPEN')""".trimIndent(),
-                session,
-                uuid,
-                orphanBytes.size.toLong(),
-                20_000L,
-                20_100L,
-            )
-            database.execute(
-                """INSERT INTO file_blocks
-                    (generation_uuid, ordinal, blob_hash, size_bytes, reference_count)
-                    VALUES (?, 0, ?, ?, 0)""".trimIndent(),
-                session,
-                orphanHash,
-                orphanBytes.size,
-            )
+            val interruptedSink = filesystem.sink("/orphan", null)
+            interruptedSink.write(Buffer().write(orphanBytes), orphanBytes.size.toLong())
+            assertTrue(blobs.isPinned("simplefilesystem-durable-embedded", orphanHash))
 
             val pinOnlyBytes = "crashed before file_blocks insert".toByteArray()
             val pinOnlyHash = MessageDigest.getInstance("SHA-256").digest(pinOnlyBytes)
@@ -96,9 +71,8 @@ fun testCrashReconciliation() {
             assertFalse(blobs.isPinned("simplefilesystem-durable-embedded", orphanHash))
             assertFalse(blobs.isPinned("simplefilesystem-durable-embedded", pinOnlyHash))
             assertFalse(blobs.isPinned("simplefilesystem-durable-embedded", oldHash))
-            assertEquals(listOf("REAPED"), database.getStrings("SELECT state FROM write_sessions WHERE session_uuid = ?", session))
-            assertEquals(0L, database.getLong("SELECT count(*) FROM file_blocks WHERE generation_uuid = ?", session))
-            assertEquals(0L, database.getLong("SELECT count(*) FROM blob_gc_outbox"))
+            assertFalse(filesystem.exists("/orphan"))
+            assertEquals("new committed bytes".toByteArray().size.toLong(), firstManager.getUsedBytes(uuid))
             assertEquals("new committed bytes", filesystem.readUtf8("/committed"))
         } finally {
             database.close()

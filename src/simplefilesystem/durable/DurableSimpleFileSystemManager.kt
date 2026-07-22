@@ -37,7 +37,22 @@ import java.security.MessageDigest
 import java.sql.SQLException
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import java.util.TreeSet
 
+/**
+ * Durable CockroachDB/Blobstore implementation of [SimpleFileSystemManager].
+ *
+ * Every transaction that needs more than one row lock follows one global order: orphan-inventory cursor (when
+ * applicable), write sessions in UUID order, reader session, filesystem, namespace entries and generation blocks
+ * in primary-key order, Blobstore GC-outbox hashes in lexical order, then manager revision. A path that needs only
+ * a suffix of that order starts at that suffix; it never acquires an earlier class after a later one. External
+ * Blobstore calls are idempotent and may be repeated by Cockroach serialization retries, while SQL publication and
+ * cursor movement remain in the single retried transaction.
+ *
+ * Large block and subtree transitions retain one logical SQL commit. They keyset-page metadata in fixed-size
+ * batches inside that transaction, so no caller can observe an intermediate namespace and heap usage is bounded by
+ * [INTERNAL_KEYSET_BATCH_SIZE], independent of file or subtree cardinality.
+ */
 class DurableSimpleFileSystemManager(
     internal val blobstoreService: BlobstoreService,
     internal val metadataDatabase: Database,
@@ -369,6 +384,16 @@ class DurableSimpleFileSystemManager(
                     created_at_millis INT8 NOT NULL
                 )""".trimIndent(),
             )
+            metadataDatabase.execute(
+                """CREATE TABLE IF NOT EXISTS simple_filesystem_maintenance_state (
+                    singleton BOOL PRIMARY KEY DEFAULT true CHECK (singleton),
+                    orphan_inventory_high_water STRING NULL
+                )""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                """INSERT INTO simple_filesystem_maintenance_state (singleton, orphan_inventory_high_water)
+                    VALUES (true, NULL) ON CONFLICT (singleton) DO NOTHING""".trimIndent(),
+            )
             schemaReady = true
         }
     }
@@ -546,11 +571,6 @@ class DurableSimpleFileSystemManager(
         }
         return entry
     }
-
-    internal fun blocks(database: Database, generationUuid: UUID): List<BlockRecord> = database.getRows(
-        "SELECT * FROM file_blocks WHERE generation_uuid = ? ORDER BY ordinal",
-        generationUuid,
-    ).map { it.toBlockRecord() }
 
     internal fun block(generationUuid: UUID, ordinal: Int): BlockRecord? = metadataDatabase.getRows(
         "SELECT * FROM file_blocks WHERE generation_uuid = ? AND ordinal = ? LIMIT 1",
@@ -822,10 +842,10 @@ class DurableSimpleFileSystemManager(
     }
 
     internal fun commitAppend(stage: StagedGeneration, mustExist: Boolean): FileMetadataInfo {
-        val assembledHashes = linkedSetOf<String>()
+        val assembledGenerationUuid = UUID.randomUUID()
         return try {
             transactionally { transaction ->
-                val appendedBlocks = claimAndVerifyStagedGeneration(transaction, stage)
+                claimAndVerifyStagedGeneration(transaction, stage)
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 if (stage.path != "/") {
                     requireDirectoryPath(
@@ -847,19 +867,16 @@ class DurableSimpleFileSystemManager(
                     throw QuotaArithmeticOverflowException(stage.path, filesystem.usedBytes, oldSize, stage.sizeBytes)
                 }
                 val attemptedUsage = checkedAttemptedUsage(filesystem, stage.path, oldSize, appendedSize)
-                val currentBlocks = current?.generationUuid?.let { blocks(transaction, it) }.orEmpty()
-                transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", stage.sessionUuid)
-                val assembler = TransactionalBlockAssembler(this, transaction, stage.sessionUuid) { hash ->
-                    assembledHashes += hash
+                val assembler = TransactionalBlockAssembler(this, transaction, assembledGenerationUuid)
+                current?.generationUuid?.let { generation ->
+                    forEachGenerationBlock(transaction, generation) { block -> assembler.append(block) }
                 }
-                (currentBlocks + appendedBlocks).forEach { block ->
-                    if (!assembler.hasPendingBytes && block.sizeBytes == BLOCK_SIZE_BYTES) {
-                        assembler.reuseCompleteBlock(block)
-                    } else {
-                        blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { assembler.writeFrom(it) }
-                    }
-                }
+                forEachGenerationBlock(transaction, stage.sessionUuid) { block -> assembler.append(block) }
                 val final = assembler.finish()
+                check(final.first == appendedSize) {
+                    "Append assembly for path '${stage.path}' produced ${final.first} bytes, but $appendedSize bytes " +
+                        "were required by the committed old and staged lengths."
+                }
                 val now = clock.currentTimeMillis()
                 if (current == null) {
                     transaction.execute(
@@ -871,7 +888,7 @@ class DurableSimpleFileSystemManager(
                         stage.path,
                         parentPath(stage.path),
                         name(stage.path),
-                        stage.sessionUuid,
+                        assembledGenerationUuid,
                         final.first,
                         final.second,
                         now,
@@ -881,7 +898,7 @@ class DurableSimpleFileSystemManager(
                     transaction.execute(
                         """UPDATE entries SET generation_uuid = ?, size_bytes = ?, content_hash = ?,
                             modified_at_millis = ? WHERE filesystem_uuid = ? AND path = ?""".trimIndent(),
-                        stage.sessionUuid,
+                        assembledGenerationUuid,
                         final.first,
                         final.second,
                         now,
@@ -891,11 +908,11 @@ class DurableSimpleFileSystemManager(
                 }
                 transaction.execute(
                     "UPDATE file_blocks SET reference_count = 1 WHERE generation_uuid = ?",
-                    stage.sessionUuid,
+                    assembledGenerationUuid,
                 )
                 current?.generationUuid?.let { releaseGeneration(transaction, it) }
-                appendedBlocks.forEach { enqueueBlobForGc(transaction, it.blobHash) }
-                assembledHashes.forEach { enqueueBlobForGc(transaction, it) }
+                enqueueGenerationHashesBatched(transaction, stage.sessionUuid)
+                transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", stage.sessionUuid)
                 transaction.execute(
                     "UPDATE filesystems SET used_bytes = ? WHERE uuid = ?",
                     attemptedUsage,
@@ -913,13 +930,6 @@ class DurableSimpleFileSystemManager(
                 requireEntry(transaction, stage.filesystemUuid, stage.path).toMetadata()
             }
         } catch (failure: Throwable) {
-            assembledHashes.forEach { hash ->
-                try {
-                    metadataDatabase.execute { transaction -> enqueueBlobForGc(transaction, hash) }
-                } catch (cleanupFailure: Throwable) {
-                    failure.addSuppressed(cleanupFailure)
-                }
-            }
             try {
                 abortSession(stage.sessionUuid)
             } catch (cleanupFailure: Throwable) {
@@ -940,7 +950,7 @@ class DurableSimpleFileSystemManager(
      * finally per-hash GC-outbox rows. Holding the OPEN session row through publication makes reaping and
      * committing mutually exclusive across independently connected manager instances.
      */
-    private fun claimAndVerifyStagedGeneration(database: Database, stage: StagedGeneration): List<BlockRecord> {
+    private fun claimAndVerifyStagedGeneration(database: Database, stage: StagedGeneration) {
         val session = database.getRows(
             """SELECT filesystem_uuid, path, expected_hash, bytes_received, state
                 FROM write_sessions WHERE session_uuid = ? FOR UPDATE""".trimIndent(),
@@ -970,22 +980,18 @@ class DurableSimpleFileSystemManager(
             )
         }
 
-        val stagedBlocks = blocks(database, stage.sessionUuid)
         val expectedBlockCount = if (stage.sizeBytes == 0L) 0L else
             ((stage.sizeBytes - 1L) / BLOCK_SIZE_BYTES.toLong()) + 1L
-        if (stagedBlocks.size.toLong() != expectedBlockCount ||
-            stagedBlocks.withIndex().any { (index, block) -> block.ordinal != index }
-        ) {
-            throw SimpleFileSystemException(
-                "Write session '${stage.sessionUuid}' cannot publish path '${stage.path}': expected " +
-                    "$expectedBlockCount contiguous staged block(s) for ${stage.sizeBytes} bytes, but found " +
-                    "${stagedBlocks.size} block(s) with ordinals ${stagedBlocks.map { it.ordinal }}.",
-            )
-        }
-
         val digest = MessageDigest.getInstance("SHA-256")
         var observedTotal = 0L
-        stagedBlocks.forEach { block ->
+        var observedBlockCount = 0L
+        forEachGenerationBlock(database, stage.sessionUuid) { block ->
+            if (block.ordinal.toLong() != observedBlockCount) {
+                throw SimpleFileSystemException(
+                    "Write session '${stage.sessionUuid}' cannot publish path '${stage.path}': expected staged " +
+                        "block ordinal $observedBlockCount, but found ordinal ${block.ordinal}.",
+                )
+            }
             var observedBlock = 0L
             blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { input ->
                 val transfer = ByteArray(8192)
@@ -1004,6 +1010,14 @@ class DurableSimpleFileSystemManager(
                 )
             }
             observedTotal = Math.addExact(observedTotal, observedBlock)
+            observedBlockCount += 1L
+        }
+        if (observedBlockCount != expectedBlockCount) {
+            throw SimpleFileSystemException(
+                "Write session '${stage.sessionUuid}' cannot publish path '${stage.path}': expected " +
+                    "$expectedBlockCount contiguous staged block(s) for ${stage.sizeBytes} bytes, but found " +
+                    "$observedBlockCount block(s).",
+            )
         }
         val observedHash = digest.digest().toUpperHex()
         if (observedTotal != stage.sizeBytes || observedHash != stage.contentHash) {
@@ -1013,7 +1027,6 @@ class DurableSimpleFileSystemManager(
                     "with SHA-256 ${stage.contentHash}.",
             )
         }
-        return stagedBlocks
     }
 
     private fun checkUpdateCount(result: sql.DatabaseRow, expected: Int, action: String) {
@@ -1055,12 +1068,14 @@ class DurableSimpleFileSystemManager(
     }
 
     internal fun releaseGeneration(database: Database, generationUuid: UUID) {
-        val generationBlocks = blocks(database, generationUuid)
-        if (generationBlocks.isEmpty()) return
-        val references = generationBlocks.first().referenceCount
+        val first = database.getRows(
+            "SELECT reference_count FROM file_blocks WHERE generation_uuid = ? ORDER BY ordinal LIMIT 1",
+            generationUuid,
+        ).firstOrNull() ?: return
+        val references = first.longValue("reference_count")
         if (references <= 0L) return
         if (references == 1L) {
-            generationBlocks.forEach { enqueueBlobForGc(database, it.blobHash) }
+            enqueueGenerationHashesBatched(database, generationUuid)
             database.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", generationUuid)
         } else {
             database.execute(
@@ -1127,21 +1142,44 @@ class DurableSimpleFileSystemManager(
     }
 
     private fun enqueueUnreferencedPinnedBlobs(limit: Int): Int {
-        var enqueued = 0
-        for (hash in blobstoreService.listBlobs(BLOB_PIN_OWNER).sorted()) {
-            if (enqueued >= limit) break
-            val newlyEnqueued = transactionally { transaction ->
+        return transactionally { transaction ->
+            val highWater = transaction.getRows(
+                "SELECT orphan_inventory_high_water FROM simple_filesystem_maintenance_state " +
+                    "WHERE singleton = true FOR UPDATE",
+            ).single().nullableStringValue("orphan_inventory_high_water")
+            val candidates = TreeSet<String>()
+            // BlobstoreApi currently returns a materialized List. We cannot prevent that allocation in the client,
+            // but deliberately neither copy nor sort it: only this bounded lexical window is retained locally.
+            blobstoreService.listBlobs(BLOB_PIN_OWNER).forEach { hash ->
+                if ((highWater == null || hash > highWater) && candidates.add(hash) && candidates.size > limit) {
+                    candidates.pollLast()
+                }
+            }
+            if (candidates.isEmpty()) {
+                if (highWater != null) transaction.execute(
+                    "UPDATE simple_filesystem_maintenance_state SET orphan_inventory_high_water = NULL " +
+                        "WHERE singleton = true",
+                )
+                return@transactionally 0
+            }
+            var enqueued = 0
+            candidates.forEach { hash ->
                 val references = transaction.getLong(
                     "SELECT count(*) FROM file_blocks WHERE blob_hash = ?",
                     hash,
                 ) ?: 0L
-                if (references > 0L) return@transactionally false
-                enqueueBlobForGc(transaction, hash)
-                true
+                if (references == 0L) {
+                    enqueueBlobForGc(transaction, hash)
+                    enqueued += 1
+                }
             }
-            if (newlyEnqueued) enqueued += 1
+            transaction.execute(
+                "UPDATE simple_filesystem_maintenance_state SET orphan_inventory_high_water = ? " +
+                    "WHERE singleton = true",
+                candidates.last(),
+            )
+            enqueued
         }
-        return enqueued
     }
 
     private fun reapSessionIfEligible(sessionUuid: UUID, observedNow: Long): Boolean = transactionally { transaction ->
@@ -1155,10 +1193,7 @@ class DurableSimpleFileSystemManager(
         if (state != "ABORTED" && (state != "OPEN" || leaseExpiresAt > observedNow)) {
             return@transactionally false
         }
-        transaction.getStrings(
-            "SELECT blob_hash FROM file_blocks WHERE generation_uuid = ?",
-            sessionUuid,
-        ).forEach { hash -> enqueueBlobForGc(transaction, hash) }
+        enqueueGenerationHashesBatched(transaction, sessionUuid)
         transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", sessionUuid)
         transaction.execute(
             "UPDATE write_sessions SET state = 'REAPED' WHERE session_uuid = ? AND state IN ('OPEN', 'ABORTED')",
@@ -1197,21 +1232,32 @@ class DurableSimpleFileSystemManager(
     }
 
     private fun purgeFilesystem(database: Database, filesystem: FilesystemRecord) {
-        database.getRows(
-            "SELECT * FROM entries WHERE filesystem_uuid = ? AND entry_kind = 'FILE' FOR UPDATE",
-            filesystem.uuid,
-        ).map { it.toEntryRecord() }.forEach { entry ->
-            entry.generationUuid?.let { releaseGeneration(database, it) }
+        var lastPath: String? = null
+        while (true) {
+            val rows = if (lastPath == null) {
+                database.getRows(
+                    """SELECT path, generation_uuid FROM entries
+                        WHERE filesystem_uuid = ? AND entry_kind = 'FILE'
+                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
+                    filesystem.uuid,
+                    INTERNAL_KEYSET_BATCH_SIZE,
+                )
+            } else {
+                database.getRows(
+                    """SELECT path, generation_uuid FROM entries
+                        WHERE filesystem_uuid = ? AND entry_kind = 'FILE' AND path > ?
+                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
+                    filesystem.uuid,
+                    lastPath,
+                    INTERNAL_KEYSET_BATCH_SIZE,
+                )
+            }
+            if (rows.isEmpty()) break
+            rows.forEach { row -> row.nullableUuidValue("generation_uuid")?.let { releaseGeneration(database, it) } }
+            lastPath = rows.last().stringValue("path")
         }
-        database.getUuids(
-            """SELECT session_uuid FROM write_sessions
-                WHERE filesystem_uuid = ? AND state IN ('OPEN', 'ABORTED')""".trimIndent(),
-            filesystem.uuid,
-        ).forEach { generation ->
-            database.getStrings(
-                "SELECT blob_hash FROM file_blocks WHERE generation_uuid = ?",
-                generation,
-            ).forEach { hash -> enqueueBlobForGc(database, hash) }
+        forEachWriteSession(database, filesystem.uuid, openOrAbortedOnly = true) { generation ->
+            enqueueGenerationHashesBatched(database, generation)
             database.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", generation)
         }
         database.execute("DELETE FROM filesystems WHERE uuid = ?", filesystem.uuid)
@@ -1219,11 +1265,77 @@ class DurableSimpleFileSystemManager(
     }
 
     private fun lockWriteSessionsForFilesystem(database: Database, filesystemUuid: UUID) {
-        database.getRows(
-            """SELECT session_uuid FROM write_sessions WHERE filesystem_uuid = ?
-                ORDER BY session_uuid FOR UPDATE""".trimIndent(),
-            filesystemUuid,
-        )
+        forEachWriteSession(database, filesystemUuid, openOrAbortedOnly = false) { }
+    }
+
+    private fun forEachWriteSession(
+        database: Database,
+        filesystemUuid: UUID,
+        openOrAbortedOnly: Boolean,
+        action: (UUID) -> Unit,
+    ) {
+        var last: UUID? = null
+        while (true) {
+            val statePredicate = if (openOrAbortedOnly) " AND state IN ('OPEN', 'ABORTED')" else ""
+            val cursorPredicate = if (last == null) "" else " AND session_uuid > ?::UUID"
+            val arguments = mutableListOf<Any>(filesystemUuid)
+            if (last != null) arguments += last
+            arguments += INTERNAL_KEYSET_BATCH_SIZE
+            val rows = database.getRows(
+                "SELECT session_uuid FROM write_sessions WHERE filesystem_uuid = ?" + statePredicate +
+                    cursorPredicate + " ORDER BY session_uuid LIMIT ? FOR UPDATE",
+                *arguments.toTypedArray(),
+            )
+            if (rows.isEmpty()) break
+            rows.forEach { action(it.uuidValue("session_uuid")) }
+            last = rows.last().uuidValue("session_uuid")
+        }
+    }
+
+    private fun forEachGenerationBlock(database: Database, generationUuid: UUID, action: (BlockRecord) -> Unit) {
+        var lastOrdinal = -1
+        while (true) {
+            val rows = database.getRows(
+                """SELECT * FROM file_blocks WHERE generation_uuid = ? AND ordinal > ?
+                    ORDER BY ordinal LIMIT ?""".trimIndent(),
+                generationUuid,
+                lastOrdinal,
+                INTERNAL_KEYSET_BATCH_SIZE,
+            )
+            if (rows.isEmpty()) break
+            rows.map { it.toBlockRecord() }.forEach(action)
+            lastOrdinal = rows.last().intValue("ordinal")
+        }
+    }
+
+    private fun enqueueGenerationHashesBatched(database: Database, generationUuid: UUID) {
+        var lastOrdinal = -1
+        while (true) {
+            val ordinals = database.getRows(
+                """SELECT ordinal FROM file_blocks WHERE generation_uuid = ? AND ordinal > ?
+                    ORDER BY ordinal LIMIT ?""".trimIndent(),
+                generationUuid,
+                lastOrdinal,
+                INTERNAL_KEYSET_BATCH_SIZE,
+            )
+            if (ordinals.isEmpty()) break
+            val nextOrdinal = ordinals.last().intValue("ordinal")
+            database.execute(
+                """INSERT INTO blob_gc_outbox (blob_hash, action, created_at_millis)
+                    SELECT blob_hash, 'UNPIN_IF_UNREFERENCED', ? FROM (
+                        SELECT DISTINCT blob_hash FROM file_blocks
+                        WHERE generation_uuid = ? AND ordinal > ? AND ordinal <= ?
+                        ORDER BY blob_hash
+                    ) AS page_hashes
+                    ON CONFLICT (blob_hash) DO UPDATE
+                    SET action = excluded.action, created_at_millis = excluded.created_at_millis""".trimIndent(),
+                clock.currentTimeMillis(),
+                generationUuid,
+                lastOrdinal,
+                nextOrdinal,
+            )
+            lastOrdinal = nextOrdinal
+        }
     }
 
     private fun requireRenewableSession(database: Database, sessionUuid: UUID) {
@@ -1380,6 +1492,7 @@ class DurableSimpleFileSystemManager(
         const val MAX_TRANSACTION_RETRIES = 32
         const val DEFAULT_SESSION_LEASE_MILLIS = 5L * 60L * 1000L
         const val DEFAULT_MAINTENANCE_BATCH_SIZE = 1_000
+        const val INTERNAL_KEYSET_BATCH_SIZE = 256
     }
 }
 

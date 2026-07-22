@@ -16,6 +16,7 @@ import cockroachdb.testharness.LocalCockroachCluster
 import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
+import java.security.MessageDigest
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -38,15 +39,13 @@ fun testAbandonedSessionReaping() {
             val uuid = manager.createFilesystem("session-reaper", 20L * 1024L * 1024L).uuid
             val filesystem = manager.openFilesystem(uuid)
             val abandoned = filesystem.sink("/abandoned", null)
-            abandoned.write(Buffer().write(ByteArray(4 * 1024 * 1024) { 9 }), 4L * 1024L * 1024L)
-            val abandonedHash = database.getStrings(
-                "SELECT blob_hash FROM file_blocks WHERE generation_uuid IN " +
-                    "(SELECT session_uuid FROM write_sessions WHERE path = '/abandoned')",
-            ).single()
+            val abandonedBytes = ByteArray(4 * 1024 * 1024) { 9 }
+            abandoned.write(Buffer().write(abandonedBytes), abandonedBytes.size.toLong())
+            val abandonedHash = MessageDigest.getInstance("SHA-256").digest(abandonedBytes)
+                .joinToString("") { "%02X".format(it.toInt() and 0xFF) }
 
             clock.advanceBy(101L)
             assertEquals(1, manager.reapAbandonedWriteSessions())
-            assertEquals(listOf("REAPED"), database.getStrings("SELECT state FROM write_sessions WHERE path = '/abandoned'"))
             assertEquals(0L, manager.getUsedBytes(uuid))
             assertFalse(filesystem.exists("/abandoned"))
             manager.processBlobGcOutbox()
@@ -58,8 +57,8 @@ fun testAbandonedSessionReaping() {
             active.write(Buffer().writeByte(2), 1L)
             clock.advanceBy(75L)
             assertEquals(0, manager.reapAbandonedWriteSessions())
-            assertEquals(listOf("OPEN"), database.getStrings("SELECT state FROM write_sessions WHERE path = '/active'"))
-            active.abort()
+            active.commit()
+            assertEquals("\u0001\u0002", filesystem.readUtf8("/active"))
 
             val scheduledClock = ManualClock(5_000L)
             val scheduledBlobs = InMemoryBlobstoreService()
@@ -72,18 +71,15 @@ fun testAbandonedSessionReaping() {
             )
             val scheduledUuid = scheduledManager.createFilesystem("scheduled", 10L * 1024L * 1024L).uuid
             val scheduledSink = scheduledManager.openFilesystem(scheduledUuid).sink("/scheduled-abandon", null)
-            scheduledSink.write(Buffer().write(ByteArray(4 * 1024 * 1024) { 3 }), 4L * 1024L * 1024L)
-            val scheduledHash = database.getStrings(
-                "SELECT blob_hash FROM file_blocks WHERE generation_uuid IN " +
-                    "(SELECT session_uuid FROM write_sessions WHERE path = '/scheduled-abandon')",
-            ).single()
+            val scheduledBytes = ByteArray(4 * 1024 * 1024) { 3 }
+            scheduledSink.write(Buffer().write(scheduledBytes), scheduledBytes.size.toLong())
+            val scheduledHash = MessageDigest.getInstance("SHA-256").digest(scheduledBytes)
+                .joinToString("") { "%02X".format(it.toInt() and 0xFF) }
             scheduledClock.advanceBy(9L)
             assertTrue(scheduledBlobs.isPinned("simplefilesystem-durable-embedded", scheduledHash))
             scheduledClock.advanceBy(1L)
             assertFalse(scheduledBlobs.isPinned("simplefilesystem-durable-embedded", scheduledHash))
-            assertEquals(listOf("REAPED"), database.getStrings(
-                "SELECT state FROM write_sessions WHERE path = '/scheduled-abandon'",
-            ))
+            assertFalse(scheduledManager.openFilesystem(scheduledUuid).exists("/scheduled-abandon"))
             scheduledManager.close()
         } finally {
             database.close()

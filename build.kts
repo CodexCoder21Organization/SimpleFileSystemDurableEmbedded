@@ -28,3 +28,16 @@ fun buildMaven(): File = buildSimpleKotlinMavenArtifact2(
 )
 
 fun buildSkinnyJar(): File = buildMaven()
+
+val testSupportDependencies = listOf(
+    MavenPrebuilt2("blobstore.api:blobstore-api:0.0.2"),
+    MavenPrebuilt2("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3"),
+    MavenPrebuilt2("org.jetbrains.kotlin:kotlin-stdlib:1.9.22"),
+)
+
+@MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-support:")
+fun buildTestSupportMaven(): File = buildSimpleKotlinMavenArtifact2(
+    coordinates = "simplefilesystem.durable:simplefilesystem-durable-test-support:0.1.0",
+    src = File("test-support"),
+    compileDependencies = testSupportDependencies,
+)

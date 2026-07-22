@@ -160,7 +160,6 @@ internal class TransactionalBlockAssembler(
     private val manager: DurableSimpleFileSystemManager,
     private val transaction: Database,
     private val generationUuid: UUID,
-    private val onStagedHash: (String) -> Unit = {},
 ) {
     private val digest: MessageDigest = MessageDigest.getInstance("SHA-256")
     private val pending = ByteArray(BLOCK_SIZE_BYTES)
@@ -169,6 +168,14 @@ internal class TransactionalBlockAssembler(
     private var totalBytes: Long = 0L
 
     val hasPendingBytes: Boolean get() = pendingSize > 0
+
+    fun append(block: BlockRecord) {
+        if (!hasPendingBytes && block.sizeBytes == BLOCK_SIZE_BYTES) {
+            reuseCompleteBlock(block)
+        } else {
+            manager.blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { writeFrom(it) }
+        }
+    }
 
     fun reuseCompleteBlock(block: BlockRecord) {
         check(!hasPendingBytes) {
@@ -240,8 +247,7 @@ internal class TransactionalBlockAssembler(
 
     private fun flushBlock() {
         if (pendingSize == 0) return
-        val staged = manager.stageBlock(transaction, generationUuid, ordinal, pending.copyOf(pendingSize))
-        onStagedHash(staged.blobHash)
+        manager.stageBlock(transaction, generationUuid, ordinal, pending.copyOf(pendingSize))
         ordinal += 1
         pendingSize = 0
     }

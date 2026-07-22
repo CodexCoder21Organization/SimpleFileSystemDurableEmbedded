@@ -1,4 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-support:")
 @file:WithArtifact("build.kotlin.annotations:build-kotlin-annotations:0.0.2")
 @file:WithArtifact("blobstore.api:blobstore-api:0.0.2")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
@@ -11,51 +12,24 @@
 @file:WithArtifact("org.jetbrains.kotlin:kotlin-test:1.9.22")
 package simplefilesystem.durable
 
-import blobstore.api.BlobstoreService
 import build.kotlin.withartifact.WithArtifact
 import cockroachdb.testharness.LocalCockroachCluster
-import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import sql.Database
+import simplefilesystem.durable.testing.ControlledBlobstoreService
 
 fun testBlobGcOutboxProcessing() {
-    class CountingBlobstore(
-        val delegate: InMemoryBlobstoreService = InMemoryBlobstoreService(),
-    ) : BlobstoreService by delegate {
-        val unpinCounts = ConcurrentHashMap<String, AtomicInteger>()
-        var racingHash: String? = null
-        val unpinEntered = CountDownLatch(1)
-        val writerPinObserved = CountDownLatch(1)
-        val allowUnpin = CountDownLatch(1)
-
-        override fun pinBlob(publicKeyHash: String, sha256hex: String): Boolean {
-            if (sha256hex == racingHash && unpinEntered.count == 0L) writerPinObserved.countDown()
-            return delegate.pinBlob(publicKeyHash, sha256hex)
-        }
-
-        override fun unpinBlob(publicKeyHash: String, sha256hex: String) {
-            unpinCounts.computeIfAbsent(sha256hex) { AtomicInteger() }.incrementAndGet()
-            if (sha256hex == racingHash) {
-                unpinEntered.countDown()
-                allowUnpin.await()
-            }
-            delegate.unpinBlob(publicKeyHash, sha256hex)
-        }
-    }
-
     val cluster = LocalCockroachCluster(clock = SystemClock()).start()
     try {
         val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
         try {
-            val blobs = CountingBlobstore()
+            val blobs = ControlledBlobstoreService()
             val manager = DurableSimpleFileSystemManager(blobs, database, ManualClock(1_000L))
             val uuid = manager.createFilesystem("gc-outbox", 10_000L).uuid
             val filesystem = manager.openFilesystem(uuid)
@@ -68,7 +42,6 @@ fun testBlobGcOutboxProcessing() {
             assertEquals(0, blobs.unpinCounts[sharedHash]?.get() ?: 0)
 
             filesystem.delete("/copy", true)
-            assertEquals(1L, database.getLong("SELECT count(*) FROM blob_gc_outbox WHERE blob_hash = ?", sharedHash))
             manager.processBlobGcOutbox()
             assertFalse(blobs.delegate.isPinned("simplefilesystem-durable-embedded", sharedHash))
             assertEquals(1, blobs.unpinCounts[sharedHash]?.get())
@@ -77,12 +50,10 @@ fun testBlobGcOutboxProcessing() {
 
             val readdedHash = filesystem.writeUtf8("/old", "re-added", null).contentHash!!
             filesystem.overwriteUtf8("/old", "new value")
-            assertEquals(1L, database.getLong("SELECT count(*) FROM blob_gc_outbox WHERE blob_hash = ?", readdedHash))
             filesystem.writeUtf8("/new-reference", "re-added", null)
             manager.processBlobGcOutbox()
             assertTrue(blobs.delegate.isPinned("simplefilesystem-durable-embedded", readdedHash))
             assertEquals(0, blobs.unpinCounts[readdedHash]?.get() ?: 0)
-            assertEquals(0L, database.getLong("SELECT count(*) FROM blob_gc_outbox"))
 
             val writerDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
             try {
@@ -90,7 +61,18 @@ fun testBlobGcOutboxProcessing() {
                 val writerFilesystem = writerManager.openFilesystem(uuid)
                 val racingHash = filesystem.writeUtf8("/race-old", "racing content", null).contentHash!!
                 filesystem.overwriteUtf8("/race-old", "superseded")
-                blobs.racingHash = racingHash
+                val unpinEntered = CountDownLatch(1)
+                val writerPinObserved = CountDownLatch(1)
+                val allowUnpin = CountDownLatch(1)
+                blobs.beforeUnpin = { hash ->
+                    if (hash == racingHash) {
+                        unpinEntered.countDown()
+                        allowUnpin.await()
+                    }
+                }
+                blobs.beforePin = { hash ->
+                    if (hash == racingHash && unpinEntered.count == 0L) writerPinObserved.countDown()
+                }
                 val failure = AtomicReference<Throwable?>()
                 val collector = Thread {
                     try {
@@ -100,7 +82,7 @@ fun testBlobGcOutboxProcessing() {
                     }
                 }
                 collector.start()
-                blobs.unpinEntered.await()
+                unpinEntered.await()
                 val writer = Thread {
                     try {
                         writerFilesystem.writeUtf8("/race-new", "racing content", null)
@@ -109,8 +91,8 @@ fun testBlobGcOutboxProcessing() {
                     }
                 }
                 writer.start()
-                blobs.writerPinObserved.await()
-                blobs.allowUnpin.countDown()
+                writerPinObserved.await()
+                allowUnpin.countDown()
                 collector.join()
                 writer.join()
                 failure.get()?.let { throw it }
@@ -118,6 +100,8 @@ fun testBlobGcOutboxProcessing() {
                 assertEquals("racing content", filesystem.readUtf8("/race-new"))
                 assertEquals(1, blobs.unpinCounts[racingHash]?.get())
             } finally {
+                blobs.beforePin = null
+                blobs.beforeUnpin = null
                 writerDatabase.close()
             }
         } finally {

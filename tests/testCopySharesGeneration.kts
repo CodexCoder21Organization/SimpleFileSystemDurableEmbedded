@@ -28,18 +28,21 @@ fun testCopySharesGeneration() {
             val uuid = manager.createFilesystem("copy", 20L * 1024L * 1024L).uuid
             val filesystem = manager.openFilesystem(uuid)
             val content = "same immutable generation"
-            filesystem.writeUtf8("/source", content, null)
+            val sharedHash = filesystem.writeUtf8("/source", content, null).contentHash!!
             filesystem.copy("/source", "/target")
 
             assertEquals(content, filesystem.readUtf8("/target"))
             assertEquals(2L * content.toByteArray().size, manager.getUsedBytes(uuid))
             assertEquals(1, blobs.storedBlobCount())
-            assertEquals(listOf(2L), database.getLongs("SELECT DISTINCT reference_count FROM file_blocks"))
-            assertEquals(1L, database.getLong("SELECT count(DISTINCT generation_uuid) FROM file_blocks"))
+            assertEquals(true, blobs.isPinned("simplefilesystem-durable-embedded", sharedHash))
 
             filesystem.overwriteUtf8("/source", "changed")
             assertEquals(content, filesystem.readUtf8("/target"))
-            assertEquals(listOf(1L, 1L), database.getLongs("SELECT reference_count FROM file_blocks ORDER BY generation_uuid"))
+            manager.processBlobGcOutbox()
+            assertEquals(true, blobs.isPinned("simplefilesystem-durable-embedded", sharedHash))
+            filesystem.delete("/target", true)
+            manager.processBlobGcOutbox()
+            assertEquals(false, blobs.isPinned("simplefilesystem-durable-embedded", sharedHash))
         } finally {
             database.close()
         }

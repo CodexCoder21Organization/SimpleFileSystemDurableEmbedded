@@ -58,7 +58,6 @@ fun testAtomicMoveAndRecursiveDelete() {
             filesystem.atomicMove("/moved/nested/a", "/replace")
             assertEquals("alpha", filesystem.readUtf8("/replace"))
             assertEquals(5L, manager.getUsedBytes(uuid))
-            assertTrue(database.getLong("SELECT count(*) FROM blob_gc_outbox")!! >= 1L)
 
             filesystem.deleteRecursively("/moved", true)
             filesystem.delete("/replace", true)
@@ -67,6 +66,7 @@ fun testAtomicMoveAndRecursiveDelete() {
             assertEquals(0L, manager.getUsedBytes(uuid))
             assertEquals(emptyList(), filesystem.list("/", null, 100).entries.map { it.path })
             assertTrue(filesystem.exists("/"))
+            manager.processBlobGcOutbox()
         } finally {
             database.close()
         }

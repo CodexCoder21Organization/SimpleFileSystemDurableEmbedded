@@ -59,7 +59,9 @@ Directory and manager listings are cursor-paginated and expose durable snapshot 
 
 ## Maintenance and reconciliation
 
-Maintenance is explicit by default. Call `reapAbandonedWriteSessions()`, `reapAbandonedReaderSessions()`, `purgeExpiredFilesystems()`, and `processBlobGcOutbox()` separately, or call `runMaintenance()` for one bounded pass. Every manager construction also performs crash reconciliation: expired or explicitly aborted sessions are reaped, unreferenced pins are inventoried, and previously committed GC-outbox intents are resumed, while expiration purge remains explicit so an expired-but-unpurged filesystem can still be revived with `setExpiration(uuid, null)`.
+Maintenance is explicit by default. Call `reapAbandonedWriteSessions()`, `reapAbandonedReaderSessions()`, `purgeExpiredFilesystems()`, and `processBlobGcOutbox()` separately, or call `runMaintenance()` for one bounded pass. Every manager construction also performs crash reconciliation: expired or explicitly aborted sessions are reaped, unreferenced pins are inventoried, and previously committed GC-outbox intents are resumed, while expiration purge remains explicit so an expired-but-unpurged filesystem can still be revived with `setExpiration(uuid, null)`. Orphan inventory persists a lexical hash high-water mark, so each invocation resumes at the next bounded range and eventually wraps to the beginning.
+
+The current `BlobstoreApi` returns `listBlobs(owner)` as an already-materialized list. This module scans that response once without copying or sorting it and retains only the next maintenance batch in a bounded ordered set, but it cannot prevent the Blobstore client/service from materializing the original response. A future Blobstore API should expose `listBlobs(owner, afterHash, limit)` or an equivalent streaming cursor so allocation is bounded across the entire call chain.
 
 Background maintenance is opt-in through `maintenanceIntervalMillis`; the default is `null`, so constructing a manager does not start recurring work. The interval is converted to the absolute deadline required by `Clock.schedule`, and `close()` cancels the scheduled callback without shutting down the caller-owned clock:
 
@@ -77,6 +79,8 @@ try {
 ```
 
 ## Durability model
+
+Namespace changes, append assembly, generation release, recursive move/delete, and expiration purge remain one Cockroach transaction and therefore one logical transition. Large block and subtree sets are traversed with fixed-size keyset pages inside that transaction; intermediate pages are not externally visible, and this service does not retain a collection proportional to file or subtree cardinality.
 
 - `filesystems` stores UUID identity, free-text descriptions, quota accounting, expiration, and a durable per-filesystem namespace revision.
 - `simple_filesystem_manager_state` stores the durable manager-descriptor revision used by filesystem-listing pages.

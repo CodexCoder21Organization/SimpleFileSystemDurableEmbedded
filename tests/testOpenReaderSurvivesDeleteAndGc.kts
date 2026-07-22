@@ -1,4 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-support:")
 @file:WithArtifact("blobstore.api:blobstore-api:0.0.2")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
 @file:WithArtifact("cockroachdb.testharness:cockroachdb-test-harness:0.0.4")
@@ -12,30 +13,21 @@
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
-import blobstore.api.BlobstoreService
 import cockroachdb.testharness.LocalCockroachCluster
-import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import community.kotlin.clocks.simple.SystemClock
 import kotlin.test.assertContentEquals
 import okio.Buffer
 import sql.Database
+import simplefilesystem.durable.testing.ControlledBlobstoreService
 
 fun testOpenReaderSurvivesDeleteAndGc() {
-    class CollectingBlobstore(
-        private val delegate: InMemoryBlobstoreService = InMemoryBlobstoreService(),
-    ) : BlobstoreService by delegate {
-        override fun getBlob(publicKeyHash: String, sha256hex: String) =
-            if (delegate.isPinned(publicKeyHash, sha256hex)) delegate.getBlob(publicKeyHash, sha256hex)
-            else throw IllegalStateException("Blob '$sha256hex' was collected after its last pin was released.")
-    }
-
     val cluster = LocalCockroachCluster(clock = SystemClock()).start()
     try {
         val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
         try {
             val manager = DurableSimpleFileSystemManager(
-                CollectingBlobstore(),
+                ControlledBlobstoreService().apply { requirePinnedOnGet = true },
                 database,
                 ManualClock(1_000L),
             )

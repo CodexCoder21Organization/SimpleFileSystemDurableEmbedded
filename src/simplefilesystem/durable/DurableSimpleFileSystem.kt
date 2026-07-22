@@ -239,26 +239,53 @@ class DurableSimpleFileSystem internal constructor(
                 if (mustExist) throw PathNotFoundException(normalized)
                 return@transactionally
             }
-            val entries = subtree(transaction, normalized)
-                .filterNot { normalized == "/" && it.path == "/" }
-            entries.filter { it.isFile }.forEach { entry ->
-                entry.generationUuid?.let { manager.releaseGeneration(transaction, it) }
-            }
-            val released = entries.fold(0L) { total, entry ->
-                try {
-                    Math.addExact(total, entry.sizeBytes ?: 0L)
-                } catch (_: ArithmeticException) {
-                    throw QuotaArithmeticOverflowException(normalized, filesystem.usedBytes, total, entry.sizeBytes ?: 0L)
-                }
-            }
-            entries.sortedByDescending { it.path.length }.forEach { entry ->
-                transaction.execute(
-                    "DELETE FROM entries WHERE filesystem_uuid = ? AND path = ?",
+            val prefix = if (normalized == "/") "/" else "$normalized/"
+            var cursor = ""
+            var released = 0L
+            var deletedAny = false
+            while (true) {
+                val entries = transaction.getRows(
+                    """SELECT * FROM entries
+                        WHERE filesystem_uuid = ? AND path != '/' AND path > ?
+                          AND (path = ? OR left(path, ?) = ?)
+                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
                     filesystemUuid,
-                    entry.path,
+                    cursor,
+                    normalized,
+                    prefix.length,
+                    prefix,
+                    TREE_KEYSET_BATCH_SIZE,
+                ).map { it.toEntryRecord() }
+                if (entries.isEmpty()) break
+                entries.forEach { entry ->
+                    entry.generationUuid?.let { manager.releaseGeneration(transaction, it) }
+                    released = try {
+                        Math.addExact(released, entry.sizeBytes ?: 0L)
+                    } catch (_: ArithmeticException) {
+                        throw QuotaArithmeticOverflowException(
+                            normalized,
+                            filesystem.usedBytes,
+                            released,
+                            entry.sizeBytes ?: 0L,
+                        )
+                    }
+                }
+                val nextCursor = entries.last().path
+                transaction.execute(
+                    """DELETE FROM entries
+                        WHERE filesystem_uuid = ? AND path != '/' AND path > ? AND path <= ?
+                          AND (path = ? OR left(path, ?) = ?)""".trimIndent(),
+                    filesystemUuid,
+                    cursor,
+                    nextCursor,
+                    normalized,
+                    prefix.length,
+                    prefix,
                 )
+                cursor = nextCursor
+                deletedAny = true
             }
-            if (entries.isNotEmpty()) {
+            if (deletedAny) {
                 val attemptedUsage = manager.checkedAttemptedUsage(filesystem, normalized, released, 0L)
                 transaction.execute(
                     "UPDATE filesystems SET used_bytes = ? WHERE uuid = ?",
@@ -379,7 +406,6 @@ class DurableSimpleFileSystem internal constructor(
                     "a directory cannot be moved into its own descendant.",
                 )
             }
-            val moving = subtree(transaction, normalizedSource)
             val replaced = manager.findEntry(transaction, filesystemUuid, normalizedTarget, lock = true)
             if (replaced != null && replaced.entryType != sourceEntry.entryType) {
                 throw PathTypeMismatchException(normalizedTarget, sourceEntry.entryType, replaced.entryType)
@@ -400,18 +426,36 @@ class DurableSimpleFileSystem internal constructor(
                     replaced.path,
                 )
             }
-            moving.sortedBy { it.path.length }.forEach { entry ->
-                val suffix = entry.path.removePrefix(normalizedSource)
-                val newPath = normalizedTarget + suffix
-                transaction.execute(
-                    """UPDATE entries SET path = ?, parent_path = ?, name = ?
-                        WHERE filesystem_uuid = ? AND path = ?""".trimIndent(),
-                    newPath,
-                    manager.parentPath(newPath),
-                    manager.name(newPath),
+            val sourcePrefix = "$normalizedSource/"
+            var cursor = ""
+            while (true) {
+                val movingPaths = transaction.getStrings(
+                    """SELECT path FROM entries
+                        WHERE filesystem_uuid = ? AND path > ?
+                          AND (path = ? OR left(path, ?) = ?)
+                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
                     filesystemUuid,
-                    entry.path,
+                    cursor,
+                    normalizedSource,
+                    sourcePrefix.length,
+                    sourcePrefix,
+                    TREE_KEYSET_BATCH_SIZE,
                 )
+                if (movingPaths.isEmpty()) break
+                movingPaths.forEach { oldPath ->
+                    val suffix = oldPath.removePrefix(normalizedSource)
+                    val newPath = normalizedTarget + suffix
+                    transaction.execute(
+                        """UPDATE entries SET path = ?, parent_path = ?, name = ?
+                            WHERE filesystem_uuid = ? AND path = ?""".trimIndent(),
+                        newPath,
+                        manager.parentPath(newPath),
+                        manager.name(newPath),
+                        filesystemUuid,
+                        oldPath,
+                    )
+                }
+                cursor = movingPaths.last()
             }
             val released = replaced?.sizeBytes ?: 0L
             val attemptedUsage = manager.checkedAttemptedUsage(filesystem, normalizedTarget, released, 0L)
@@ -707,20 +751,9 @@ class DurableSimpleFileSystem internal constructor(
         manager.requireActiveFilesystem(filesystemUuid)
     }
 
-    private fun subtree(database: sql.Database, root: String): List<EntryRecord> {
-        val prefix = if (root == "/") "/" else "$root/"
-        return database.getRows(
-            """SELECT * FROM entries
-                WHERE filesystem_uuid = ? AND (path = ? OR left(path, ?) = ?)
-                ORDER BY path""".trimIndent(),
-            filesystemUuid,
-            root,
-            prefix.length,
-            prefix,
-        ).map { it.toEntryRecord() }
-    }
 }
 
+private const val TREE_KEYSET_BATCH_SIZE = 256
 private const val BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 private fun base64Value(character: Char): Int = BASE64_ALPHABET.indexOf(character)

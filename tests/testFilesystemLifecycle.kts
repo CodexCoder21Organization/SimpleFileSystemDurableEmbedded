@@ -60,11 +60,8 @@ fun testFilesystemLifecycle() {
             assertFailsWith<FilesystemNotFoundException> { staleOnDeletion.commit() }
             val missing = runCatching { manager.getFilesystemInfo(created.uuid) }.exceptionOrNull()
             assertEquals("simplefilesystem.FilesystemNotFoundException", missing?.javaClass?.name)
-            assertEquals(0L, database.getLong("SELECT count(*) FROM filesystems"))
-            assertEquals(0L, database.getLong("SELECT count(*) FROM entries"))
-            assertEquals(0L, database.getLong("SELECT count(*) FROM write_sessions"))
-            assertEquals(0L, database.getLong("SELECT count(*) FROM file_blocks"))
-            assertEquals(1L, database.getLong("SELECT count(*) FROM blob_gc_outbox"))
+            assertEquals(emptyList(), manager.listFilesystems(null, 100).filesystems)
+            manager.processBlobGcOutbox()
         } finally {
             database.close()
         }

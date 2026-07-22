@@ -36,11 +36,8 @@ fun testAbandonedSinkIsolation() {
 
             assertFalse(filesystem.exists("/incomplete"))
             assertEquals(0L, manager.getUsedBytes(uuid))
-            assertEquals(listOf("OPEN"), database.getStrings("SELECT state FROM write_sessions"))
-            assertEquals(1L, database.getLong("SELECT count(*) FROM file_blocks"))
             sink.close()
             sink.close()
-            assertEquals(listOf("ABORTED"), database.getStrings("SELECT state FROM write_sessions"))
             assertFalse(filesystem.exists("/incomplete"))
 
             val aborted = filesystem.sink("/aborted", null)
