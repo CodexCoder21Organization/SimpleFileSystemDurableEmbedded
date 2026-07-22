@@ -1,6 +1,6 @@
 # SimpleFileSystemDurableEmbedded
 
-Durable, in-process implementation of the [`simplefilesystem`](https://github.com/CodexCoder21Organization/SimpleFileSystemApi) 0.2.0 contract. File and directory metadata is stored transactionally in CockroachDB while immutable 4 MiB content blocks are stored directly in Blobstore by uppercase SHA-256 hash.
+Durable, in-process implementation of the [`simplefilesystem`](https://github.com/CodexCoder21Organization/SimpleFileSystemApi) 0.3.0 contract. File and directory metadata is stored transactionally in CockroachDB while immutable 4 MiB content blocks are stored directly in Blobstore by uppercase SHA-256 hash.
 
 `DurableSimpleFileSystemManager` implements the multi-filesystem lifecycle API and vends `DurableSimpleFileSystem` handles. Writes upload and pin staged blocks before one metadata transaction atomically publishes a new immutable generation, updates quota usage, and queues superseded blocks for idempotent garbage collection.
 
@@ -48,6 +48,12 @@ fun useDurableFilesystem(blobstore: BlobstoreService, metadataDatabase: Database
     filesystem.writeUtf8("/artifacts/jvm/result.txt", "recompiled", ifMatches = hash)
     println(filesystem.readUtf8("/artifacts/jvm/result.txt"))
 
+    var cursor = manager.watchFilesystem(descriptor.uuid, "/artifacts/jvm/result.txt", null, 100)
+        .nextSinceRevision
+    val changed = manager.watchFilesystem(descriptor.uuid, "/artifacts/jvm/result.txt", cursor, 100)
+    changed.events.forEach { event -> println("revision ${event.revision}: ${event.contentHash}") }
+    cursor = changed.nextSinceRevision
+
     val maintenance = manager.runMaintenance()
     println("Reaped ${maintenance.reapedSessions} sessions and purged ${maintenance.purgedFilesystems} filesystems")
 }
@@ -56,6 +62,8 @@ fun useDurableFilesystem(blobstore: BlobstoreService, metadataDatabase: Database
 Callers own the injected services and database handle; the manager does not close them. Every returned `Source`, `FileSink`, and `InputStream` must be closed by its caller. A `FileSink` publishes data only when `commit()` succeeds; `abort()` discards an open stage, and `close()` aborts an uncommitted stage. Successful and failed commits are repeatable.
 
 Directory and manager listings are cursor-paginated and expose durable snapshot revisions. Paths, filesystem descriptions, Base64, and UTF-8 are validated strictly; inline conveniences are capped at 4 MiB, while `source` and `FileSink` provide streaming access for larger files.
+
+`watchFilesystem(uuid, path, sinceRevision, limit)` reads the durable, exact-path namespace event log. A null cursor returns one current snapshot; subsequent calls return committed events after the cursor. Creation and removal also emit a snapshot for the direct parent directory, and filesystem expiration, explicit deletion, and purge emit terminal root events. Events carry metadata and content hashes, never file contents, so consumers re-read when a hash changes. Advance with `nextSinceRevision`, discard duplicate revisions, and rebuild from a null cursor if `PathWatchResyncRequiredException` reports that the requested history has been retained out. A later server/Observables binding can repeatedly invoke this backend-neutral pull primitive without changing its persistence semantics.
 
 ## Maintenance and reconciliation
 
@@ -84,6 +92,8 @@ Namespace changes, append assembly, generation release, recursive move/delete, a
 
 - `filesystems` stores UUID identity, free-text descriptions, quota accounting, expiration, and a durable per-filesystem namespace revision.
 - `simple_filesystem_manager_state` stores the durable manager-descriptor revision used by filesystem-listing pages.
+- `namespace_event_streams` stores each filesystem's latest revision, oldest safe watch cursor, and terminal state even after the filesystem descriptor has been removed.
+- `namespace_events` stores per-path snapshots at the same revision and in the same CockroachDB transaction as each namespace mutation. The default retention keeps seven days and the newest 10,000 event rows, pruning only whole revisions so a multi-path transaction is never partially visible. A single exceptionally wide mutation may therefore temporarily exceed the row target. Constructor settings `namespaceEventRetentionCount` and `namespaceEventRetentionMillis` may tighten these bounds. Once pruning advances the oldest safe cursor, older non-null cursors receive `PathWatchResyncRequiredException`; null always requests a fresh snapshot or the retained terminal event.
 - `entries` stores the directory tree and atomically points files at immutable generation UUIDs.
 - `file_blocks` maps each generation to ordered 4 MiB Blobstore blocks and tracks references from entries and open readers.
 - `write_sessions` records staged uploads, terminal state, and a renewable lease. Chunk writes renew the lease; reaping deletes an expired session's staged `file_blocks`, queues their hashes for GC evaluation, and leaves the durable session row in `REAPED` state without changing quota.

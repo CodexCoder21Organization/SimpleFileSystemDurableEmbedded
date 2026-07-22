@@ -20,11 +20,15 @@ import simplefilesystem.InvalidMaxSizeBytesException
 import simplefilesystem.InvalidPageLimitException
 import simplefilesystem.InvalidPathException
 import simplefilesystem.InvalidPathReason
+import simplefilesystem.InvalidWatchRevisionException
 import simplefilesystem.MAX_PAGE_LIMIT
 import simplefilesystem.PATH_MAX_DEPTH
 import simplefilesystem.PATH_MAX_UTF8_BYTES
 import simplefilesystem.PATH_SEGMENT_MAX_UTF8_BYTES
 import simplefilesystem.PathNotFoundException
+import simplefilesystem.PathWatchPage
+import simplefilesystem.PathWatchResyncRequiredException
+import simplefilesystem.PathWatchTerminalReason
 import simplefilesystem.PathTypeMismatchException
 import simplefilesystem.QuotaArithmeticOverflowException
 import simplefilesystem.QuotaExceededException
@@ -60,6 +64,8 @@ class DurableSimpleFileSystemManager(
     private val sessionLeaseMillis: Long = DEFAULT_SESSION_LEASE_MILLIS,
     private val maintenanceIntervalMillis: Long? = null,
     private val maintenanceBatchSize: Int = DEFAULT_MAINTENANCE_BATCH_SIZE,
+    private val namespaceEventRetentionCount: Int = DEFAULT_NAMESPACE_EVENT_RETENTION_COUNT,
+    private val namespaceEventRetentionMillis: Long = DEFAULT_NAMESPACE_EVENT_RETENTION_MILLIS,
 ) : SimpleFileSystemManager, AutoCloseable {
     @Volatile
     private var schemaReady: Boolean = false
@@ -76,6 +82,12 @@ class DurableSimpleFileSystemManager(
         }
         require(maintenanceBatchSize > 0) {
             "Maintenance batch size must be positive, but was $maintenanceBatchSize."
+        }
+        require(namespaceEventRetentionCount > 0) {
+            "Namespace-event retention count must be positive, but was $namespaceEventRetentionCount."
+        }
+        require(namespaceEventRetentionMillis > 0L) {
+            "Namespace-event retention age must be positive, but was $namespaceEventRetentionMillis milliseconds."
         }
         ensureSchema()
         reconcileInterruptedWork(maintenanceBatchSize)
@@ -113,6 +125,12 @@ class DurableSimpleFileSystemManager(
                 uuid,
                 now,
                 now,
+            )
+            transaction.execute(
+                """INSERT INTO namespace_event_streams
+                    (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason)
+                    VALUES (?, 0, 0, NULL)""".trimIndent(),
+                uuid,
             )
             bumpManagerRevision(transaction)
         }
@@ -160,13 +178,118 @@ class DurableSimpleFileSystemManager(
         return DurableSimpleFileSystem(this, parsed)
     }
 
+    override fun watchFilesystem(uuid: String, path: String, sinceRevision: Long?, limit: Int): PathWatchPage {
+        val parsed = parseUuid(uuid)
+        val canonicalPath = normalizePath(path)
+        val pageLimit = validatePageLimit(limit)
+        ensureSchema()
+        return transactionally { transaction ->
+            var filesystem = transaction.getRows(
+                "SELECT * FROM filesystems WHERE uuid = ? FOR UPDATE",
+                parsed,
+            ).firstOrNull()?.toFilesystemRecord()
+            var stream = requireNamespaceEventStream(transaction, parsed, lock = true)
+
+            if (filesystem != null && filesystem.expiresAtMillis?.let { clock.currentTimeMillis() >= it } == true &&
+                stream.terminalReason != PathWatchTerminalReason.FILESYSTEM_EXPIRED
+            ) {
+                val revision = appendNamespaceEvents(
+                    database = transaction,
+                    filesystem = filesystem,
+                    affectedPaths = emptyList(),
+                    terminalReason = PathWatchTerminalReason.FILESYSTEM_EXPIRED,
+                )
+                filesystem = filesystem.copy(namespaceRevision = revision)
+            }
+
+            pruneNamespaceEvents(transaction, parsed)
+            stream = requireNamespaceEventStream(transaction, parsed, lock = true)
+            val retainedTerminal = transaction.getRows(
+                """SELECT * FROM namespace_events WHERE filesystem_uuid = ? AND terminal = true
+                    ORDER BY revision DESC LIMIT 1""".trimIndent(),
+                parsed,
+            ).firstOrNull()?.toNamespaceEventRecord() ?: stream.terminalReason?.let { reason ->
+                NamespaceEventRecord(
+                    filesystemUuid = parsed,
+                    revision = stream.latestRevision,
+                    canonicalPath = "/",
+                    entryType = null,
+                    exists = false,
+                    isDirectory = false,
+                    isRegularFile = false,
+                    sizeBytes = null,
+                    contentHash = null,
+                    terminalReason = reason,
+                )
+            }
+
+            val latestRevision = stream.latestRevision
+            if (sinceRevision == null) {
+                if (filesystem == null && retainedTerminal == null) {
+                    throw FilesystemNotFoundException(uuid)
+                }
+                val initial = if (filesystem == null || stream.terminalReason != null) {
+                    requireNotNull(retainedTerminal) {
+                        "Terminal namespace-event stream '$parsed' had no retained terminal event."
+                    }.toWatchEvent()
+                } else {
+                    namespaceSnapshot(
+                        transaction,
+                        parsed,
+                        canonicalPath,
+                        latestRevision,
+                    ).toWatchEvent()
+                }
+                return@transactionally PathWatchPageValue(
+                    events = listOf(initial),
+                    nextSinceRevision = latestRevision,
+                    hasMore = false,
+                    latestRevision = latestRevision,
+                )
+            }
+
+            if (sinceRevision < 0L || sinceRevision > latestRevision) {
+                throw InvalidWatchRevisionException(uuid, sinceRevision, latestRevision)
+            }
+            if (sinceRevision < stream.oldestAvailableSinceRevision) {
+                throw PathWatchResyncRequiredException(
+                    uuid,
+                    sinceRevision,
+                    stream.oldestAvailableSinceRevision,
+                    latestRevision,
+                )
+            }
+            if (filesystem == null && retainedTerminal == null) {
+                throw FilesystemNotFoundException(uuid)
+            }
+            val rows = transaction.getRows(
+                """SELECT * FROM namespace_events
+                    WHERE filesystem_uuid = ? AND revision > ?
+                      AND (canonical_path = ? OR terminal = true)
+                    ORDER BY revision, canonical_path LIMIT ?""".trimIndent(),
+                parsed,
+                sinceRevision,
+                canonicalPath,
+                pageLimit + 1,
+            ).map { it.toNamespaceEventRecord().toWatchEvent() }
+            val selected = rows.take(pageLimit)
+            val hasMore = rows.size > pageLimit
+            PathWatchPageValue(
+                events = selected,
+                nextSinceRevision = if (hasMore) requireNotNull(selected.lastOrNull()).revision else latestRevision,
+                hasMore = hasMore,
+                latestRevision = latestRevision,
+            )
+        }
+    }
+
     override fun deleteFilesystem(uuid: String) {
         val parsed = parseUuid(uuid)
         ensureSchema()
         transactionally { transaction ->
             lockWriteSessionsForFilesystem(transaction, parsed)
             val filesystem = requireFilesystem(transaction, parsed, lock = true)
-            purgeFilesystem(transaction, filesystem)
+            purgeFilesystem(transaction, filesystem, PathWatchTerminalReason.FILESYSTEM_DELETED)
         }
     }
 
@@ -184,6 +307,22 @@ class DurableSimpleFileSystemManager(
                     parsed,
                 )
                 bumpManagerRevision(transaction)
+                val stream = requireNamespaceEventStream(transaction, parsed, lock = true)
+                if (expiresAtMillis != null && expiresAtMillis <= clock.currentTimeMillis()) {
+                    if (stream.terminalReason != PathWatchTerminalReason.FILESYSTEM_EXPIRED) {
+                        appendNamespaceEvents(
+                            transaction,
+                            filesystem,
+                            emptyList(),
+                            PathWatchTerminalReason.FILESYSTEM_EXPIRED,
+                        )
+                    }
+                } else if (stream.terminalReason == PathWatchTerminalReason.FILESYSTEM_EXPIRED) {
+                    transaction.execute(
+                        "UPDATE namespace_event_streams SET terminal_reason = NULL WHERE filesystem_uuid = ?",
+                        parsed,
+                    )
+                }
             }
         }
     }
@@ -319,6 +458,58 @@ class DurableSimpleFileSystemManager(
             metadataDatabase.execute(
                 """INSERT INTO simple_filesystem_manager_state (singleton, descriptor_revision)
                     VALUES (true, 0) ON CONFLICT (singleton) DO NOTHING""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                """CREATE TABLE IF NOT EXISTS namespace_event_streams (
+                    filesystem_uuid UUID PRIMARY KEY,
+                    latest_revision INT8 NOT NULL CHECK (latest_revision >= 0),
+                    oldest_available_since_revision INT8 NOT NULL
+                        CHECK (oldest_available_since_revision >= 0),
+                    terminal_reason STRING NULL CHECK (terminal_reason IS NULL OR terminal_reason IN
+                        ('FILESYSTEM_EXPIRED', 'FILESYSTEM_DELETED', 'FILESYSTEM_PURGED')),
+                    CHECK (oldest_available_since_revision <= latest_revision)
+                )""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                """INSERT INTO namespace_event_streams
+                    (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason)
+                    SELECT uuid, namespace_revision, namespace_revision, NULL FROM filesystems
+                    ON CONFLICT (filesystem_uuid) DO NOTHING""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                """CREATE TABLE IF NOT EXISTS namespace_events (
+                    filesystem_uuid UUID NOT NULL,
+                    revision INT8 NOT NULL CHECK (revision > 0),
+                    canonical_path STRING NOT NULL,
+                    entry_type STRING NULL CHECK (entry_type IS NULL OR entry_type IN
+                        ('REGULAR_FILE', 'DIRECTORY', 'SYMLINK', 'OTHER')),
+                    exists BOOL NOT NULL,
+                    is_directory BOOL NOT NULL,
+                    is_regular_file BOOL NOT NULL,
+                    size_bytes INT8 NULL CHECK (size_bytes IS NULL OR size_bytes >= 0),
+                    content_hash STRING NULL,
+                    terminal BOOL NOT NULL,
+                    terminal_reason STRING NULL CHECK (terminal_reason IS NULL OR terminal_reason IN
+                        ('FILESYSTEM_EXPIRED', 'FILESYSTEM_DELETED', 'FILESYSTEM_PURGED')),
+                    event_at_millis INT8 NOT NULL,
+                    PRIMARY KEY (filesystem_uuid, revision, canonical_path),
+                    CHECK ((terminal AND terminal_reason IS NOT NULL AND canonical_path = '/' AND
+                            NOT exists AND entry_type IS NULL AND NOT is_directory AND
+                            NOT is_regular_file AND size_bytes IS NULL AND content_hash IS NULL)
+                        OR (NOT terminal AND terminal_reason IS NULL AND
+                            exists = (entry_type IS NOT NULL) AND
+                            is_directory = (entry_type = 'DIRECTORY') AND
+                            is_regular_file = (entry_type = 'REGULAR_FILE') AND
+                            (is_regular_file OR (size_bytes IS NULL AND content_hash IS NULL))))
+                )""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                """CREATE INDEX IF NOT EXISTS namespace_events_by_path
+                    ON namespace_events (filesystem_uuid, canonical_path, revision)""".trimIndent(),
+            )
+            metadataDatabase.execute(
+                """CREATE INDEX IF NOT EXISTS namespace_events_by_age
+                    ON namespace_events (filesystem_uuid, event_at_millis, revision)""".trimIndent(),
             )
             metadataDatabase.execute(
                 """CREATE TABLE IF NOT EXISTS entries (
@@ -820,8 +1011,12 @@ class DurableSimpleFileSystemManager(
                     attemptedUsage,
                     stage.filesystemUuid,
                 )
-                bumpFilesystemRevision(transaction, filesystem)
-                if (attemptedUsage != filesystem.usedBytes) bumpManagerRevision(transaction)
+                recordNamespaceMutation(
+                    transaction,
+                    filesystem,
+                    attemptedUsage,
+                    listOf(stage.path) + if (current == null) listOf(parentPath(stage.path)) else emptyList(),
+                )
                 val committed = transaction.execute(
                     """UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ?
                         WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
@@ -918,8 +1113,12 @@ class DurableSimpleFileSystemManager(
                     attemptedUsage,
                     stage.filesystemUuid,
                 )
-                bumpFilesystemRevision(transaction, filesystem)
-                if (attemptedUsage != filesystem.usedBytes) bumpManagerRevision(transaction)
+                recordNamespaceMutation(
+                    transaction,
+                    filesystem,
+                    attemptedUsage,
+                    listOf(stage.path) + if (current == null) listOf(parentPath(stage.path)) else emptyList(),
+                )
                 val committed = transaction.execute(
                     """UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ?
                         WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
@@ -1227,11 +1426,16 @@ class DurableSimpleFileSystemManager(
         ).firstOrNull()?.toFilesystemRecord() ?: return@transactionally false
         val expiration = filesystem.expiresAtMillis
         if (expiration == null || expiration > observedNow) return@transactionally false
-        purgeFilesystem(transaction, filesystem)
+        purgeFilesystem(transaction, filesystem, PathWatchTerminalReason.FILESYSTEM_PURGED)
         true
     }
 
-    private fun purgeFilesystem(database: Database, filesystem: FilesystemRecord) {
+    private fun purgeFilesystem(
+        database: Database,
+        filesystem: FilesystemRecord,
+        terminalReason: PathWatchTerminalReason,
+    ) {
+        appendNamespaceEvents(database, filesystem, emptyList(), terminalReason)
         var lastPath: String? = null
         while (true) {
             val rows = if (lastPath == null) {
@@ -1404,12 +1608,18 @@ class DurableSimpleFileSystemManager(
         database: Database,
         filesystem: FilesystemRecord,
         newUsedBytes: Long = filesystem.usedBytes,
+        affectedPaths: Collection<String>,
     ) {
-        bumpFilesystemRevision(database, filesystem)
+        appendNamespaceEvents(database, filesystem, affectedPaths, terminalReason = null)
         if (newUsedBytes != filesystem.usedBytes) bumpManagerRevision(database)
     }
 
-    private fun bumpFilesystemRevision(database: Database, filesystem: FilesystemRecord) {
+    private fun appendNamespaceEvents(
+        database: Database,
+        filesystem: FilesystemRecord,
+        affectedPaths: Collection<String>,
+        terminalReason: PathWatchTerminalReason?,
+    ): Long {
         val next = try {
             Math.addExact(filesystem.namespaceRevision, 1L)
         } catch (_: ArithmeticException) {
@@ -1422,6 +1632,136 @@ class DurableSimpleFileSystemManager(
             next,
             filesystem.uuid,
         )
+        val now = clock.currentTimeMillis()
+        if (terminalReason == null) {
+            require(affectedPaths.isNotEmpty()) {
+                "A non-terminal namespace mutation for filesystem '${filesystem.uuid}' must identify at least one affected path."
+            }
+            affectedPaths.toSortedSet().chunked(INTERNAL_KEYSET_BATCH_SIZE).forEach { paths ->
+                val values = paths.joinToString(", ") { "(?)" }
+                val arguments = mutableListOf<Any>(filesystem.uuid, next, now)
+                arguments.addAll(paths)
+                arguments.add(filesystem.uuid)
+                database.execute(
+                    """INSERT INTO namespace_events
+                        (filesystem_uuid, revision, canonical_path, entry_type, exists, is_directory,
+                         is_regular_file, size_bytes, content_hash, terminal, terminal_reason, event_at_millis)
+                        SELECT ?, ?, requested.path,
+                               CASE entry.entry_kind
+                                   WHEN 'FILE' THEN 'REGULAR_FILE'
+                                   WHEN 'DIRECTORY' THEN 'DIRECTORY'
+                                   ELSE NULL
+                               END,
+                               entry.path IS NOT NULL,
+                               COALESCE(entry.entry_kind = 'DIRECTORY', false),
+                               COALESCE(entry.entry_kind = 'FILE', false),
+                               entry.size_bytes,
+                               entry.content_hash,
+                               false,
+                               NULL,
+                               ?
+                        FROM (VALUES $values) AS requested(path)
+                        LEFT JOIN entries AS entry
+                          ON entry.filesystem_uuid = ? AND entry.path = requested.path""".trimIndent(),
+                    *arguments.toTypedArray(),
+                )
+            }
+        } else {
+            database.execute(
+                """INSERT INTO namespace_events
+                    (filesystem_uuid, revision, canonical_path, entry_type, exists, is_directory,
+                     is_regular_file, size_bytes, content_hash, terminal, terminal_reason, event_at_millis)
+                    VALUES (?, ?, '/', NULL, false, false, false, NULL, NULL, true, ?, ?)""".trimIndent(),
+                filesystem.uuid,
+                next,
+                terminalReason.name,
+                now,
+            )
+        }
+        database.execute(
+            """UPDATE namespace_event_streams SET latest_revision = ?, terminal_reason = ?
+                WHERE filesystem_uuid = ?""".trimIndent(),
+            next,
+            terminalReason?.name,
+            filesystem.uuid,
+        )
+        pruneNamespaceEvents(database, filesystem.uuid)
+        return next
+    }
+
+    private fun namespaceSnapshot(
+        database: Database,
+        filesystemUuid: UUID,
+        canonicalPath: String,
+        revision: Long,
+    ): NamespaceEventRecord {
+        val entry = findEntry(database, filesystemUuid, canonicalPath)
+        return NamespaceEventRecord(
+            filesystemUuid = filesystemUuid,
+            revision = revision,
+            canonicalPath = canonicalPath,
+            entryType = entry?.entryType,
+            exists = entry != null,
+            isDirectory = entry?.isDirectory == true,
+            isRegularFile = entry?.isFile == true,
+            sizeBytes = entry?.sizeBytes,
+            contentHash = entry?.contentHash,
+            terminalReason = null,
+        )
+    }
+
+    private fun requireNamespaceEventStream(
+        database: Database,
+        filesystemUuid: UUID,
+        lock: Boolean,
+    ): NamespaceEventStreamRecord {
+        val suffix = if (lock) " FOR UPDATE" else ""
+        return database.getRows(
+            "SELECT * FROM namespace_event_streams WHERE filesystem_uuid = ?$suffix",
+            filesystemUuid,
+        ).firstOrNull()?.toNamespaceEventStreamRecord()
+            ?: throw FilesystemNotFoundException(filesystemUuid.toString())
+    }
+
+    private fun pruneNamespaceEvents(database: Database, filesystemUuid: UUID) {
+        val now = clock.currentTimeMillis()
+        val ageCutoff = try {
+            Math.subtractExact(now, namespaceEventRetentionMillis)
+        } catch (_: ArithmeticException) {
+            Long.MIN_VALUE
+        }
+        database.execute(
+            "DELETE FROM namespace_events WHERE filesystem_uuid = ? AND event_at_millis < ?",
+            filesystemUuid,
+            ageCutoff,
+        )
+        val countCutoffRevision = database.getRows(
+            """SELECT revision FROM namespace_events WHERE filesystem_uuid = ?
+                ORDER BY revision DESC, canonical_path DESC LIMIT 1 OFFSET ?""".trimIndent(),
+            filesystemUuid,
+            namespaceEventRetentionCount - 1,
+        ).firstOrNull()?.longValue("revision")
+        if (countCutoffRevision != null) {
+            database.execute(
+                "DELETE FROM namespace_events WHERE filesystem_uuid = ? AND revision < ?",
+                filesystemUuid,
+                countCutoffRevision,
+            )
+        }
+        val stream = requireNamespaceEventStream(database, filesystemUuid, lock = true)
+        val minimumRetainedRevision = database.getRows(
+            "SELECT min(revision) AS minimum_revision FROM namespace_events WHERE filesystem_uuid = ?",
+            filesystemUuid,
+        ).single().nullableLongValue("minimum_revision")
+        val safeSinceRevision = minimumRetainedRevision?.let { it - 1L } ?: stream.latestRevision
+        if (safeSinceRevision > stream.oldestAvailableSinceRevision) {
+            database.execute(
+                """UPDATE namespace_event_streams SET oldest_available_since_revision = ?
+                    WHERE filesystem_uuid = ?""".trimIndent(),
+                safeSinceRevision,
+                filesystemUuid,
+            )
+        }
     }
 
     private fun managerRevision(database: Database, lock: Boolean = false): Long {
@@ -1493,6 +1833,8 @@ class DurableSimpleFileSystemManager(
         const val DEFAULT_SESSION_LEASE_MILLIS = 5L * 60L * 1000L
         const val DEFAULT_MAINTENANCE_BATCH_SIZE = 1_000
         const val INTERNAL_KEYSET_BATCH_SIZE = 256
+        const val DEFAULT_NAMESPACE_EVENT_RETENTION_COUNT = 10_000
+        const val DEFAULT_NAMESPACE_EVENT_RETENTION_MILLIS = 7L * 24L * 60L * 60L * 1000L
     }
 }
 

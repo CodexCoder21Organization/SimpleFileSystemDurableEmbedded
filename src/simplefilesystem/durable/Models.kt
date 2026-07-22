@@ -6,6 +6,9 @@ import simplefilesystem.FileEntryType
 import simplefilesystem.FileMetadataInfo
 import simplefilesystem.FilesystemInfo
 import simplefilesystem.FilesystemPage
+import simplefilesystem.PathWatchEvent
+import simplefilesystem.PathWatchPage
+import simplefilesystem.PathWatchTerminalReason
 import sql.DatabaseRow
 import java.util.UUID
 
@@ -68,6 +71,26 @@ internal data class FileGenerationSnapshot(
     val readerUuid: UUID,
 )
 
+internal data class NamespaceEventStreamRecord(
+    val filesystemUuid: UUID,
+    val latestRevision: Long,
+    val oldestAvailableSinceRevision: Long,
+    val terminalReason: PathWatchTerminalReason?,
+)
+
+internal data class NamespaceEventRecord(
+    val filesystemUuid: UUID,
+    val revision: Long,
+    val canonicalPath: String,
+    val entryType: FileEntryType?,
+    val exists: Boolean,
+    val isDirectory: Boolean,
+    val isRegularFile: Boolean,
+    val sizeBytes: Long?,
+    val contentHash: String?,
+    val terminalReason: PathWatchTerminalReason?,
+)
+
 internal data class FilesystemInfoValue(
     override val uuid: String,
     override val description: String,
@@ -112,6 +135,26 @@ internal data class FilesystemPageValue(
     override val snapshotRevision: Long,
 ) : FilesystemPage
 
+internal data class PathWatchEventValue(
+    override val uuid: String,
+    override val path: String,
+    override val revision: Long,
+    override val entryType: FileEntryType?,
+    override val exists: Boolean,
+    override val isDirectory: Boolean,
+    override val isRegularFile: Boolean,
+    override val size: Long?,
+    override val contentHash: String?,
+    override val terminalReason: PathWatchTerminalReason?,
+) : PathWatchEvent
+
+internal data class PathWatchPageValue(
+    override val events: List<PathWatchEvent>,
+    override val nextSinceRevision: Long,
+    override val hasMore: Boolean,
+    override val latestRevision: Long,
+) : PathWatchPage
+
 internal fun DatabaseRow.uuidValue(column: String): UUID = when (val value = results[column]) {
     is UUID -> value
     is String -> UUID.fromString(value)
@@ -137,6 +180,9 @@ internal fun DatabaseRow.nullableLongValue(column: String): Long? = (results[col
 
 internal fun DatabaseRow.intValue(column: String): Int = (results[column] as? Number)?.toInt()
     ?: error("Column '$column' was expected to contain an integer, but contained '${results[column]}'.")
+
+internal fun DatabaseRow.booleanValue(column: String): Boolean = results[column] as? Boolean
+    ?: error("Column '$column' was expected to contain a boolean, but contained '${results[column]}'.")
 
 internal fun DatabaseRow.toFilesystemRecord(): FilesystemRecord = FilesystemRecord(
     uuid = uuidValue("uuid"),
@@ -168,6 +214,26 @@ internal fun DatabaseRow.toBlockRecord(): BlockRecord = BlockRecord(
     blobHash = stringValue("blob_hash"),
     sizeBytes = intValue("size_bytes"),
     referenceCount = longValue("reference_count"),
+)
+
+internal fun DatabaseRow.toNamespaceEventStreamRecord(): NamespaceEventStreamRecord = NamespaceEventStreamRecord(
+    filesystemUuid = uuidValue("filesystem_uuid"),
+    latestRevision = longValue("latest_revision"),
+    oldestAvailableSinceRevision = longValue("oldest_available_since_revision"),
+    terminalReason = nullableStringValue("terminal_reason")?.let(PathWatchTerminalReason::valueOf),
+)
+
+internal fun DatabaseRow.toNamespaceEventRecord(): NamespaceEventRecord = NamespaceEventRecord(
+    filesystemUuid = uuidValue("filesystem_uuid"),
+    revision = longValue("revision"),
+    canonicalPath = stringValue("canonical_path"),
+    entryType = nullableStringValue("entry_type")?.let(FileEntryType::valueOf),
+    exists = booleanValue("exists"),
+    isDirectory = booleanValue("is_directory"),
+    isRegularFile = booleanValue("is_regular_file"),
+    sizeBytes = nullableLongValue("size_bytes"),
+    contentHash = nullableStringValue("content_hash"),
+    terminalReason = nullableStringValue("terminal_reason")?.let(PathWatchTerminalReason::valueOf),
 )
 
 internal fun FilesystemRecord.toInfo(): FilesystemInfo = FilesystemInfoValue(
@@ -206,3 +272,16 @@ internal val EntryRecord.entryType: FileEntryType
         "DIRECTORY" -> FileEntryType.DIRECTORY
         else -> FileEntryType.OTHER
     }
+
+internal fun NamespaceEventRecord.toWatchEvent(): PathWatchEvent = PathWatchEventValue(
+    uuid = filesystemUuid.toString(),
+    path = canonicalPath,
+    revision = revision,
+    entryType = entryType,
+    exists = exists,
+    isDirectory = isDirectory,
+    isRegularFile = isRegularFile,
+    size = sizeBytes,
+    contentHash = contentHash,
+    terminalReason = terminalReason,
+)

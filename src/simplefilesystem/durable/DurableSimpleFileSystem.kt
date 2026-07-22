@@ -223,7 +223,12 @@ class DurableSimpleFileSystem internal constructor(
                 attemptedUsage,
                 filesystemUuid,
             )
-            manager.recordNamespaceMutation(transaction, filesystem, attemptedUsage)
+            manager.recordNamespaceMutation(
+                transaction,
+                filesystem,
+                attemptedUsage,
+                listOf(normalized, manager.parentPath(normalized)),
+            )
         }
     }
 
@@ -243,6 +248,7 @@ class DurableSimpleFileSystem internal constructor(
             var cursor = ""
             var released = 0L
             var deletedAny = false
+            val deletedPaths = mutableListOf<String>()
             while (true) {
                 val entries = transaction.getRows(
                     """SELECT * FROM entries
@@ -271,6 +277,7 @@ class DurableSimpleFileSystem internal constructor(
                     }
                 }
                 val nextCursor = entries.last().path
+                deletedPaths += entries.map { it.path }
                 transaction.execute(
                     """DELETE FROM entries
                         WHERE filesystem_uuid = ? AND path != '/' AND path > ? AND path <= ?
@@ -292,7 +299,13 @@ class DurableSimpleFileSystem internal constructor(
                     attemptedUsage,
                     filesystemUuid,
                 )
-                manager.recordNamespaceMutation(transaction, filesystem, attemptedUsage)
+                manager.recordNamespaceMutation(
+                    transaction,
+                    filesystem,
+                    attemptedUsage,
+                    deletedPaths +
+                        if (normalized == "/") listOf("/") else listOf(manager.parentPath(normalized)),
+                )
             }
         }
     }
@@ -371,7 +384,13 @@ class DurableSimpleFileSystem internal constructor(
                 )
             }
             transaction.execute("UPDATE filesystems SET used_bytes = ? WHERE uuid = ?", attempted, filesystemUuid)
-            manager.recordNamespaceMutation(transaction, filesystem, attempted)
+            manager.recordNamespaceMutation(
+                transaction,
+                filesystem,
+                attempted,
+                listOf(normalizedTarget) +
+                    if (targetEntry == null) listOf(manager.parentPath(normalizedTarget)) else emptyList(),
+            )
             manager.requireEntry(transaction, filesystemUuid, normalizedTarget).toMetadata()
         }
     }
@@ -428,6 +447,7 @@ class DurableSimpleFileSystem internal constructor(
             }
             val sourcePrefix = "$normalizedSource/"
             var cursor = ""
+            val movedPathEvents = mutableListOf<String>()
             while (true) {
                 val movingPaths = transaction.getStrings(
                     """SELECT path FROM entries
@@ -445,6 +465,8 @@ class DurableSimpleFileSystem internal constructor(
                 movingPaths.forEach { oldPath ->
                     val suffix = oldPath.removePrefix(normalizedSource)
                     val newPath = normalizedTarget + suffix
+                    movedPathEvents += oldPath
+                    movedPathEvents += newPath
                     transaction.execute(
                         """UPDATE entries SET path = ?, parent_path = ?, name = ?
                             WHERE filesystem_uuid = ? AND path = ?""".trimIndent(),
@@ -464,7 +486,14 @@ class DurableSimpleFileSystem internal constructor(
                 attemptedUsage,
                 filesystemUuid,
             )
-            manager.recordNamespaceMutation(transaction, filesystem, attemptedUsage)
+            val membershipPaths = listOf(manager.parentPath(normalizedSource)) +
+                if (replaced == null) listOf(manager.parentPath(normalizedTarget)) else emptyList()
+            manager.recordNamespaceMutation(
+                transaction,
+                filesystem,
+                attemptedUsage,
+                movedPathEvents + membershipPaths,
+            )
             manager.requireEntry(transaction, filesystemUuid, normalizedTarget).toMetadata()
         }
     }
@@ -564,22 +593,32 @@ class DurableSimpleFileSystem internal constructor(
                     lock = true,
                 )
                 insertDirectory(transaction, normalized, now)
-                manager.recordNamespaceMutation(transaction, filesystem)
+                manager.recordNamespaceMutation(
+                    transaction,
+                    filesystem,
+                    affectedPaths = listOf(normalized, manager.parentPath(normalized)),
+                )
                 return@transactionally
             }
             var current = ""
-            var created = false
+            val createdPaths = mutableListOf<String>()
             normalized.removePrefix("/").split('/').forEach { component ->
                 current += "/$component"
                 val componentEntry = manager.findEntry(transaction, filesystemUuid, current, lock = true)
                 if (componentEntry == null) {
                     insertDirectory(transaction, current, now)
-                    created = true
+                    createdPaths += current
                 } else if (!componentEntry.isDirectory) {
                     throw PathTypeMismatchException(current, FileEntryType.DIRECTORY, componentEntry.entryType)
                 }
             }
-            if (created) manager.recordNamespaceMutation(transaction, filesystem)
+            if (createdPaths.isNotEmpty()) {
+                manager.recordNamespaceMutation(
+                    transaction,
+                    filesystem,
+                    affectedPaths = createdPaths.flatMap { listOf(it, manager.parentPath(it)) },
+                )
+            }
         }
     }
 
