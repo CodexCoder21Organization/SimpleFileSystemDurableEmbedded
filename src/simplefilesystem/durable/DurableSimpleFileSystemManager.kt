@@ -703,7 +703,8 @@ class DurableSimpleFileSystemManager(
         } catch (failure: InvalidPathException) {
             throw InvalidCursorException(
                 after,
-                "the cursor must be a canonical absolute path: ${failure.reason.name}.",
+                "expected a canonical absolute path previously returned as nextAfter. " +
+                    "The cursor path is invalid: ${failure.reason.name}.",
             )
         }
         val descendant = directory == "/" && after != "/" ||
@@ -711,7 +712,11 @@ class DurableSimpleFileSystemManager(
         val directChild = descendant && parentPath(after) == directory
         if (!descendant || (!recursive && !directChild)) {
             val scope = if (recursive) "a descendant" else "a direct child"
-            throw InvalidCursorException(after, "the cursor must be $scope of directory '$directory'.")
+            throw InvalidCursorException(
+                after,
+                "expected a canonical absolute path previously returned as nextAfter. " +
+                    "The cursor must be $scope of directory '$directory'.",
+            )
         }
         return after
     }
@@ -1789,7 +1794,8 @@ class DurableSimpleFileSystemManager(
             throw InvalidFilesystemDescriptionException(
                 description,
                 null,
-                "the text contains an unpaired UTF-16 surrogate at character index $it",
+                "Filesystem description is not valid Unicode text: " +
+                    "unpaired UTF-16 surrogate at character index $it.",
             )
         }
         val byteCount = strictUtf8Size(description).toLong()
@@ -1797,30 +1803,45 @@ class DurableSimpleFileSystemManager(
             throw InvalidFilesystemDescriptionException(
                 description,
                 byteCount,
-                "the strict UTF-8 encoding exceeds $FILESYSTEM_DESCRIPTION_MAX_UTF8_BYTES bytes",
+                "Filesystem description is $byteCount UTF-8 bytes, exceeding the maximum of " +
+                    "$FILESYSTEM_DESCRIPTION_MAX_UTF8_BYTES UTF-8 bytes.",
             )
         }
     }
 
     private fun parseFilesystemCursor(after: String?): Pair<Long, UUID>? {
         if (after == null) return null
+        val expected = "expected '<createdAtMillis>:<uuid>' where createdAtMillis is a non-negative decimal " +
+            "and uuid is canonical lowercase RFC 4122."
         val separator = after.indexOf(':')
         if (separator <= 0 || separator != after.lastIndexOf(':')) {
-            throw InvalidCursorException(after, "expected '<createdAtMillis>:<uuid>'.")
+            throw InvalidCursorException(
+                after,
+                "$expected The cursor must contain exactly one colon separating its two non-empty components.",
+            )
         }
         val timestampText = after.substring(0, separator)
         if (!UNSIGNED_DECIMAL.matches(timestampText) ||
             (timestampText.length > 1 && timestampText.startsWith('0'))
         ) {
-            throw InvalidCursorException(after, "createdAtMillis must be canonical unsigned decimal text.")
+            throw InvalidCursorException(
+                after,
+                "$expected The createdAtMillis component must be canonical unsigned decimal text without leading zeroes.",
+            )
         }
         val timestamp = timestampText.toLongOrNull()
-            ?: throw InvalidCursorException(after, "createdAtMillis is outside the signed 64-bit epoch-millisecond range.")
+            ?: throw InvalidCursorException(
+                after,
+                "$expected The createdAtMillis component exceeds the supported signed 64-bit epoch-millisecond range.",
+            )
         val uuidText = after.substring(separator + 1)
         val uuid = try {
             parseUuid(uuidText)
         } catch (_: InvalidFilesystemUuidException) {
-            throw InvalidCursorException(after, "UUID must be lowercase canonical RFC 4122 text.")
+            throw InvalidCursorException(
+                after,
+                "$expected The UUID component is not lowercase canonical RFC 4122 text.",
+            )
         }
         return timestamp to uuid
     }
