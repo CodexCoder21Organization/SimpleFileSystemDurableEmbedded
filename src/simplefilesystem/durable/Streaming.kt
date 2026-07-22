@@ -39,8 +39,8 @@ internal class StagedBlockSink(
             while (remaining > 0L) {
                 val requested = minOf(remaining, (pending.size - pendingSize).toLong()).toInt()
                 val read = source.read(pending, pendingSize, requested)
-                check(read == requested) {
-                    "Okio buffer for '$path' ended after $read bytes while $requested staged bytes were required."
+                check(read > 0) {
+                    "Okio buffer for '$path' ended while $remaining staged bytes were still required."
                 }
                 digest.update(pending, pendingSize, read)
                 pendingSize += read

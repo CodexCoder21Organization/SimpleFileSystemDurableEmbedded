@@ -114,7 +114,7 @@ class DurableSimpleFileSystem internal constructor(
             throw InvalidPathException(path, "delete cannot remove the filesystem root; use deleteRecursively to clear it.")
         }
         manager.ensureSchema()
-        manager.metadataDatabase.execute { transaction ->
+        manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = true)
             val entry = manager.findEntry(transaction, filesystemUuid, normalized, lock = true)
             if (entry == null) {
@@ -153,7 +153,7 @@ class DurableSimpleFileSystem internal constructor(
     override fun deleteRecursively(path: String, mustExist: Boolean) {
         val normalized = manager.normalizePath(path)
         manager.ensureSchema()
-        manager.metadataDatabase.execute { transaction ->
+        manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = true)
             val root = manager.findEntry(transaction, filesystemUuid, normalized, lock = true)
             if (root == null) {
@@ -187,7 +187,7 @@ class DurableSimpleFileSystem internal constructor(
         if (normalizedTarget == "/") throw InvalidPathException(target, "copy cannot replace the filesystem root.")
         if (normalizedSource == normalizedTarget) return
         manager.ensureSchema()
-        manager.metadataDatabase.execute { transaction ->
+        manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = true)
             val sourceEntry = manager.requireEntry(transaction, filesystemUuid, normalizedSource, lock = true)
             if (!sourceEntry.isFile) {
@@ -257,7 +257,7 @@ class DurableSimpleFileSystem internal constructor(
             )
         }
         manager.ensureSchema()
-        manager.metadataDatabase.execute { transaction ->
+        manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = true)
             manager.requireEntry(transaction, filesystemUuid, normalizedSource, lock = true)
             manager.requireDirectory(transaction, filesystemUuid, manager.parentPath(normalizedTarget), lock = true)
@@ -364,7 +364,7 @@ class DurableSimpleFileSystem internal constructor(
             return
         }
         manager.ensureSchema()
-        manager.metadataDatabase.execute { transaction ->
+        manager.transactionally { transaction ->
             manager.requireActiveFilesystem(transaction, filesystemUuid, lock = true)
             val existing = manager.findEntry(transaction, filesystemUuid, normalized, lock = true)
             if (existing != null) {

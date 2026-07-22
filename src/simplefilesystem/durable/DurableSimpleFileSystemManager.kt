@@ -19,6 +19,7 @@ import simplefilesystem.SimpleFileSystemManager
 import sql.Database
 import java.io.ByteArrayInputStream
 import java.security.MessageDigest
+import java.sql.SQLException
 import java.util.UUID
 
 class DurableSimpleFileSystemManager(
@@ -34,7 +35,7 @@ class DurableSimpleFileSystemManager(
         if (maxSizeBytes <= 0L) throw InvalidMaxSizeBytesException(maxSizeBytes)
         val uuid = UUID.randomUUID()
         val now = clock.currentTimeMillis()
-        metadataDatabase.execute { transaction ->
+        transactionally { transaction ->
             transaction.execute(
                 """INSERT INTO filesystems
                     (uuid, description, owner, max_size_bytes, used_bytes, expires_at_millis, created_at_millis)
@@ -74,7 +75,7 @@ class DurableSimpleFileSystemManager(
     override fun deleteFilesystem(uuid: String) {
         val parsed = parseUuid(uuid)
         ensureSchema()
-        metadataDatabase.execute { transaction ->
+        transactionally { transaction ->
             requireFilesystem(transaction, parsed, lock = true)
             val entries = transaction.getRows(
                 "SELECT * FROM entries WHERE filesystem_uuid = ? AND entry_kind = 'FILE' FOR UPDATE",
@@ -102,7 +103,7 @@ class DurableSimpleFileSystemManager(
     override fun setExpiration(uuid: String, expiresAtMillis: Long?) {
         val parsed = parseUuid(uuid)
         ensureSchema()
-        metadataDatabase.execute { transaction ->
+        transactionally { transaction ->
             requireFilesystem(transaction, parsed, lock = true)
             transaction.execute(
                 "UPDATE filesystems SET expires_at_millis = ? WHERE uuid = ?",
@@ -182,6 +183,29 @@ class DurableSimpleFileSystemManager(
             )
             schemaReady = true
         }
+    }
+
+    internal fun <T> transactionally(operation: (Database) -> T): T {
+        var retryCount = 0
+        while (true) {
+            try {
+                return metadataDatabase.execute(operation)
+            } catch (failure: SQLException) {
+                if (!failure.hasSqlState(SERIALIZATION_FAILURE_SQL_STATE) || retryCount >= MAX_TRANSACTION_RETRIES) {
+                    throw failure
+                }
+                retryCount += 1
+            }
+        }
+    }
+
+    private fun SQLException.hasSqlState(expected: String): Boolean {
+        var current: Throwable? = this
+        while (current != null) {
+            if (current is SQLException && current.sqlState == expected) return true
+            current = current.cause
+        }
+        return false
     }
 
     internal fun parseUuid(uuid: String): UUID {
@@ -341,7 +365,7 @@ class DurableSimpleFileSystemManager(
 
     internal fun commitGeneration(stage: StagedGeneration, unconditional: Boolean) {
         try {
-            metadataDatabase.execute { transaction ->
+            transactionally { transaction ->
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 val current = findEntry(transaction, stage.filesystemUuid, stage.path, lock = true)
                 if (current?.isDirectory == true) {
@@ -405,13 +429,18 @@ class DurableSimpleFileSystemManager(
 
     internal fun commitAppend(stage: StagedGeneration) {
         try {
-            metadataDatabase.execute { transaction ->
+            transactionally { transaction ->
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 val current = findEntry(transaction, stage.filesystemUuid, stage.path, lock = true)
                 if (current?.isDirectory == true) throw PathTypeMismatchException(stage.path, "FILE", "DIRECTORY")
                 requireDirectory(transaction, stage.filesystemUuid, parentPath(stage.path), lock = true)
                 val oldSize = current?.sizeBytes ?: 0L
-                val attemptedUsage = checkedAttemptedUsage(filesystem, stage.path, oldSize, oldSize + stage.sizeBytes)
+                val appendedSize = if (stage.sizeBytes > Long.MAX_VALUE - oldSize) {
+                    Long.MAX_VALUE
+                } else {
+                    oldSize + stage.sizeBytes
+                }
+                val attemptedUsage = checkedAttemptedUsage(filesystem, stage.path, oldSize, appendedSize)
                 val finalGeneration = UUID.randomUUID()
                 val assembler = TransactionalBlockAssembler(this, transaction, finalGeneration)
                 current?.generationUuid?.let { generation ->
@@ -532,9 +561,11 @@ class DurableSimpleFileSystemManager(
 
     internal fun sha256(bytes: ByteArray): String = MessageDigest.getInstance("SHA-256")
         .digest(bytes)
-        .joinToString("") { "%02X".format(it) }
+        .joinToString("") { "%02X".format(it.toInt() and 0xFF) }
 
     private companion object {
         val EXPECTED_HASH = Regex("[0-9A-F]{64}")
+        const val SERIALIZATION_FAILURE_SQL_STATE = "40001"
+        const val MAX_TRANSACTION_RETRIES = 32
     }
 }
