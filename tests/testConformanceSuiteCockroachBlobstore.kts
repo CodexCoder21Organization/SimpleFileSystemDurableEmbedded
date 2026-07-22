@@ -24,8 +24,7 @@ import simplefilesystem.conformance.SimpleFileSystemManagerFactory
 import simplefilesystem.conformance.SimpleFileSystemManagerFixture
 import sql.Database
 
-private fun durableConformanceFactory(): SimpleFileSystemManagerFactory =
-    object : SimpleFileSystemManagerFactory {
+private val durableConformanceFactory = object : SimpleFileSystemManagerFactory {
             override val backendName: String = "Durable CockroachDB + in-memory Blobstore"
 
             override fun create(initialTimeMillis: Long): SimpleFileSystemManagerFixture {
@@ -60,33 +59,41 @@ private fun durableConformanceFactory(): SimpleFileSystemManagerFactory =
                     }
                 }
             }
-    }
+}
 
 private fun runDurableConformanceArea(area: ConformanceArea, expectedCount: Int) {
-    val result = SimpleFileSystemConformanceSuite.run(durableConformanceFactory(), setOf(area))
+    val result = SimpleFileSystemConformanceSuite.run(durableConformanceFactory, setOf(area))
     assertEquals(expectedCount, result.totalScenarioCount)
 }
 
-fun testConformanceSuiteCockroachBlobstorePrecedenceAndMessages(): Unit =
+fun testConformanceSuiteCockroachBlobstorePrecedenceAndMessages() {
     runDurableConformanceArea(ConformanceArea.PRECEDENCE_AND_MESSAGES, 12)
+}
 
-fun testConformanceSuiteCockroachBlobstoreOperationMatrix(): Unit =
+fun testConformanceSuiteCockroachBlobstoreOperationMatrix() {
     runDurableConformanceArea(ConformanceArea.OPERATION_MATRIX, 12)
+}
 
-fun testConformanceSuiteCockroachBlobstoreContentCas(): Unit =
+fun testConformanceSuiteCockroachBlobstoreContentCas() {
     runDurableConformanceArea(ConformanceArea.CONTENT_CAS, 7)
+}
 
-fun testConformanceSuiteCockroachBlobstoreSnapshotsAndPagination(): Unit =
+fun testConformanceSuiteCockroachBlobstoreSnapshotsAndPagination() {
     runDurableConformanceArea(ConformanceArea.SNAPSHOTS_AND_PAGINATION, 4)
+}
 
-fun testConformanceSuiteCockroachBlobstoreStreaming(): Unit =
+fun testConformanceSuiteCockroachBlobstoreStreaming() {
     runDurableConformanceArea(ConformanceArea.STREAMING, 6)
+}
 
-fun testConformanceSuiteCockroachBlobstoreLifecycle(): Unit =
+fun testConformanceSuiteCockroachBlobstoreLifecycle() {
     runDurableConformanceArea(ConformanceArea.LIFECYCLE, 8)
+}
 
-fun testConformanceSuiteCockroachBlobstoreWatchLog(): Unit =
+fun testConformanceSuiteCockroachBlobstoreWatchLog() {
     runDurableConformanceArea(ConformanceArea.WATCH_LOG, 11)
+}
 
-fun testConformanceSuiteCockroachBlobstoreInlineCodecsAndArithmetic(): Unit =
+fun testConformanceSuiteCockroachBlobstoreInlineCodecsAndArithmetic() {
     runDurableConformanceArea(ConformanceArea.INLINE_CODECS_AND_ARITHMETIC, 9)
+}
