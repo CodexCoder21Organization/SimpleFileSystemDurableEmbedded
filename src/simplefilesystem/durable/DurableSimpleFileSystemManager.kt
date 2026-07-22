@@ -310,6 +310,16 @@ class DurableSimpleFileSystemManager(
         generationUuid,
     ).map { it.toBlockRecord() }
 
+    internal fun fileGenerationSnapshot(filesystemUuid: UUID, path: String): FileGenerationSnapshot {
+        ensureSchema()
+        return transactionally { transaction ->
+            requireActiveFilesystem(transaction, filesystemUuid, lock = false)
+            val entry = requireEntry(transaction, filesystemUuid, path)
+            if (!entry.isFile) throw PathTypeMismatchException(path, "FILE", entry.kind)
+            FileGenerationSnapshot(entry, blocks(transaction, requireNotNull(entry.generationUuid)))
+        }
+    }
+
     internal fun beginSession(filesystemUuid: UUID, rawPath: String, expectedHash: String?): Pair<UUID, String> {
         ensureSchema()
         validateExpectedHash(expectedHash)
@@ -437,11 +447,13 @@ class DurableSimpleFileSystemManager(
         }
     }
 
-    internal fun commitAppend(stage: StagedGeneration) {
+    internal fun commitAppend(stage: StagedGeneration, mustExist: Boolean) {
+        val assembledHashes = linkedSetOf<String>()
         try {
             transactionally { transaction ->
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 val current = findEntry(transaction, stage.filesystemUuid, stage.path, lock = true)
+                if (mustExist && current == null) throw PathNotFoundException(stage.path)
                 if (current?.isDirectory == true) throw PathTypeMismatchException(stage.path, "FILE", "DIRECTORY")
                 requireDirectory(transaction, stage.filesystemUuid, parentPath(stage.path), lock = true)
                 val oldSize = current?.sizeBytes ?: 0L
@@ -451,15 +463,18 @@ class DurableSimpleFileSystemManager(
                     oldSize + stage.sizeBytes
                 }
                 val attemptedUsage = checkedAttemptedUsage(filesystem, stage.path, oldSize, appendedSize)
-                val finalGeneration = UUID.randomUUID()
-                val assembler = TransactionalBlockAssembler(this, transaction, finalGeneration)
-                current?.generationUuid?.let { generation ->
-                    blocks(transaction, generation).forEach { block ->
+                val currentBlocks = current?.generationUuid?.let { blocks(transaction, it) }.orEmpty()
+                val appendedBlocks = blocks(transaction, stage.sessionUuid)
+                transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", stage.sessionUuid)
+                val assembler = TransactionalBlockAssembler(this, transaction, stage.sessionUuid) { hash ->
+                    assembledHashes += hash
+                }
+                (currentBlocks + appendedBlocks).forEach { block ->
+                    if (!assembler.hasPendingBytes && block.sizeBytes == BLOCK_SIZE_BYTES) {
+                        assembler.reuseCompleteBlock(block)
+                    } else {
                         blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { assembler.writeFrom(it) }
                     }
-                }
-                blocks(transaction, stage.sessionUuid).forEach { block ->
-                    blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { assembler.writeFrom(it) }
                 }
                 val final = assembler.finish()
                 val now = clock.currentTimeMillis()
@@ -473,7 +488,7 @@ class DurableSimpleFileSystemManager(
                         stage.path,
                         parentPath(stage.path),
                         name(stage.path),
-                        finalGeneration,
+                        stage.sessionUuid,
                         final.first,
                         final.second,
                         now,
@@ -483,7 +498,7 @@ class DurableSimpleFileSystemManager(
                     transaction.execute(
                         """UPDATE entries SET generation_uuid = ?, size_bytes = ?, content_hash = ?,
                             modified_at_millis = ? WHERE filesystem_uuid = ? AND path = ?""".trimIndent(),
-                        finalGeneration,
+                        stage.sessionUuid,
                         final.first,
                         final.second,
                         now,
@@ -493,11 +508,11 @@ class DurableSimpleFileSystemManager(
                 }
                 transaction.execute(
                     "UPDATE file_blocks SET reference_count = 1 WHERE generation_uuid = ?",
-                    finalGeneration,
+                    stage.sessionUuid,
                 )
                 current?.generationUuid?.let { releaseGeneration(transaction, it) }
-                blocks(transaction, stage.sessionUuid).forEach { enqueueBlobForGc(transaction, it.blobHash) }
-                transaction.execute("DELETE FROM file_blocks WHERE generation_uuid = ?", stage.sessionUuid)
+                appendedBlocks.forEach { enqueueBlobForGc(transaction, it.blobHash) }
+                assembledHashes.forEach { enqueueBlobForGc(transaction, it) }
                 transaction.execute(
                     "UPDATE filesystems SET used_bytes = ? WHERE uuid = ?",
                     attemptedUsage,
@@ -510,6 +525,9 @@ class DurableSimpleFileSystemManager(
                 )
             }
         } catch (failure: Throwable) {
+            assembledHashes.forEach { hash ->
+                metadataDatabase.execute { transaction -> enqueueBlobForGc(transaction, hash) }
+            }
             abortSession(stage.sessionUuid)
             throw failure
         }

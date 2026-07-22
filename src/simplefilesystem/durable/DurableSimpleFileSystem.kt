@@ -79,15 +79,13 @@ class DurableSimpleFileSystem internal constructor(
 
     override fun appendingWrite(path: String, data: String, mustExist: Boolean) {
         val normalized = manager.normalizePath(path)
-        if (mustExist && !exists(normalized)) throw PathNotFoundException(normalized)
         val bytes = Base64.getDecoder().decode(data)
-        appendingSink(normalized).buffer().use { it.write(bytes) }
+        appendingSink(normalized, mustExist).buffer().use { it.write(bytes) }
     }
 
     override fun appendingWriteUtf8(path: String, content: String, mustExist: Boolean) {
         val normalized = manager.normalizePath(path)
-        if (mustExist && !exists(normalized)) throw PathNotFoundException(normalized)
-        appendingSink(normalized).buffer().use { it.writeUtf8(content) }
+        appendingSink(normalized, mustExist).buffer().use { it.writeUtf8(content) }
     }
 
     override fun metadata(path: String): FileMetadataInfo {
@@ -299,27 +297,24 @@ class DurableSimpleFileSystem internal constructor(
 
     override fun source(path: String): Source {
         val snapshot = fileSnapshot(path)
-        val generation = requireNotNull(snapshot.generationUuid)
         return GenerationSource(
             manager,
-            manager.blocks(manager.metadataDatabase, generation),
+            snapshot.blocks,
             initialSkip = 0L,
-            byteCount = requireNotNull(snapshot.sizeBytes),
+            byteCount = requireNotNull(snapshot.entry.sizeBytes),
         )
     }
 
     override fun source(path: String, offset: Long, byteCount: Long): Source {
         val snapshot = fileSnapshot(path)
-        val size = requireNotNull(snapshot.sizeBytes)
+        val size = requireNotNull(snapshot.entry.sizeBytes)
         if (offset < 0L || byteCount < 0L || offset > size || byteCount > size - offset) {
-            throw InvalidByteRangeException(snapshot.path, offset, byteCount, size)
+            throw InvalidByteRangeException(snapshot.entry.path, offset, byteCount, size)
         }
         if (byteCount == 0L) return GenerationSource(manager, emptyList(), 0L, 0L)
-        val generation = requireNotNull(snapshot.generationUuid)
         val firstOrdinal = (offset / BLOCK_SIZE_BYTES).toInt()
         val lastOrdinal = ((offset + byteCount - 1L) / BLOCK_SIZE_BYTES).toInt()
-        val relevant = manager.blocks(manager.metadataDatabase, generation)
-            .filter { it.ordinal in firstOrdinal..lastOrdinal }
+        val relevant = snapshot.blocks.filter { it.ordinal in firstOrdinal..lastOrdinal }
         return GenerationSource(
             manager,
             relevant,
@@ -344,6 +339,7 @@ class DurableSimpleFileSystem internal constructor(
         expectedHash = null,
         unconditional = false,
         append = true,
+        appendMustExist = false,
     )
 
     override fun inputStream(path: String): InputStream = source(path).buffer().inputStream()
@@ -406,12 +402,19 @@ class DurableSimpleFileSystem internal constructor(
         )
     }
 
-    private fun fileSnapshot(rawPath: String): EntryRecord {
-        active()
+    private fun appendingSink(path: String, mustExist: Boolean): Sink = StagedBlockSink(
+        manager = manager,
+        filesystemUuid = filesystemUuid,
+        rawPath = path,
+        expectedHash = null,
+        unconditional = false,
+        append = true,
+        appendMustExist = mustExist,
+    )
+
+    private fun fileSnapshot(rawPath: String): FileGenerationSnapshot {
         val normalized = manager.normalizePath(rawPath)
-        val entry = manager.requireEntry(manager.metadataDatabase, filesystemUuid, normalized)
-        if (!entry.isFile) throw PathTypeMismatchException(normalized, "FILE", entry.kind)
-        return entry
+        return manager.fileGenerationSnapshot(filesystemUuid, normalized)
     }
 
     private fun readBytes(path: String): ByteArray {

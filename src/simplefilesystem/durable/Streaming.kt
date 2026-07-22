@@ -16,6 +16,7 @@ internal class StagedBlockSink(
     private val expectedHash: String?,
     private val unconditional: Boolean,
     private val append: Boolean,
+    private val appendMustExist: Boolean = false,
 ) : Sink {
     private val sessionAndPath = manager.beginSession(filesystemUuid, rawPath, expectedHash)
     private val sessionUuid: UUID = sessionAndPath.first
@@ -77,7 +78,11 @@ internal class StagedBlockSink(
                 sizeBytes = totalBytes,
                 contentHash = contentHash,
             )
-            if (append) manager.commitAppend(stage) else manager.commitGeneration(stage, unconditional)
+            if (append) {
+                manager.commitAppend(stage, appendMustExist)
+            } else {
+                manager.commitGeneration(stage, unconditional)
+            }
         } catch (failure: Throwable) {
             manager.abortSession(sessionUuid)
             throw failure
@@ -98,12 +103,51 @@ internal class TransactionalBlockAssembler(
     private val manager: DurableSimpleFileSystemManager,
     private val transaction: Database,
     private val generationUuid: UUID,
+    private val onStagedHash: (String) -> Unit = {},
 ) {
     private val digest: MessageDigest = MessageDigest.getInstance("SHA-256")
     private val pending = ByteArray(BLOCK_SIZE_BYTES)
     private var pendingSize: Int = 0
     private var ordinal: Int = 0
     private var totalBytes: Long = 0L
+
+    val hasPendingBytes: Boolean get() = pendingSize > 0
+
+    fun reuseCompleteBlock(block: BlockRecord) {
+        check(!hasPendingBytes) {
+            "Cannot reuse complete block ${block.ordinal} after a partial block has started a new extent."
+        }
+        check(block.sizeBytes == BLOCK_SIZE_BYTES) {
+            "Cannot reuse block ${block.ordinal} as a complete extent because it contains ${block.sizeBytes} bytes, " +
+                "not $BLOCK_SIZE_BYTES bytes."
+        }
+        var observedBytes = 0L
+        manager.blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { input ->
+            val transfer = ByteArray(8192)
+            while (true) {
+                val count = input.read(transfer)
+                if (count == -1) break
+                if (count == 0) continue
+                digest.update(transfer, 0, count)
+                observedBytes += count.toLong()
+            }
+        }
+        check(observedBytes == block.sizeBytes.toLong()) {
+            "Blob '${block.blobHash}' for complete block ${block.ordinal} contains $observedBytes bytes, but metadata " +
+                "declares ${block.sizeBytes} bytes."
+        }
+        transaction.execute(
+            """INSERT INTO file_blocks
+                (generation_uuid, ordinal, blob_hash, size_bytes, reference_count)
+                VALUES (?, ?, ?, ?, 0)""".trimIndent(),
+            generationUuid,
+            ordinal,
+            block.blobHash,
+            block.sizeBytes,
+        )
+        ordinal += 1
+        totalBytes += observedBytes
+    }
 
     fun writeFrom(input: InputStream) {
         val transfer = ByteArray(8192)
@@ -137,7 +181,8 @@ internal class TransactionalBlockAssembler(
 
     private fun flushBlock() {
         if (pendingSize == 0) return
-        manager.stageBlock(transaction, generationUuid, ordinal, pending.copyOf(pendingSize))
+        val staged = manager.stageBlock(transaction, generationUuid, ordinal, pending.copyOf(pendingSize))
+        onStagedHash(staged.blobHash)
         ordinal += 1
         pendingSize = 0
     }

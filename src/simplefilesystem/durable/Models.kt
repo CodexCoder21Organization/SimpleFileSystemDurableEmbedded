@@ -52,6 +52,11 @@ internal data class StagedGeneration(
     val contentHash: String,
 )
 
+internal data class FileGenerationSnapshot(
+    val entry: EntryRecord,
+    val blocks: List<BlockRecord>,
+)
+
 internal data class FilesystemInfoValue(
     override val uuid: String,
     override val description: String,
