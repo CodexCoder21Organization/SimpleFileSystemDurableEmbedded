@@ -20,7 +20,6 @@ import java.util.concurrent.TimeoutException
 private const val SHARED_COCKROACH_JDBC_URL_ENV =
     "SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL"
 private const val COCKROACH_STARTUP_TIMEOUT_MILLIS = 120_000L
-private const val PROCESS_STOP_GRACE_SECONDS = 2L
 private const val PROCESS_STOP_FORCE_SECONDS = 5L
 
 /**
@@ -93,9 +92,14 @@ class SharedCockroachCluster(
         val configuredJdbcUrl = adminJdbcUrl ?: return
         var failure: Throwable? = null
         try {
-            DriverManager.getConnection(configuredJdbcUrl, username, password).use { connection ->
-                connection.createStatement().use { statement ->
-                    statement.execute("DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} CASCADE")
+            // A managed node is disposable and every database name is unique, so its process exit
+            // reclaims completed databases in one bounded operation. A caller-owned fixture may
+            // outlive this test and therefore still needs eager per-database cleanup.
+            if (!managedNodeLease) {
+                DriverManager.getConnection(configuredJdbcUrl, username, password).use { connection ->
+                    connection.createStatement().use { statement ->
+                        statement.execute("DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} CASCADE")
+                    }
                 }
             }
         } catch (dropFailure: Throwable) {
@@ -255,15 +259,11 @@ private object SharedCockroachNode {
 
     private fun stopProcess(handle: ProcessHandle, pid: Long, logFile: File) {
         var interrupted = false
-        handle.destroy()
-        try {
-            handle.onExit().get(PROCESS_STOP_GRACE_SECONDS, TimeUnit.SECONDS)
-        } catch (_: TimeoutException) {
-            handle.destroyForcibly()
-        } catch (_: InterruptedException) {
-            interrupted = true
-            handle.destroyForcibly()
-        }
+        // The fallback node has an in-memory store and reaches this point only after its final
+        // isolated database lease is gone. A graceful CockroachDB shutdown can consume most of a
+        // direct test's remaining 30-second budget under CPU contention, while forcible shutdown
+        // discards exactly the same process-local state immediately.
+        handle.destroyForcibly()
 
         if (handle.isAlive) {
             try {
