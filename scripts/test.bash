@@ -10,7 +10,8 @@ if [ ! -f "$JAR_PATH" ]; then
 fi
 
 REPO_PATH=$(cd "$SCRIPT_PATH/.." && pwd)
-CACHE_PATH="$HOME/.aibuildcaches/$(echo "$REPO_PATH" | sed 's|/|_|g')"
+DEFAULT_CACHE_PATH="$HOME/.aibuildcaches/$(echo "$REPO_PATH" | sed 's|/|_|g')"
+CACHE_PATH="${SIMPLE_FILESYSTEM_DURABLE_TEST_CACHE_PATH:-$DEFAULT_CACHE_PATH}"
 if [ "$#" -eq 0 ]; then
   set -- --test .
 fi
