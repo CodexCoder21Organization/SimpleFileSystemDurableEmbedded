@@ -138,7 +138,12 @@ private object SharedCockroachNode {
 
     fun acquire(leaseName: String, clock: Clock): String = withStateLock {
         purgeStaleLeases()
-        val existing = readState()?.takeIf(::isUsable) ?: discoverUsableNode()
+        // A recorded node was connectivity-checked before its state file became visible, and this
+        // caller immediately opens a real JDBC connection to create its isolated database. Probing
+        // it again here serializes every concurrent test JVM behind a duplicate network round trip
+        // while the cross-process state lock is held. PID/start-time identity is sufficient for the
+        // fast path; orphan discovery still performs a full JDBC probe before adopting a node.
+        val existing = readState()?.takeIf(::isLiveProcess) ?: discoverUsableNode()
         val state = existing ?: startNode(clock)
         if (existing != null) writeState(existing)
         writeLease(leaseName)
@@ -224,6 +229,7 @@ private object SharedCockroachNode {
                 "The shared CockroachDB node wrote ${listeningUrlFile.absolutePath}, but a JDBC " +
                     "connection to ${state.jdbcUrl} could not be established"
             }
+            configureSingleNodeTestCluster(state.jdbcUrl)
             writeState(state)
             return state
         } catch (failure: Throwable) {
@@ -288,10 +294,12 @@ private object SharedCockroachNode {
     }
 
     private fun isUsable(state: NodeState): Boolean {
+        return isLiveProcess(state) && canConnect(state.jdbcUrl)
+    }
+
+    private fun isLiveProcess(state: NodeState): Boolean {
         val handle = ProcessHandle.of(state.pid).orElse(null) ?: return false
-        return processIdentityMatches(handle, state.processStartedAt) &&
-            handle.isAlive &&
-            canConnect(state.jdbcUrl)
+        return processIdentityMatches(handle, state.processStartedAt) && handle.isAlive
     }
 
     private fun discoverUsableNode(): NodeState? {
@@ -337,6 +345,18 @@ private object SharedCockroachNode {
         // A failed localhost probe means a persisted node record is stale. The caller replaces
         // that disposable node, and any replacement failure is propagated with its full output.
         false
+    }
+
+    private fun configureSingleNodeTestCluster(jdbcUrl: String) {
+        // Load-based range splits exist to distribute hot ranges among nodes. This disposable
+        // fixture has exactly one node, so a split cannot redistribute load and only makes the
+        // bounded transition queries cross more ranges while sixteen test JVMs contend for two
+        // CPUs. Size-based safety splits remain enabled.
+        DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute("SET CLUSTER SETTING kv.range_split.by_load_enabled = false")
+            }
+        }
     }
 
     private fun processIdentityMatches(handle: ProcessHandle, startedAt: Instant): Boolean =

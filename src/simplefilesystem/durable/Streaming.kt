@@ -25,6 +25,7 @@ internal class StagedBlockSink(
     private val path: String = sessionAndPath.second
     private val digest: MessageDigest = MessageDigest.getInstance("SHA-256")
     private val pending = ByteArray(BLOCK_SIZE_BYTES)
+    private var nextLeaseRenewalAtMillis: Long = manager.sessionLeaseRenewalThreshold()
     private var pendingSize: Int = 0
     private var ordinal: Int = 0
     private var totalBytes: Long = 0L
@@ -38,7 +39,10 @@ internal class StagedBlockSink(
             require(byteCount >= 0L && byteCount <= source.size) {
                 "Cannot consume $byteCount bytes from an Okio buffer containing ${source.size} bytes."
             }
-            manager.renewSessionLease(sessionUuid)
+            nextLeaseRenewalAtMillis = manager.renewSessionLeaseIfDue(
+                sessionUuid,
+                nextLeaseRenewalAtMillis,
+            )
             var remaining = byteCount
             while (remaining > 0L) {
                 val requested = minOf(remaining, (pending.size - pendingSize).toLong()).toInt()
@@ -116,6 +120,7 @@ internal class StagedBlockSink(
         if (pendingSize == 0) return
         val bytes = pending.copyOf(pendingSize)
         manager.stageSessionBlock(sessionUuid, ordinal, bytes, totalBytes)
+        nextLeaseRenewalAtMillis = manager.sessionLeaseRenewalThreshold()
         ordinal += 1
         pendingSize = 0
     }
@@ -163,6 +168,8 @@ internal class TransactionalBlockAssembler(
 ) {
     private val digest: MessageDigest = MessageDigest.getInstance("SHA-256")
     private val pending = ByteArray(BLOCK_SIZE_BYTES)
+    private var cachedBlobHash: String? = null
+    private var cachedBlobBytes: ByteArray? = null
     private var pendingSize: Int = 0
     private var ordinal: Int = 0
     private var totalBytes: Long = 0L
@@ -170,14 +177,31 @@ internal class TransactionalBlockAssembler(
     val hasPendingBytes: Boolean get() = pendingSize > 0
 
     fun append(block: BlockRecord) {
+        val bytes = blockBytes(block)
         if (!hasPendingBytes && block.sizeBytes == BLOCK_SIZE_BYTES) {
-            reuseCompleteBlock(block)
+            reuseCompleteBlock(block, bytes)
         } else {
-            manager.blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { writeFrom(it) }
+            write(bytes, 0, bytes.size)
         }
     }
 
-    fun reuseCompleteBlock(block: BlockRecord) {
+    private fun blockBytes(block: BlockRecord): ByteArray {
+        if (cachedBlobHash == block.blobHash) {
+            return requireNotNull(cachedBlobBytes)
+        }
+        val bytes = manager.blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { input ->
+            input.readNBytes(block.sizeBytes + 1)
+        }
+        check(bytes.size == block.sizeBytes) {
+            "Blob '${block.blobHash}' for block ${block.ordinal} contains ${bytes.size} bytes, but metadata " +
+                "declares ${block.sizeBytes} bytes."
+        }
+        cachedBlobHash = block.blobHash
+        cachedBlobBytes = bytes
+        return bytes
+    }
+
+    private fun reuseCompleteBlock(block: BlockRecord, bytes: ByteArray) {
         check(!hasPendingBytes) {
             "Cannot reuse complete block ${block.ordinal} after a partial block has started a new extent."
         }
@@ -185,21 +209,7 @@ internal class TransactionalBlockAssembler(
             "Cannot reuse block ${block.ordinal} as a complete extent because it contains ${block.sizeBytes} bytes, " +
                 "not $BLOCK_SIZE_BYTES bytes."
         }
-        var observedBytes = 0L
-        manager.blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash).use { input ->
-            val transfer = ByteArray(8192)
-            while (true) {
-                val count = input.read(transfer)
-                if (count == -1) break
-                if (count == 0) continue
-                digest.update(transfer, 0, count)
-                observedBytes += count.toLong()
-            }
-        }
-        check(observedBytes == block.sizeBytes.toLong()) {
-            "Blob '${block.blobHash}' for complete block ${block.ordinal} contains $observedBytes bytes, but metadata " +
-                "declares ${block.sizeBytes} bytes."
-        }
+        digest.update(bytes)
         manager.prepareBlobReference(transaction, block.blobHash)
         transaction.execute(
             """INSERT INTO file_blocks
@@ -212,7 +222,7 @@ internal class TransactionalBlockAssembler(
         )
         transaction.execute("DELETE FROM blob_gc_outbox WHERE blob_hash = ?", block.blobHash)
         ordinal += 1
-        totalBytes += observedBytes
+        totalBytes += bytes.size.toLong()
     }
 
     fun writeFrom(input: InputStream) {

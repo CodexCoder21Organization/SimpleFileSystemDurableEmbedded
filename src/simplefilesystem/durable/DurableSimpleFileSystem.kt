@@ -251,16 +251,31 @@ class DurableSimpleFileSystem internal constructor(
             val deletedPaths = mutableListOf<String>()
             while (true) {
                 val entries = transaction.getRows(
-                    """SELECT * FROM entries
+                    """WITH page_boundary AS MATERIALIZED (
+                            SELECT max(path) AS last_path
+                            FROM (
+                                SELECT path FROM entries
+                                WHERE filesystem_uuid = ? AND path != '/' AND path > ?
+                                  AND (path = ? OR left(path, ?) = ?)
+                                ORDER BY path LIMIT ? FOR UPDATE
+                            ) AS bounded_paths
+                        )
+                        DELETE FROM entries
                         WHERE filesystem_uuid = ? AND path != '/' AND path > ?
+                          AND path <= (SELECT last_path FROM page_boundary)
                           AND (path = ? OR left(path, ?) = ?)
-                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
+                        RETURNING *""".trimIndent(),
                     filesystemUuid,
                     cursor,
                     normalized,
                     prefix.length,
                     prefix,
                     TREE_KEYSET_BATCH_SIZE,
+                    filesystemUuid,
+                    cursor,
+                    normalized,
+                    prefix.length,
+                    prefix,
                 ).map { it.toEntryRecord() }
                 if (entries.isEmpty()) break
                 entries.forEach { entry ->
@@ -276,21 +291,10 @@ class DurableSimpleFileSystem internal constructor(
                         )
                     }
                 }
-                val nextCursor = entries.last().path
                 deletedPaths += entries.map { it.path }
-                transaction.execute(
-                    """DELETE FROM entries
-                        WHERE filesystem_uuid = ? AND path != '/' AND path > ? AND path <= ?
-                          AND (path = ? OR left(path, ?) = ?)""".trimIndent(),
-                    filesystemUuid,
-                    cursor,
-                    nextCursor,
-                    normalized,
-                    prefix.length,
-                    prefix,
-                )
-                cursor = nextCursor
+                cursor = entries.maxOf { it.path }
                 deletedAny = true
+                if (entries.size < TREE_KEYSET_BATCH_SIZE) break
             }
             if (deletedAny) {
                 val attemptedUsage = manager.checkedAttemptedUsage(filesystem, normalized, released, 0L)
@@ -446,38 +450,38 @@ class DurableSimpleFileSystem internal constructor(
                 )
             }
             val sourcePrefix = "$normalizedSource/"
-            var cursor = ""
-            val movedPathEvents = mutableListOf<String>()
-            while (true) {
-                val movingPaths = transaction.getStrings(
-                    """SELECT path FROM entries
-                        WHERE filesystem_uuid = ? AND path > ?
-                          AND (path = ? OR left(path, ?) = ?)
-                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
-                    filesystemUuid,
-                    cursor,
-                    normalizedSource,
-                    sourcePrefix.length,
-                    sourcePrefix,
-                    TREE_KEYSET_BATCH_SIZE,
-                )
-                if (movingPaths.isEmpty()) break
-                movingPaths.forEach { oldPath ->
-                    val suffix = oldPath.removePrefix(normalizedSource)
-                    val newPath = normalizedTarget + suffix
-                    movedPathEvents += oldPath
-                    movedPathEvents += newPath
-                    transaction.execute(
-                        """UPDATE entries SET path = ?, parent_path = ?, name = ?
-                            WHERE filesystem_uuid = ? AND path = ?""".trimIndent(),
-                        newPath,
-                        manager.parentPath(newPath),
-                        manager.name(newPath),
-                        filesystemUuid,
-                        oldPath,
-                    )
-                }
-                cursor = movingPaths.last()
+            val movedPaths = transaction.getStrings(
+                """UPDATE entries
+                    SET path = CASE
+                            WHEN path = ? THEN ?
+                            ELSE ? || substring(path FROM ?)
+                        END,
+                        parent_path = CASE
+                            WHEN path = ? THEN ?
+                            ELSE ? || substring(parent_path FROM ?)
+                        END,
+                        name = CASE WHEN path = ? THEN ? ELSE name END
+                    WHERE filesystem_uuid = ?
+                      AND (path = ? OR left(path, ?) = ?)
+                    RETURNING path""".trimIndent(),
+                normalizedSource,
+                normalizedTarget,
+                normalizedTarget,
+                normalizedSource.length + 1,
+                normalizedSource,
+                manager.parentPath(normalizedTarget),
+                normalizedTarget,
+                normalizedSource.length + 1,
+                normalizedSource,
+                manager.name(normalizedTarget),
+                filesystemUuid,
+                normalizedSource,
+                sourcePrefix.length,
+                sourcePrefix,
+            )
+            val movedPathEvents = movedPaths.flatMap { newPath ->
+                val oldPath = normalizedSource + newPath.removePrefix(normalizedTarget)
+                listOf(oldPath, newPath)
             }
             val released = replaced?.sizeBytes ?: 0L
             val attemptedUsage = manager.checkedAttemptedUsage(filesystem, normalizedTarget, released, 0L)
@@ -792,7 +796,7 @@ class DurableSimpleFileSystem internal constructor(
 
 }
 
-private const val TREE_KEYSET_BATCH_SIZE = 256
+private const val TREE_KEYSET_BATCH_SIZE = 2_048
 private const val BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
 private fun base64Value(character: Char): Int = BASE64_ALPHABET.indexOf(character)
