@@ -733,11 +733,11 @@ class DurableSimpleFileSystemManager(
 
     internal fun beginSession(filesystemUuid: UUID, rawPath: String, expectedHash: String?): Pair<UUID, String> {
         ensureSchema()
-        val path = normalizePath(rawPath)
-        validateExpectedHash(expectedHash)
-        val session = UUID.randomUUID()
-        transactionally { transaction ->
+        return transactionally { transaction ->
             requireActiveFilesystem(transaction, filesystemUuid, lock = false)
+            val path = normalizePath(rawPath)
+            validateExpectedHash(expectedHash)
+            val session = UUID.randomUUID()
             if (path != "/") requireDirectoryPath(transaction, filesystemUuid, parentPath(path))
             val now = clock.currentTimeMillis()
             transaction.execute(
@@ -752,8 +752,8 @@ class DurableSimpleFileSystemManager(
                 now,
                 leaseDeadline(now),
             )
+            session to path
         }
-        return session to path
     }
 
     internal fun stageBlock(
