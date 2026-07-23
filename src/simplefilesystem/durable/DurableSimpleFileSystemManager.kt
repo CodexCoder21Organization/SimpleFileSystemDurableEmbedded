@@ -42,6 +42,7 @@ import java.sql.SQLException
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.TreeSet
+import java.util.WeakHashMap
 
 /**
  * Durable CockroachDB/Blobstore implementation of [SimpleFileSystemManager].
@@ -437,156 +438,33 @@ class DurableSimpleFileSystemManager(
         if (schemaReady) return
         synchronized(this) {
             if (schemaReady) return
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS filesystems (
-                    uuid UUID PRIMARY KEY,
-                    description STRING NOT NULL,
-                    owner STRING NULL,
-                    max_size_bytes INT8 NOT NULL CHECK (max_size_bytes > 0),
-                    used_bytes INT8 NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
-                    expires_at_millis INT8 NULL,
-                    created_at_millis INT8 NOT NULL,
-                    namespace_revision INT8 NOT NULL DEFAULT 0 CHECK (namespace_revision >= 0)
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS simple_filesystem_manager_state (
-                    singleton BOOL PRIMARY KEY DEFAULT true CHECK (singleton),
-                    descriptor_revision INT8 NOT NULL CHECK (descriptor_revision >= 0)
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """INSERT INTO simple_filesystem_manager_state (singleton, descriptor_revision)
-                    VALUES (true, 0) ON CONFLICT (singleton) DO NOTHING""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS namespace_event_streams (
-                    filesystem_uuid UUID PRIMARY KEY,
-                    latest_revision INT8 NOT NULL CHECK (latest_revision >= 0),
-                    oldest_available_since_revision INT8 NOT NULL
-                        CHECK (oldest_available_since_revision >= 0),
-                    terminal_reason STRING NULL CHECK (terminal_reason IS NULL OR terminal_reason IN
-                        ('FILESYSTEM_EXPIRED', 'FILESYSTEM_DELETED', 'FILESYSTEM_PURGED')),
-                    CHECK (oldest_available_since_revision <= latest_revision)
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """INSERT INTO namespace_event_streams
-                    (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason)
-                    SELECT uuid, namespace_revision, namespace_revision, NULL FROM filesystems
-                    ON CONFLICT (filesystem_uuid) DO NOTHING""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS namespace_events (
-                    filesystem_uuid UUID NOT NULL,
-                    revision INT8 NOT NULL CHECK (revision > 0),
-                    canonical_path STRING NOT NULL,
-                    entry_type STRING NULL CHECK (entry_type IS NULL OR entry_type IN
-                        ('REGULAR_FILE', 'DIRECTORY', 'SYMLINK', 'OTHER')),
-                    exists BOOL NOT NULL,
-                    is_directory BOOL NOT NULL,
-                    is_regular_file BOOL NOT NULL,
-                    size_bytes INT8 NULL CHECK (size_bytes IS NULL OR size_bytes >= 0),
-                    content_hash STRING NULL,
-                    terminal BOOL NOT NULL,
-                    terminal_reason STRING NULL CHECK (terminal_reason IS NULL OR terminal_reason IN
-                        ('FILESYSTEM_EXPIRED', 'FILESYSTEM_DELETED', 'FILESYSTEM_PURGED')),
-                    event_at_millis INT8 NOT NULL,
-                    PRIMARY KEY (filesystem_uuid, revision, canonical_path),
-                    CHECK ((terminal AND terminal_reason IS NOT NULL AND canonical_path = '/' AND
-                            NOT exists AND entry_type IS NULL AND NOT is_directory AND
-                            NOT is_regular_file AND size_bytes IS NULL AND content_hash IS NULL)
-                        OR (NOT terminal AND terminal_reason IS NULL AND
-                            exists = (entry_type IS NOT NULL) AND
-                            is_directory = (entry_type = 'DIRECTORY') AND
-                            is_regular_file = (entry_type = 'REGULAR_FILE') AND
-                            (is_regular_file OR (size_bytes IS NULL AND content_hash IS NULL))))
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """CREATE INDEX IF NOT EXISTS namespace_events_by_path
-                    ON namespace_events (filesystem_uuid, canonical_path, revision)""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """CREATE INDEX IF NOT EXISTS namespace_events_by_age
-                    ON namespace_events (filesystem_uuid, event_at_millis, revision)""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS entries (
-                    filesystem_uuid UUID NOT NULL REFERENCES filesystems(uuid) ON DELETE CASCADE,
-                    path STRING NOT NULL,
-                    parent_path STRING NOT NULL,
-                    name STRING NOT NULL,
-                    entry_kind STRING NOT NULL CHECK (entry_kind IN ('FILE', 'DIRECTORY')),
-                    generation_uuid UUID NULL,
-                    size_bytes INT8 NULL,
-                    content_hash STRING NULL,
-                    created_at_millis INT8 NULL,
-                    modified_at_millis INT8 NULL,
-                    PRIMARY KEY (filesystem_uuid, path)
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                "CREATE INDEX IF NOT EXISTS entries_by_parent ON entries (filesystem_uuid, parent_path, name)",
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS file_blocks (
-                    generation_uuid UUID NOT NULL,
-                    ordinal INT4 NOT NULL,
-                    blob_hash STRING NOT NULL,
-                    size_bytes INT4 NOT NULL CHECK (size_bytes >= 0 AND size_bytes <= $BLOCK_SIZE_BYTES),
-                    reference_count INT8 NOT NULL DEFAULT 0 CHECK (reference_count >= 0),
-                    PRIMARY KEY (generation_uuid, ordinal)
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                "CREATE INDEX IF NOT EXISTS file_blocks_by_blob_hash ON file_blocks (blob_hash, reference_count)",
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS write_sessions (
-                    session_uuid UUID PRIMARY KEY,
-                    filesystem_uuid UUID NOT NULL REFERENCES filesystems(uuid) ON DELETE CASCADE,
-                    path STRING NOT NULL,
-                    expected_hash STRING NULL,
-                    bytes_received INT8 NOT NULL,
-                    created_at_millis INT8 NOT NULL,
-                    lease_expires_at_millis INT8 NOT NULL,
-                    state STRING NOT NULL CHECK (state IN ('OPEN', 'COMMITTED', 'ABORTED', 'REAPED'))
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                "CREATE INDEX IF NOT EXISTS write_sessions_by_lease ON write_sessions (state, lease_expires_at_millis)",
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS reader_sessions (
-                    reader_uuid UUID PRIMARY KEY,
-                    generation_uuid UUID NOT NULL,
-                    lease_expires_at_millis INT8 NOT NULL,
-                    state STRING NOT NULL CHECK (state IN ('OPEN', 'RELEASED', 'REAPED'))
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                "CREATE INDEX IF NOT EXISTS reader_sessions_by_lease ON reader_sessions (state, lease_expires_at_millis)",
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS blob_gc_outbox (
-                    blob_hash STRING PRIMARY KEY,
-                    action STRING NOT NULL,
-                    created_at_millis INT8 NOT NULL
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """CREATE TABLE IF NOT EXISTS simple_filesystem_maintenance_state (
-                    singleton BOOL PRIMARY KEY DEFAULT true CHECK (singleton),
-                    orphan_inventory_high_water STRING NULL
-                )""".trimIndent(),
-            )
-            metadataDatabase.execute(
-                """INSERT INTO simple_filesystem_maintenance_state (singleton, orphan_inventory_high_water)
-                    VALUES (true, NULL) ON CONFLICT (singleton) DO NOTHING""".trimIndent(),
-            )
+            if (cachedSchemaVersion(metadataDatabase) != CURRENT_SCHEMA_VERSION) {
+                when (val storedVersion = storedSchemaVersion()) {
+                    null -> metadataDatabase.execute(SCHEMA_INITIALIZATION_SQL)
+                    CURRENT_SCHEMA_VERSION -> Unit
+                    else -> throw IllegalStateException(
+                        "Cannot open durable filesystem metadata schema version $storedVersion; " +
+                            "this implementation supports version $CURRENT_SCHEMA_VERSION.",
+                    )
+                }
+                cacheSchemaVersion(metadataDatabase, CURRENT_SCHEMA_VERSION)
+            }
             schemaReady = true
         }
+    }
+
+    private fun storedSchemaVersion(): Int? {
+        val versionTableExists = metadataDatabase.getRows(
+            """SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name = 'simple_filesystem_schema_version'
+            )""".trimIndent(),
+        ).single().results["exists"] == true
+        if (!versionTableExists) return null
+        return metadataDatabase.getRows(
+            "SELECT schema_version FROM simple_filesystem_schema_version WHERE singleton = true",
+        ).firstOrNull()?.intValue("schema_version")
     }
 
     internal fun <T> transactionally(operation: (Database) -> T): T {
@@ -1858,6 +1736,148 @@ class DurableSimpleFileSystemManager(
         const val DEFAULT_NAMESPACE_EVENT_RETENTION_MILLIS = 7L * 24L * 60L * 60L * 1000L
     }
 }
+
+private const val CURRENT_SCHEMA_VERSION = 1
+
+private val schemaVersionCache = WeakHashMap<Database, Int>()
+
+private fun cachedSchemaVersion(database: Database): Int? = synchronized(schemaVersionCache) {
+    schemaVersionCache[database]
+}
+
+private fun cacheSchemaVersion(database: Database, version: Int) = synchronized(schemaVersionCache) {
+    schemaVersionCache[database] = version
+}
+
+/*
+ * This is intentionally one PostgreSQL request. On a shared two-core CockroachDB node, issuing
+ * every idempotent DDL statement as its own auto-committed request made concurrent test databases
+ * spend 1-4.5 seconds on each index and repeatedly replay the whole sequence on manager restart.
+ * PostgreSQL executes this multi-statement request as one implicit transaction, so the version
+ * marker becomes visible only after the complete schema does.
+ */
+private val SCHEMA_INITIALIZATION_SQL = """
+    CREATE TABLE IF NOT EXISTS filesystems (
+        uuid UUID PRIMARY KEY,
+        description STRING NOT NULL,
+        owner STRING NULL,
+        max_size_bytes INT8 NOT NULL CHECK (max_size_bytes > 0),
+        used_bytes INT8 NOT NULL DEFAULT 0 CHECK (used_bytes >= 0),
+        expires_at_millis INT8 NULL,
+        created_at_millis INT8 NOT NULL,
+        namespace_revision INT8 NOT NULL DEFAULT 0 CHECK (namespace_revision >= 0)
+    );
+    CREATE TABLE IF NOT EXISTS simple_filesystem_manager_state (
+        singleton BOOL PRIMARY KEY DEFAULT true CHECK (singleton),
+        descriptor_revision INT8 NOT NULL CHECK (descriptor_revision >= 0)
+    );
+    INSERT INTO simple_filesystem_manager_state (singleton, descriptor_revision)
+        VALUES (true, 0) ON CONFLICT (singleton) DO NOTHING;
+    CREATE TABLE IF NOT EXISTS namespace_event_streams (
+        filesystem_uuid UUID PRIMARY KEY,
+        latest_revision INT8 NOT NULL CHECK (latest_revision >= 0),
+        oldest_available_since_revision INT8 NOT NULL
+            CHECK (oldest_available_since_revision >= 0),
+        terminal_reason STRING NULL CHECK (terminal_reason IS NULL OR terminal_reason IN
+            ('FILESYSTEM_EXPIRED', 'FILESYSTEM_DELETED', 'FILESYSTEM_PURGED')),
+        CHECK (oldest_available_since_revision <= latest_revision)
+    );
+    INSERT INTO namespace_event_streams
+        (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason)
+        SELECT uuid, namespace_revision, namespace_revision, NULL FROM filesystems
+        ON CONFLICT (filesystem_uuid) DO NOTHING;
+    CREATE TABLE IF NOT EXISTS namespace_events (
+        filesystem_uuid UUID NOT NULL,
+        revision INT8 NOT NULL CHECK (revision > 0),
+        canonical_path STRING NOT NULL,
+        entry_type STRING NULL CHECK (entry_type IS NULL OR entry_type IN
+            ('REGULAR_FILE', 'DIRECTORY', 'SYMLINK', 'OTHER')),
+        exists BOOL NOT NULL,
+        is_directory BOOL NOT NULL,
+        is_regular_file BOOL NOT NULL,
+        size_bytes INT8 NULL CHECK (size_bytes IS NULL OR size_bytes >= 0),
+        content_hash STRING NULL,
+        terminal BOOL NOT NULL,
+        terminal_reason STRING NULL CHECK (terminal_reason IS NULL OR terminal_reason IN
+            ('FILESYSTEM_EXPIRED', 'FILESYSTEM_DELETED', 'FILESYSTEM_PURGED')),
+        event_at_millis INT8 NOT NULL,
+        PRIMARY KEY (filesystem_uuid, revision, canonical_path),
+        CHECK ((terminal AND terminal_reason IS NOT NULL AND canonical_path = '/' AND
+                NOT exists AND entry_type IS NULL AND NOT is_directory AND
+                NOT is_regular_file AND size_bytes IS NULL AND content_hash IS NULL)
+            OR (NOT terminal AND terminal_reason IS NULL AND
+                exists = (entry_type IS NOT NULL) AND
+                is_directory = (entry_type = 'DIRECTORY') AND
+                is_regular_file = (entry_type = 'REGULAR_FILE') AND
+                (is_regular_file OR (size_bytes IS NULL AND content_hash IS NULL))))
+    );
+    CREATE INDEX IF NOT EXISTS namespace_events_by_path
+        ON namespace_events (filesystem_uuid, canonical_path, revision);
+    CREATE INDEX IF NOT EXISTS namespace_events_by_age
+        ON namespace_events (filesystem_uuid, event_at_millis, revision);
+    CREATE TABLE IF NOT EXISTS entries (
+        filesystem_uuid UUID NOT NULL REFERENCES filesystems(uuid) ON DELETE CASCADE,
+        path STRING NOT NULL,
+        parent_path STRING NOT NULL,
+        name STRING NOT NULL,
+        entry_kind STRING NOT NULL CHECK (entry_kind IN ('FILE', 'DIRECTORY')),
+        generation_uuid UUID NULL,
+        size_bytes INT8 NULL,
+        content_hash STRING NULL,
+        created_at_millis INT8 NULL,
+        modified_at_millis INT8 NULL,
+        PRIMARY KEY (filesystem_uuid, path)
+    );
+    CREATE INDEX IF NOT EXISTS entries_by_parent
+        ON entries (filesystem_uuid, parent_path, name);
+    CREATE TABLE IF NOT EXISTS file_blocks (
+        generation_uuid UUID NOT NULL,
+        ordinal INT4 NOT NULL,
+        blob_hash STRING NOT NULL,
+        size_bytes INT4 NOT NULL CHECK (size_bytes >= 0 AND size_bytes <= $BLOCK_SIZE_BYTES),
+        reference_count INT8 NOT NULL DEFAULT 0 CHECK (reference_count >= 0),
+        PRIMARY KEY (generation_uuid, ordinal)
+    );
+    CREATE INDEX IF NOT EXISTS file_blocks_by_blob_hash
+        ON file_blocks (blob_hash, reference_count);
+    CREATE TABLE IF NOT EXISTS write_sessions (
+        session_uuid UUID PRIMARY KEY,
+        filesystem_uuid UUID NOT NULL REFERENCES filesystems(uuid) ON DELETE CASCADE,
+        path STRING NOT NULL,
+        expected_hash STRING NULL,
+        bytes_received INT8 NOT NULL,
+        created_at_millis INT8 NOT NULL,
+        lease_expires_at_millis INT8 NOT NULL,
+        state STRING NOT NULL CHECK (state IN ('OPEN', 'COMMITTED', 'ABORTED', 'REAPED'))
+    );
+    CREATE INDEX IF NOT EXISTS write_sessions_by_lease
+        ON write_sessions (state, lease_expires_at_millis);
+    CREATE TABLE IF NOT EXISTS reader_sessions (
+        reader_uuid UUID PRIMARY KEY,
+        generation_uuid UUID NOT NULL,
+        lease_expires_at_millis INT8 NOT NULL,
+        state STRING NOT NULL CHECK (state IN ('OPEN', 'RELEASED', 'REAPED'))
+    );
+    CREATE INDEX IF NOT EXISTS reader_sessions_by_lease
+        ON reader_sessions (state, lease_expires_at_millis);
+    CREATE TABLE IF NOT EXISTS blob_gc_outbox (
+        blob_hash STRING PRIMARY KEY,
+        action STRING NOT NULL,
+        created_at_millis INT8 NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS simple_filesystem_maintenance_state (
+        singleton BOOL PRIMARY KEY DEFAULT true CHECK (singleton),
+        orphan_inventory_high_water STRING NULL
+    );
+    INSERT INTO simple_filesystem_maintenance_state (singleton, orphan_inventory_high_water)
+        VALUES (true, NULL) ON CONFLICT (singleton) DO NOTHING;
+    CREATE TABLE IF NOT EXISTS simple_filesystem_schema_version (
+        singleton BOOL PRIMARY KEY DEFAULT true CHECK (singleton),
+        schema_version INT4 NOT NULL CHECK (schema_version > 0)
+    );
+    INSERT INTO simple_filesystem_schema_version (singleton, schema_version)
+        VALUES (true, $CURRENT_SCHEMA_VERSION)
+""".trimIndent()
 
 private fun firstMalformedUnicodeIndex(text: String): Int? {
     var index = 0
