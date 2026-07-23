@@ -24,7 +24,12 @@ fun testGenerationDeletePageBoundaries() {
         val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
         try {
             val blobs = InMemoryBlobstoreService()
-            val manager = DurableSimpleFileSystemManager(blobs, database)
+            val generationDeleteBatchSize = 64
+            val manager = DurableSimpleFileSystemManager(
+                blobstoreService = blobs,
+                metadataDatabase = database,
+                generationDeleteBatchSize = generationDeleteBatchSize,
+            )
             try {
                 val sha256 = { bytes: ByteArray ->
                     MessageDigest.getInstance("SHA-256").digest(bytes)
@@ -32,9 +37,11 @@ fun testGenerationDeletePageBoundaries() {
                 }
                 val filesystemUuid = manager.createFilesystem("delete page boundaries", 100_000L).uuid
                 val filesystem = manager.openFilesystem(filesystemUuid)
-                val path = "/exact-page"
-                val blockCount = 16_384
-                filesystem.writeUtf8(path, "seed", null)
+                val blockCounts = linkedMapOf(
+                    "/exact-page" to generationDeleteBatchSize,
+                    "/page-plus-one" to generationDeleteBatchSize + 1,
+                )
+                blockCounts.keys.forEach { path -> filesystem.writeUtf8(path, "seed", null) }
 
                 val oneByte = byteArrayOf('x'.code.toByte())
                 val oneByteHash = sha256(oneByte)
@@ -46,50 +53,57 @@ fun testGenerationDeletePageBoundaries() {
                 )
                 assertTrue(blobs.pinBlob("simplefilesystem-durable-embedded", oneByteHash))
 
-                val oldGeneration = database.getRows(
-                    "SELECT generation_uuid FROM entries WHERE filesystem_uuid = ?::UUID AND path = ?",
-                    filesystemUuid,
-                    path,
-                ).single().results["generation_uuid"]
-                database.execute("DELETE FROM file_blocks WHERE generation_uuid = ?::UUID", oldGeneration)
-                database.execute(
-                    """INSERT INTO file_blocks
-                        (generation_uuid, ordinal, blob_hash, size_bytes, reference_count)
-                        SELECT ?::UUID, value::INT4, ?, 1, 1
-                        FROM generate_series(0, ?) AS generated(value)""".trimIndent(),
-                    oldGeneration,
-                    oneByteHash,
-                    blockCount - 1,
-                )
-                database.execute(
-                    """UPDATE entries SET size_bytes = ?, content_hash = ?
-                        WHERE filesystem_uuid = ?::UUID AND path = ?""".trimIndent(),
-                    blockCount.toLong(),
-                    sha256(ByteArray(blockCount) { 'x'.code.toByte() }),
-                    filesystemUuid,
-                    path,
-                )
+                val oldGenerations = blockCounts.map { (path, count) ->
+                    val generation = database.getRows(
+                        "SELECT generation_uuid FROM entries WHERE filesystem_uuid = ?::UUID AND path = ?",
+                        filesystemUuid,
+                        path,
+                    ).single().results["generation_uuid"]
+                    database.execute("DELETE FROM file_blocks WHERE generation_uuid = ?::UUID", generation)
+                    database.execute(
+                        """INSERT INTO file_blocks
+                            (generation_uuid, ordinal, blob_hash, size_bytes, reference_count)
+                            SELECT ?::UUID, value::INT4, ?, 1, 1
+                            FROM generate_series(0, ?) AS generated(value)""".trimIndent(),
+                        generation,
+                        oneByteHash,
+                        count - 1,
+                    )
+                    database.execute(
+                        """UPDATE entries SET size_bytes = ?, content_hash = ?
+                            WHERE filesystem_uuid = ?::UUID AND path = ?""".trimIndent(),
+                        count.toLong(),
+                        sha256(ByteArray(count) { 'x'.code.toByte() }),
+                        filesystemUuid,
+                        path,
+                    )
+                    generation
+                }
                 database.execute(
                     "UPDATE filesystems SET used_bytes = ? WHERE uuid = ?::UUID",
-                    blockCount.toLong(),
+                    blockCounts.values.sumOf(Int::toLong),
                     filesystemUuid,
                 )
 
-                filesystem.overwriteUtf8(path, "replacement")
-                assertEquals("replacement", filesystem.readUtf8(path))
-                assertEquals(
-                    0L,
-                    database.getRows(
-                        "SELECT count(*) AS block_count FROM file_blocks WHERE generation_uuid = ?::UUID",
-                        oldGeneration,
-                    ).single().results.getValue("block_count").toString().toLong(),
-                    "Replacing a generation must delete every old block at the exact batch boundary.",
-                )
+                blockCounts.keys.forEach { path ->
+                    filesystem.overwriteUtf8(path, "replacement")
+                    assertEquals("replacement", filesystem.readUtf8(path))
+                }
+                oldGenerations.forEach { generation ->
+                    assertEquals(
+                        0L,
+                        database.getRows(
+                            "SELECT count(*) AS block_count FROM file_blocks WHERE generation_uuid = ?::UUID",
+                            generation,
+                        ).single().results.getValue("block_count").toString().toLong(),
+                        "Replacing a generation must delete every old block at and across the configured batch boundary.",
+                    )
+                }
 
                 manager.processBlobGcOutbox()
                 assertFalse(
                     blobs.isPinned("simplefilesystem-durable-embedded", oneByteHash),
-                    "The old blob must be unpinned after the exact-page generation is gone.",
+                    "The shared old blob must be unpinned after every boundary-sized generation is gone.",
                 )
             } finally {
                 manager.close()

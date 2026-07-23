@@ -99,6 +99,8 @@ try {
 
 Namespace changes, append assembly, generation release, recursive move/delete, and expiration purge remain one Cockroach transaction and therefore one logical transition. Large block and subtree sets are traversed with fixed-size keyset pages inside that transaction; intermediate pages are not externally visible, and this service does not retain a collection proportional to file or subtree cardinality.
 
+Generation deletion uses pages of 16,384 blocks by default. Backends with a different transaction-size budget can set `generationDeleteBatchSize` when constructing `DurableSimpleFileSystemManager`; the value must be positive and does not change the atomic visibility of the transition.
+
 - `filesystems` stores UUID identity, free-text descriptions, quota accounting, expiration, and a durable per-filesystem namespace revision.
 - `simple_filesystem_manager_state` stores the durable manager-descriptor revision used by filesystem-listing pages.
 - `namespace_event_streams` stores each filesystem's latest revision, oldest safe watch cursor, and terminal state even after the filesystem descriptor has been removed.

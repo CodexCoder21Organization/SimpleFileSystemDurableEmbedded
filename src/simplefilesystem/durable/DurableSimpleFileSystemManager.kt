@@ -67,6 +67,7 @@ class DurableSimpleFileSystemManager(
     private val maintenanceBatchSize: Int = DEFAULT_MAINTENANCE_BATCH_SIZE,
     private val namespaceEventRetentionCount: Int = DEFAULT_NAMESPACE_EVENT_RETENTION_COUNT,
     private val namespaceEventRetentionMillis: Long = DEFAULT_NAMESPACE_EVENT_RETENTION_MILLIS,
+    private val generationDeleteBatchSize: Int = DEFAULT_GENERATION_DELETE_BATCH_SIZE,
 ) : SimpleFileSystemManager, AutoCloseable {
     @Volatile
     private var schemaReady: Boolean = false
@@ -89,6 +90,9 @@ class DurableSimpleFileSystemManager(
         }
         require(namespaceEventRetentionMillis > 0L) {
             "Namespace-event retention age must be positive, but was $namespaceEventRetentionMillis milliseconds."
+        }
+        require(generationDeleteBatchSize > 0) {
+            "Generation-delete batch size must be positive, but was $generationDeleteBatchSize."
         }
         ensureSchema()
         reconcileInterruptedWork(maintenanceBatchSize)
@@ -1582,12 +1586,12 @@ class DurableSimpleFileSystemManager(
                       AND ordinal IN (SELECT ordinal FROM block_page)
                       AND (SELECT count(*) FROM enqueued_hashes) >= 0""".trimIndent(),
                 generationUuid,
-                GENERATION_DELETE_BATCH_SIZE,
+                generationDeleteBatchSize,
                 clock.currentTimeMillis(),
                 generationUuid,
             )
             val deletedCount = affectedRowCount(deleted, "delete generation '$generationUuid' blocks")
-            if (deletedCount < GENERATION_DELETE_BATCH_SIZE) break
+            if (deletedCount < generationDeleteBatchSize) break
         }
     }
 
@@ -1955,7 +1959,7 @@ class DurableSimpleFileSystemManager(
         const val DEFAULT_MAINTENANCE_BATCH_SIZE = 1_000
         const val INTERNAL_KEYSET_BATCH_SIZE = 256
         const val GENERATION_READ_BATCH_SIZE = 4_096
-        const val GENERATION_DELETE_BATCH_SIZE = 16_384
+        const val DEFAULT_GENERATION_DELETE_BATCH_SIZE = 16_384
         const val NAMESPACE_EVENT_BATCH_SIZE = 2_048
         const val DEFAULT_NAMESPACE_EVENT_RETENTION_COUNT = 10_000
         const val DEFAULT_NAMESPACE_EVENT_RETENTION_MILLIS = 7L * 24L * 60L * 60L * 1000L
