@@ -26,6 +26,11 @@ Blobstore in-memory implementation:
 scripts/test.bash --test . --log test_log_file.xml
 ```
 
+The test-support library also starts that shared node lazily when tests are dispatched directly
+instead of through `scripts/test.bash`. A cross-process lock ensures the independently forked test
+JVMs converge on one memory-bounded CockroachDB process, while per-test leases keep the process
+alive until every isolated logical database has been dropped.
+
 ## Programmatic example
 
 ```kotlin

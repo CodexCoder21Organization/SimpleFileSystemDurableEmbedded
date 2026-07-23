@@ -36,6 +36,7 @@ fun buildSkinnyJar(): File = buildMaven()
 val testSupportDependencies = listOf(
     MavenPrebuilt2("blobstore.api:blobstore-api:0.0.2"),
     MavenPrebuilt2("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3"),
+    MavenPrebuilt2("community.kotlin.clocks.simple:community-kotlin-clocks-simple:0.0.7"),
     MavenPrebuilt2("cockroachdb.testharness:cockroachdb-test-harness:0.0.4"),
     MavenPrebuilt2("org.jetbrains.kotlin:kotlin-stdlib:1.9.22"),
 )
