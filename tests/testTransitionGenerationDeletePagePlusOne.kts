@@ -18,7 +18,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
-fun testGenerationDeletePageBoundaries() {
+fun testTransitionGenerationDeletePagePlusOne() {
     val cluster = SharedCockroachCluster().start()
     try {
         val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
@@ -30,10 +30,10 @@ fun testGenerationDeletePageBoundaries() {
                     MessageDigest.getInstance("SHA-256").digest(bytes)
                         .joinToString("") { "%02X".format(it.toInt() and 0xFF) }
                 }
-                val filesystemUuid = manager.createFilesystem("delete page boundaries", 100_000L).uuid
+                val filesystemUuid = manager.createFilesystem("delete page plus one", 100_000L).uuid
                 val filesystem = manager.openFilesystem(filesystemUuid)
-                val path = "/exact-page"
-                val blockCount = 16_384
+                val path = "/page-plus-one"
+                val blockCount = 16_385
                 filesystem.writeUtf8(path, "seed", null)
 
                 val oneByte = byteArrayOf('x'.code.toByte())
@@ -83,13 +83,13 @@ fun testGenerationDeletePageBoundaries() {
                         "SELECT count(*) AS block_count FROM file_blocks WHERE generation_uuid = ?::UUID",
                         oldGeneration,
                     ).single().results.getValue("block_count").toString().toLong(),
-                    "Replacing a generation must delete every old block at the exact batch boundary.",
+                    "Replacing a generation must delete blocks on both sides of the page boundary.",
                 )
 
                 manager.processBlobGcOutbox()
                 assertFalse(
                     blobs.isPinned("simplefilesystem-durable-embedded", oneByteHash),
-                    "The old blob must be unpinned after the exact-page generation is gone.",
+                    "The old blob must be unpinned after the page-plus-one generation is gone.",
                 )
             } finally {
                 manager.close()
