@@ -437,6 +437,7 @@ class DurableSimpleFileSystem internal constructor(
             }
             val sourcePrefix = "$normalizedSource/"
             val sourcePrefixUpperBound = prefixUpperBound(normalizedSource)
+            val sourceSuffixStart = normalizedSource.codePointCount(0, normalizedSource.length) + 1
             val movedPaths = transaction.getStrings(
                 """UPDATE entries
                     SET path = CASE
@@ -454,11 +455,11 @@ class DurableSimpleFileSystem internal constructor(
                 normalizedSource,
                 normalizedTarget,
                 normalizedTarget,
-                normalizedSource.length + 1,
+                sourceSuffixStart,
                 normalizedSource,
                 manager.parentPath(normalizedTarget),
                 normalizedTarget,
-                normalizedSource.length + 1,
+                sourceSuffixStart,
                 normalizedSource,
                 manager.name(normalizedTarget),
                 filesystemUuid,

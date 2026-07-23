@@ -55,15 +55,17 @@ class SharedCockroachCluster(
                 managedNodeLease = true
             }
         }
-        val databaseJdbcUrl = jdbcUrlForDatabase(sharedJdbcUrl, databaseName)
-
         try {
+            val databaseJdbcUrl = jdbcUrlForDatabase(sharedJdbcUrl, databaseName)
             Class.forName("org.postgresql.Driver")
             DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
                 connection.createStatement().use { statement ->
                     statement.execute("CREATE DATABASE ${quoteIdentifier(databaseName)}")
                 }
             }
+            adminJdbcUrl = sharedJdbcUrl
+            testJdbcUrl = databaseJdbcUrl
+            return this
         } catch (failure: Throwable) {
             if (managedNodeLease) {
                 try {
@@ -75,10 +77,6 @@ class SharedCockroachCluster(
             }
             throw failure
         }
-
-        adminJdbcUrl = sharedJdbcUrl
-        testJdbcUrl = databaseJdbcUrl
-        return this
     }
 
     fun jdbcUrl(): String = testJdbcUrl
@@ -141,8 +139,9 @@ private object SharedCockroachNode {
         // A recorded node was connectivity-checked before its state file became visible, and this
         // caller immediately opens a real JDBC connection to create its isolated database. Probing
         // it again here serializes every concurrent test JVM behind a duplicate network round trip
-        // while the cross-process state lock is held. PID/start-time identity is sufficient for the
-        // fast path; orphan discovery still performs a full JDBC probe before adopting a node.
+        // while the cross-process state lock is held. PID/start-time identity plus the node-owned
+        // listening-URL file is sufficient for the fast path; orphan discovery still performs a
+        // full JDBC probe before adopting a node.
         val existing = readState()?.takeIf(::isLiveProcess) ?: discoverUsableNode()
         val state = existing ?: startNode(clock)
         if (existing != null) writeState(existing)
@@ -251,14 +250,15 @@ private object SharedCockroachNode {
     }
 
     private fun stopNode(state: NodeState) {
+        val managedWorkDirectory = requireManagedWorkDirectory(state.workDirectory)
         val handle = ProcessHandle.of(state.pid).orElse(null)
         if (handle != null && processIdentityMatches(handle, state.processStartedAt)) {
-            stopProcess(handle, state.pid, File(state.workDirectory, "cockroach.out"))
+            stopProcess(handle, state.pid, File(managedWorkDirectory, "cockroach.out"))
         }
-        if (state.workDirectory.exists() && !state.workDirectory.deleteRecursively()) {
+        if (managedWorkDirectory.exists() && !managedWorkDirectory.deleteRecursively()) {
             throw IllegalStateException(
                 "Could not delete shared CockroachDB work directory " +
-                    state.workDirectory.absolutePath,
+                    managedWorkDirectory.absolutePath,
             )
         }
     }
@@ -314,15 +314,16 @@ private object SharedCockroachNode {
 
     private fun readDiscoveredNode(workDirectory: File): NodeState? {
         return try {
-            val pid = File(workDirectory, "cockroach.pid").readText().trim().toLong()
+            val managedWorkDirectory = requireManagedWorkDirectory(workDirectory)
+            val pid = File(managedWorkDirectory, "cockroach.pid").readText().trim().toLong()
             val handle = ProcessHandle.of(pid).orElse(null) ?: return null
             val processStartedAt = handle.info().startInstant().orElse(null) ?: return null
-            val listeningUrl = File(workDirectory, "listening-url").readText().trim()
+            val listeningUrl = File(managedWorkDirectory, "listening-url").readText().trim()
             NodeState(
                 pid = pid,
                 processStartedAt = processStartedAt,
                 jdbcUrl = listeningUrlToJdbcUrl(listeningUrl),
-                workDirectory = workDirectory,
+                workDirectory = managedWorkDirectory,
             )
         } catch (_: Exception) {
             // Incomplete node directories are expected after a process dies during startup. Only
@@ -368,13 +369,25 @@ private object SharedCockroachNode {
             val properties = Properties().apply {
                 stateFile.inputStream().use(::load)
             }
+            val jdbcUrl = requireNotNull(properties.getProperty("jdbcUrl"))
+            jdbcUrlForDatabase(jdbcUrl, "state_validation")
+            val workDirectory = requireManagedWorkDirectory(
+                File(requireNotNull(properties.getProperty("workDirectory"))),
+            )
+            val discoveredJdbcUrl = listeningUrlToJdbcUrl(
+                File(workDirectory, "listening-url").readText().trim(),
+            )
+            require(jdbcUrl == discoveredJdbcUrl) {
+                "Shared CockroachDB state JDBC URL '$jdbcUrl' does not match the node's " +
+                    "listening URL '$discoveredJdbcUrl'."
+            }
             NodeState(
                 pid = requireNotNull(properties.getProperty("pid")).toLong(),
                 processStartedAt = Instant.ofEpochMilli(
                     requireNotNull(properties.getProperty("processStartedAtMillis")).toLong(),
                 ),
-                jdbcUrl = requireNotNull(properties.getProperty("jdbcUrl")),
-                workDirectory = File(requireNotNull(properties.getProperty("workDirectory"))),
+                jdbcUrl = jdbcUrl,
+                workDirectory = workDirectory,
             )
         } catch (_: Exception) {
             // A partial/corrupt state file can be left by a killed test JVM. The node-discovery
@@ -406,6 +419,16 @@ private object SharedCockroachNode {
                 StandardCopyOption.REPLACE_EXISTING,
             )
         }
+    }
+
+    private fun requireManagedWorkDirectory(workDirectory: File): File {
+        val managedRoot = stateDirectory.canonicalFile
+        val canonical = workDirectory.canonicalFile
+        require(canonical.parentFile == managedRoot && canonical.name.startsWith("node-")) {
+            "Shared CockroachDB work directory must be a node-* child of ${managedRoot.absolutePath}, " +
+                "but was ${workDirectory.absolutePath}."
+        }
+        return canonical
     }
 
     private fun writeLease(leaseName: String) {

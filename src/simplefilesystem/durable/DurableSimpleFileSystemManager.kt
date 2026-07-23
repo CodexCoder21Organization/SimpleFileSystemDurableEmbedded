@@ -2107,6 +2107,7 @@ private val SCHEMA_INITIALIZATION_SQL = """
     );
     INSERT INTO simple_filesystem_schema_version (singleton, schema_version)
         VALUES (true, $CURRENT_SCHEMA_VERSION)
+        ON CONFLICT (singleton) DO NOTHING
 """.trimIndent()
 
 private fun firstMalformedUnicodeIndex(text: String): Int? {
