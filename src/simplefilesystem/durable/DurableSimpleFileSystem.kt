@@ -22,6 +22,7 @@ import simplefilesystem.PathNotFoundException
 import simplefilesystem.PathTypeMismatchException
 import simplefilesystem.QuotaArithmeticOverflowException
 import simplefilesystem.SimpleFileSystem
+import sql.Database
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.CharBuffer
@@ -35,69 +36,53 @@ class DurableSimpleFileSystem internal constructor(
     private val filesystemUuid: UUID,
 ) : SimpleFileSystem {
     override fun list(path: String, after: String?, limit: Int): FileEntryPage {
-        requireActive()
-        val normalized = manager.normalizePath(path)
-        val cursor = manager.validateListCursor(normalized, after, recursive = false)
-        val pageLimit = manager.validatePageLimit(limit)
         return manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
-            manager.requireDirectoryPath(transaction, filesystemUuid, normalized)
-            val rows = if (cursor == null) {
-                transaction.getRows(
-                    """SELECT * FROM entries WHERE filesystem_uuid = ? AND parent_path = ?
-                        ORDER BY path LIMIT ?""".trimIndent(),
-                    filesystemUuid,
-                    normalized,
-                    pageLimit + 1,
-                )
-            } else {
-                transaction.getRows(
-                    """SELECT * FROM entries WHERE filesystem_uuid = ? AND parent_path = ? AND path > ?
-                        ORDER BY path LIMIT ?""".trimIndent(),
-                    filesystemUuid,
-                    normalized,
-                    cursor,
-                    pageLimit + 1,
-                )
-            }
-            fileEntryPage(rows.map { it.toEntryRecord() }, pageLimit, filesystem.namespaceRevision)
+            val normalized = manager.normalizePath(path)
+            val cursor = manager.validateListCursor(normalized, after, recursive = false)
+            val pageLimit = manager.validatePageLimit(limit)
+            val cursorClause = if (cursor == null) "" else "AND path > ?"
+            val pageArguments = mutableListOf<Any>(filesystemUuid, normalized)
+            if (cursor != null) pageArguments += cursor
+            pageArguments += pageLimit + 1
+            val entries = validatedDirectoryListing(
+                transaction,
+                normalized,
+                """SELECT * FROM entries
+                    WHERE filesystem_uuid = ? AND parent_path = ? $cursorClause
+                    ORDER BY path LIMIT ?""".trimIndent(),
+                *pageArguments.toTypedArray(),
+            )
+            fileEntryPage(entries, pageLimit, filesystem.namespaceRevision)
         }
     }
 
     override fun listRecursively(path: String, after: String?, limit: Int): FileEntryPage {
-        requireActive()
-        val normalized = manager.normalizePath(path)
-        val cursor = manager.validateListCursor(normalized, after, recursive = true)
-        val pageLimit = manager.validatePageLimit(limit)
-        val prefix = if (normalized == "/") "/" else "$normalized/"
         return manager.transactionally { transaction ->
             val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
-            manager.requireDirectoryPath(transaction, filesystemUuid, normalized)
-            val rows = if (cursor == null) {
-                transaction.getRows(
-                    """SELECT * FROM entries
-                        WHERE filesystem_uuid = ? AND path != ? AND left(path, ?) = ?
-                        ORDER BY path LIMIT ?""".trimIndent(),
-                    filesystemUuid,
-                    normalized,
-                    prefix.length,
-                    prefix,
-                    pageLimit + 1,
-                )
-            } else {
-                transaction.getRows(
-                    """SELECT * FROM entries
-                        WHERE filesystem_uuid = ? AND path != ? AND left(path, ?) = ? AND path > ?
-                        ORDER BY path LIMIT ?""".trimIndent(),
-                    filesystemUuid,
-                    normalized,
-                    prefix.length,
-                    prefix,
-                    cursor,
-                    pageLimit + 1,
-                )
-            }
-            fileEntryPage(rows.map { it.toEntryRecord() }, pageLimit, filesystem.namespaceRevision)
+            val normalized = manager.normalizePath(path)
+            val cursor = manager.validateListCursor(normalized, after, recursive = true)
+            val pageLimit = manager.validatePageLimit(limit)
+            val prefix = if (normalized == "/") "/" else "$normalized/"
+            val prefixUpperBound = prefixUpperBound(normalized)
+            val cursorClause = if (cursor == null) "" else "AND path > ?"
+            val pageArguments = mutableListOf<Any>(
+                filesystemUuid,
+                normalized,
+                prefix,
+                prefixUpperBound,
+            )
+            if (cursor != null) pageArguments += cursor
+            pageArguments += pageLimit + 1
+            val entries = validatedDirectoryListing(
+                transaction,
+                normalized,
+                """SELECT * FROM entries
+                    WHERE filesystem_uuid = ? AND path != ? AND path >= ? AND path < ? $cursorClause
+                    ORDER BY path LIMIT ?""".trimIndent(),
+                *pageArguments.toTypedArray(),
+            )
+            fileEntryPage(entries, pageLimit, filesystem.namespaceRevision)
         }
     }
 
@@ -245,6 +230,7 @@ class DurableSimpleFileSystem internal constructor(
                 return@transactionally
             }
             val prefix = if (normalized == "/") "/" else "$normalized/"
+            val prefixUpperBound = prefixUpperBound(normalized)
             var cursor = ""
             var released = 0L
             var deletedAny = false
@@ -256,26 +242,26 @@ class DurableSimpleFileSystem internal constructor(
                             FROM (
                                 SELECT path FROM entries
                                 WHERE filesystem_uuid = ? AND path != '/' AND path > ?
-                                  AND (path = ? OR left(path, ?) = ?)
+                                  AND (path = ? OR (path >= ? AND path < ?))
                                 ORDER BY path LIMIT ? FOR UPDATE
                             ) AS bounded_paths
                         )
                         DELETE FROM entries
                         WHERE filesystem_uuid = ? AND path != '/' AND path > ?
                           AND path <= (SELECT last_path FROM page_boundary)
-                          AND (path = ? OR left(path, ?) = ?)
+                          AND (path = ? OR (path >= ? AND path < ?))
                         RETURNING *""".trimIndent(),
                     filesystemUuid,
                     cursor,
                     normalized,
-                    prefix.length,
                     prefix,
+                    prefixUpperBound,
                     TREE_KEYSET_BATCH_SIZE,
                     filesystemUuid,
                     cursor,
                     normalized,
-                    prefix.length,
                     prefix,
+                    prefixUpperBound,
                 ).map { it.toEntryRecord() }
                 if (entries.isEmpty()) break
                 entries.forEach { entry ->
@@ -450,6 +436,7 @@ class DurableSimpleFileSystem internal constructor(
                 )
             }
             val sourcePrefix = "$normalizedSource/"
+            val sourcePrefixUpperBound = prefixUpperBound(normalizedSource)
             val movedPaths = transaction.getStrings(
                 """UPDATE entries
                     SET path = CASE
@@ -462,7 +449,7 @@ class DurableSimpleFileSystem internal constructor(
                         END,
                         name = CASE WHEN path = ? THEN ? ELSE name END
                     WHERE filesystem_uuid = ?
-                      AND (path = ? OR left(path, ?) = ?)
+                      AND (path = ? OR (path >= ? AND path < ?))
                     RETURNING path""".trimIndent(),
                 normalizedSource,
                 normalizedTarget,
@@ -476,8 +463,8 @@ class DurableSimpleFileSystem internal constructor(
                 manager.name(normalizedTarget),
                 filesystemUuid,
                 normalizedSource,
-                sourcePrefix.length,
                 sourcePrefix,
+                sourcePrefixUpperBound,
             )
             val movedPathEvents = movedPaths.flatMap { newPath ->
                 val oldPath = normalizedSource + newPath.removePrefix(normalizedTarget)
@@ -651,6 +638,39 @@ class DurableSimpleFileSystem internal constructor(
         appendMustExist = mustExist,
     )
 
+    private fun validatedDirectoryListing(
+        transaction: Database,
+        normalizedPath: String,
+        pageQuery: String,
+        vararg pageArguments: Any,
+    ): List<EntryRecord> {
+        manager.validateIntermediateComponents(transaction, filesystemUuid, normalizedPath)
+        val rows = transaction.getRows(
+            """WITH requested_directory AS MATERIALIZED (
+                    SELECT entry_kind FROM entries
+                    WHERE filesystem_uuid = ? AND path = ?
+                ),
+                page AS MATERIALIZED (
+                    $pageQuery
+                )
+                SELECT requested_directory.entry_kind AS requested_directory_kind, page.*
+                FROM (SELECT true) AS anchor
+                LEFT JOIN requested_directory ON true
+                LEFT JOIN page ON true
+                ORDER BY page.path""".trimIndent(),
+            filesystemUuid,
+            normalizedPath,
+            *pageArguments,
+        )
+        val directoryKind = rows.first().nullableStringValue("requested_directory_kind")
+            ?: throw PathNotFoundException(normalizedPath)
+        if (directoryKind != "DIRECTORY") {
+            val actualType = if (directoryKind == "FILE") FileEntryType.REGULAR_FILE else FileEntryType.OTHER
+            throw PathTypeMismatchException(normalizedPath, FileEntryType.DIRECTORY, actualType)
+        }
+        return rows.filter { it.nullableStringValue("path") != null }.map { it.toEntryRecord() }
+    }
+
     private fun fileSnapshot(rawPath: String): FileGenerationSnapshot {
         requireActive()
         val normalized = manager.normalizePath(rawPath)
@@ -789,6 +809,9 @@ class DurableSimpleFileSystem internal constructor(
             throw InlinePayloadTooLargeException(path, actualBytes, INLINE_PAYLOAD_MAX_BYTES)
         }
     }
+
+    private fun prefixUpperBound(normalizedPath: String): String =
+        if (normalizedPath == "/") "0" else "${normalizedPath}0"
 
     private fun active() {
         manager.requireActiveFilesystem(filesystemUuid)
