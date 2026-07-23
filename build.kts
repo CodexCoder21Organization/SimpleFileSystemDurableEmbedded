@@ -3,8 +3,12 @@
 package simplefilesystem.durable
 
 import build.kotlin.annotations.MavenArtifactCoordinates
+import build.kotlin.jvm.BuildJar
+import build.kotlin.jvm.Manifest
 import build.kotlin.jvm.MavenPrebuilt2
 import build.kotlin.jvm.buildSimpleKotlinMavenArtifact2
+import build.kotlin.jvm.jar
+import build.kotlin.jvm.resolveDependencies2
 import build.kotlin.withartifact.WithArtifact
 import java.io.File
 
@@ -32,12 +36,19 @@ fun buildSkinnyJar(): File = buildMaven()
 val testSupportDependencies = listOf(
     MavenPrebuilt2("blobstore.api:blobstore-api:0.0.2"),
     MavenPrebuilt2("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3"),
+    MavenPrebuilt2("cockroachdb.testharness:cockroachdb-test-harness:0.0.4"),
     MavenPrebuilt2("org.jetbrains.kotlin:kotlin-stdlib:1.9.22"),
 )
 
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-support:")
 fun buildTestSupportMaven(): File = buildSimpleKotlinMavenArtifact2(
-    coordinates = "simplefilesystem.durable:simplefilesystem-durable-test-support:0.1.1",
+    coordinates = "simplefilesystem.durable:simplefilesystem-durable-test-support:0.1.2",
     src = File("test-support"),
     compileDependencies = testSupportDependencies,
+)
+
+fun buildCockroachTestFixtureFatJar(): File = BuildJar(
+    Manifest("simplefilesystem.durable.testing.CockroachSuiteFixtureMainKt"),
+    resolveDependencies2(testSupportDependencies).map { it.jar } +
+        buildTestSupportMaven().jar,
 )

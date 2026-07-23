@@ -1,6 +1,6 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
-@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-support:")
-@file:WithArtifact("cockroachdb.testharness:cockroachdb-test-harness:0.0.4")
+@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
 @file:WithArtifact("sql:sql-api:0.0.1")
 @file:WithArtifact("sql:sql:0.0.2")
 @file:WithArtifact("community.kotlin.clocks.simple:community-kotlin-clocks-simple:0.0.3")
@@ -11,9 +11,8 @@
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
-import cockroachdb.testharness.LocalCockroachCluster
+import simplefilesystem.durable.testing.SharedCockroachCluster
 import community.kotlin.clocks.simple.ManualClock
-import community.kotlin.clocks.simple.SystemClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -27,7 +26,7 @@ import simplefilesystem.durable.testing.ControlledBlobstoreService
 import sql.Database
 
 fun testCockroachRetryAndGlobalLockOrder() {
-    val cluster = LocalCockroachCluster(clock = SystemClock()).start()
+    val cluster = SharedCockroachCluster().start()
     try {
         val primaryDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
         val writerDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)

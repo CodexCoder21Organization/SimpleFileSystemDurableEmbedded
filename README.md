@@ -18,7 +18,9 @@ The artifact coordinate is:
 MavenPrebuilt("simplefilesystem.durable:simplefilesystem-durable-embedded:0.1.1")
 ```
 
-Run the complete end-to-end suite, which starts isolated single-node CockroachDB instances and uses the real Blobstore in-memory implementation:
+Run the complete end-to-end suite, which starts one real in-memory single-node CockroachDB
+fixture and gives every test an isolated logical database on that node. Tests also use the real
+Blobstore in-memory implementation:
 
 ```bash
 scripts/test.bash --test . --log test_log_file.xml
