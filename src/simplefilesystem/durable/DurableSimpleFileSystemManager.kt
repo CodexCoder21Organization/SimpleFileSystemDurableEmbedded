@@ -129,8 +129,10 @@ class DurableSimpleFileSystemManager(
                         RETURNING filesystem_uuid
                     )
                     INSERT INTO namespace_event_streams
-                        (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason)
-                    SELECT filesystem_uuid, 0, 0, NULL FROM inserted_root""".trimIndent(),
+                        (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason,
+                         latest_event_ordinal, retained_event_count,
+                         oldest_retained_revision_last_event_ordinal, oldest_event_at_millis)
+                    SELECT filesystem_uuid, 0, 0, NULL, 0, 0, 0, NULL FROM inserted_root""".trimIndent(),
                 uuid,
                 description,
                 maxSizeBytes,
@@ -208,8 +210,12 @@ class DurableSimpleFileSystemManager(
                 filesystem = filesystem.copy(namespaceRevision = revision)
             }
 
-            pruneNamespaceEvents(transaction, parsed)
             stream = requireNamespaceEventStream(transaction, parsed, lock = true)
+            val ageCutoff = namespaceEventAgeCutoff(clock.currentTimeMillis())
+            if (shouldPruneNamespaceEvents(stream, ageCutoff)) {
+                pruneNamespaceEvents(transaction, parsed, ageCutoff)
+                stream = requireNamespaceEventStream(transaction, parsed, lock = true)
+            }
             val retainedTerminal = transaction.getRows(
                 """SELECT * FROM namespace_events WHERE filesystem_uuid = ? AND terminal = true
                     ORDER BY revision DESC LIMIT 1""".trimIndent(),
@@ -475,6 +481,7 @@ class DurableSimpleFileSystemManager(
                 when (val storedVersion = storedSchemaVersion()) {
                     null -> metadataDatabase.execute(SCHEMA_INITIALIZATION_SQL)
                     CURRENT_SCHEMA_VERSION -> Unit
+                    1 -> migrateSchemaVersionOne()
                     else -> throw IllegalStateException(
                         "Cannot open durable filesystem metadata schema version $storedVersion; " +
                             "this implementation supports version $CURRENT_SCHEMA_VERSION.",
@@ -500,6 +507,41 @@ class DurableSimpleFileSystemManager(
         ).firstOrNull()?.intValue("schema_version")
     }
 
+    private fun migrateSchemaVersionOne() {
+        executeConcurrentSchemaChange(SCHEMA_MIGRATION_1_TO_2_DDL_SQL)
+        executeConcurrentSchemaChange(SCHEMA_MIGRATION_1_TO_2_CONSTRAINT_SQL)
+        transactionally { transaction ->
+            val lockedVersion = transaction.getRows(
+                """SELECT schema_version FROM simple_filesystem_schema_version
+                    WHERE singleton = true FOR UPDATE""".trimIndent(),
+            ).single().intValue("schema_version")
+            when (lockedVersion) {
+                CURRENT_SCHEMA_VERSION -> Unit
+                1 -> transaction.execute(SCHEMA_MIGRATION_1_TO_2_DATA_SQL)
+                else -> throw IllegalStateException(
+                    "Cannot open durable filesystem metadata schema version $lockedVersion; " +
+                        "this implementation supports version $CURRENT_SCHEMA_VERSION.",
+                )
+            }
+        }
+    }
+
+    private fun executeConcurrentSchemaChange(sql: String) {
+        var retryCount = 0
+        while (true) {
+            try {
+                transactionally { transaction -> transaction.execute(sql) }
+                return
+            } catch (failure: SQLException) {
+                if (!failure.isConcurrentSchemaPublication() || retryCount >= MAX_TRANSACTION_RETRIES) {
+                    throw failure
+                }
+                retryCount += 1
+                Thread.yield()
+            }
+        }
+    }
+
     internal fun <T> transactionally(operation: (Database) -> T): T {
         var retryCount = 0
         while (true) {
@@ -519,6 +561,17 @@ class DurableSimpleFileSystemManager(
         var current: Throwable? = this
         while (current != null) {
             if (current is SQLException && current.sqlState == expected) return true
+            current = current.cause
+        }
+        return false
+    }
+
+    private fun SQLException.isConcurrentSchemaPublication(): Boolean {
+        var current: Throwable? = this
+        while (current != null) {
+            if (current.message?.contains("in the middle of being added, not yet public") == true) {
+                return true
+            }
             current = current.cause
         }
         return false
@@ -1720,14 +1773,71 @@ class DurableSimpleFileSystemManager(
             filesystem.uuid,
         )
         val now = clock.currentTimeMillis()
-        if (terminalReason == null) {
+        val paths = if (terminalReason == null) {
             require(affectedPaths.isNotEmpty()) {
                 "A non-terminal namespace mutation for filesystem '${filesystem.uuid}' must identify at least one affected path."
             }
-            affectedPaths.toSortedSet().chunked(NAMESPACE_EVENT_BATCH_SIZE).forEach { paths ->
-                val values = paths.joinToString(", ") { "(?)" }
+            affectedPaths.toSortedSet().toList()
+        } else {
+            listOf("/")
+        }
+        val eventCount = paths.size.toLong()
+        val retentionRows = database.getRows(
+            """WITH updated_stream AS (
+                    UPDATE namespace_event_streams
+                    SET latest_revision = ?,
+                        terminal_reason = ?,
+                        latest_event_ordinal = latest_event_ordinal + ?,
+                        retained_event_count = retained_event_count + ?,
+                        oldest_retained_revision_last_event_ordinal =
+                            CASE WHEN retained_event_count = 0
+                                 THEN latest_event_ordinal + ?
+                                 ELSE oldest_retained_revision_last_event_ordinal END,
+                        oldest_event_at_millis =
+                            CASE WHEN retained_event_count = 0 THEN ?
+                                 ELSE LEAST(oldest_event_at_millis, ?) END
+                    WHERE filesystem_uuid = ?
+                      AND latest_event_ordinal <= ? - ?
+                    RETURNING latest_event_ordinal, retained_event_count,
+                              oldest_retained_revision_last_event_ordinal, oldest_event_at_millis
+                ),
+                inserted_revision AS (
+                    INSERT INTO namespace_event_revisions
+                        (filesystem_uuid, revision, event_count, event_at_millis, last_event_ordinal)
+                    SELECT ?, ?, ?, ?, latest_event_ordinal FROM updated_stream
+                    RETURNING revision
+                )
+                SELECT latest_event_ordinal, retained_event_count,
+                       oldest_retained_revision_last_event_ordinal, oldest_event_at_millis
+                FROM updated_stream
+                WHERE EXISTS (SELECT 1 FROM inserted_revision)""".trimIndent(),
+            next,
+            terminalReason?.name,
+            eventCount,
+            eventCount,
+            eventCount,
+            now,
+            now,
+            filesystem.uuid,
+            Long.MAX_VALUE,
+            eventCount,
+            filesystem.uuid,
+            next,
+            eventCount,
+            now,
+        )
+        if (retentionRows.isEmpty()) {
+            throw SimpleFileSystemException(
+                "Namespace event ordinal overflowed for filesystem '${filesystem.uuid}': " +
+                    "cannot append $eventCount event(s) beyond the signed 64-bit ordinal range.",
+            )
+        }
+        val retention = retentionRows.single()
+        if (terminalReason == null) {
+            paths.chunked(NAMESPACE_EVENT_BATCH_SIZE).forEach { pathBatch ->
+                val values = pathBatch.joinToString(", ") { "(?)" }
                 val arguments = mutableListOf<Any>(filesystem.uuid, next, now)
-                arguments.addAll(paths)
+                arguments.addAll(pathBatch)
                 arguments.add(filesystem.uuid)
                 database.execute(
                     """INSERT INTO namespace_events
@@ -1765,14 +1875,23 @@ class DurableSimpleFileSystemManager(
                 now,
             )
         }
-        database.execute(
-            """UPDATE namespace_event_streams SET latest_revision = ?, terminal_reason = ?
-                WHERE filesystem_uuid = ?""".trimIndent(),
-            next,
-            terminalReason?.name,
-            filesystem.uuid,
-        )
-        pruneNamespaceEvents(database, filesystem.uuid)
+        val latestEventOrdinal = retention.longValue("latest_event_ordinal")
+        val retainedEventCount = retention.longValue("retained_event_count")
+        val oldestRevisionLastEventOrdinal =
+            retention.longValue("oldest_retained_revision_last_event_ordinal")
+        val oldestEventAtMillis = retention.nullableLongValue("oldest_event_at_millis")
+        val ageCutoff = namespaceEventAgeCutoff(now)
+        if (
+            shouldPruneNamespaceEvents(
+                latestEventOrdinal,
+                retainedEventCount,
+                oldestRevisionLastEventOrdinal,
+                oldestEventAtMillis,
+                ageCutoff,
+            )
+        ) {
+            pruneNamespaceEvents(database, filesystem.uuid, ageCutoff)
+        }
         return next
     }
 
@@ -1810,26 +1929,69 @@ class DurableSimpleFileSystemManager(
             ?: throw FilesystemNotFoundException(filesystemUuid.toString())
     }
 
-    private fun pruneNamespaceEvents(database: Database, filesystemUuid: UUID) {
-        val now = clock.currentTimeMillis()
-        val ageCutoff = try {
-            Math.subtractExact(now, namespaceEventRetentionMillis)
-        } catch (_: ArithmeticException) {
-            Long.MIN_VALUE
-        }
-        val retention = database.getRows(
-            """WITH count_cutoff AS MATERIALIZED (
-                    SELECT revision FROM namespace_events
-                    WHERE filesystem_uuid = ? AND event_at_millis >= ?
-                    ORDER BY revision DESC, canonical_path DESC LIMIT 1 OFFSET ?
+    private fun namespaceEventAgeCutoff(now: Long): Long = try {
+        Math.subtractExact(now, namespaceEventRetentionMillis)
+    } catch (_: ArithmeticException) {
+        Long.MIN_VALUE
+    }
+
+    private fun shouldPruneNamespaceEvents(stream: NamespaceEventStreamRecord, ageCutoff: Long): Boolean =
+        shouldPruneNamespaceEvents(
+            stream.latestEventOrdinal,
+            stream.retainedEventCount,
+            stream.oldestRetainedRevisionLastEventOrdinal,
+            stream.oldestEventAtMillis,
+            ageCutoff,
+        )
+
+    private fun shouldPruneNamespaceEvents(
+        latestEventOrdinal: Long,
+        retainedEventCount: Long,
+        oldestRetainedRevisionLastEventOrdinal: Long,
+        oldestEventAtMillis: Long?,
+        ageCutoff: Long,
+    ): Boolean {
+        val countPruneNeeded = retainedEventCount > namespaceEventRetentionCount &&
+            latestEventOrdinal - oldestRetainedRevisionLastEventOrdinal >= namespaceEventRetentionCount
+        return countPruneNeeded || (oldestEventAtMillis != null && oldestEventAtMillis < ageCutoff)
+    }
+
+    private fun pruneNamespaceEvents(database: Database, filesystemUuid: UUID, ageCutoff: Long) {
+        database.getRows(
+            """WITH locked_stream AS MATERIALIZED (
+                    SELECT latest_revision, oldest_available_since_revision, latest_event_ordinal
+                    FROM namespace_event_streams
+                    WHERE filesystem_uuid = ?
+                    FOR UPDATE
                 ),
-                minimum_retained AS MATERIALIZED (
-                    SELECT min(revision) AS minimum_revision FROM namespace_events
+                ranked_revisions AS MATERIALIZED (
+                    SELECT revision, event_count, event_at_millis, last_event_ordinal,
+                           SUM(event_count) OVER (ORDER BY revision DESC) AS newest_event_count
+                    FROM namespace_event_revisions
                     WHERE filesystem_uuid = ? AND event_at_millis >= ?
-                      AND (
-                          NOT EXISTS (SELECT 1 FROM count_cutoff)
-                          OR revision >= (SELECT revision FROM count_cutoff)
-                      )
+                ),
+                count_cutoff AS MATERIALIZED (
+                    SELECT revision FROM ranked_revisions
+                    WHERE newest_event_count >= ?
+                    ORDER BY revision DESC
+                    LIMIT 1
+                ),
+                retained_revisions AS MATERIALIZED (
+                    SELECT revision, event_count, event_at_millis, last_event_ordinal
+                    FROM ranked_revisions
+                    WHERE NOT EXISTS (SELECT 1 FROM count_cutoff)
+                       OR revision >= (SELECT revision FROM count_cutoff)
+                ),
+                oldest_retained AS MATERIALIZED (
+                    SELECT revision, last_event_ordinal
+                    FROM retained_revisions
+                    ORDER BY revision
+                    LIMIT 1
+                ),
+                retained_totals AS MATERIALIZED (
+                    SELECT COALESCE(SUM(event_count), 0) AS event_count,
+                           MIN(event_at_millis) AS oldest_event_at_millis
+                    FROM retained_revisions
                 ),
                 deleted_events AS (
                     DELETE FROM namespace_events
@@ -1842,35 +2004,53 @@ class DurableSimpleFileSystemManager(
                           )
                       )
                     RETURNING revision
+                ),
+                deleted_revisions AS (
+                    DELETE FROM namespace_event_revisions
+                    WHERE filesystem_uuid = ?
+                      AND (
+                          event_at_millis < ?
+                          OR (
+                              EXISTS (SELECT 1 FROM count_cutoff)
+                              AND revision < (SELECT revision FROM count_cutoff)
+                          )
+                      )
+                    RETURNING event_count
+                ),
+                updated_stream AS (
+                    UPDATE namespace_event_streams AS stream
+                    SET oldest_available_since_revision = GREATEST(
+                            stream.oldest_available_since_revision,
+                            COALESCE(
+                                (SELECT revision - 1 FROM oldest_retained),
+                                locked_stream.latest_revision
+                            )
+                        ),
+                        retained_event_count = retained_totals.event_count,
+                        oldest_retained_revision_last_event_ordinal = COALESCE(
+                            (SELECT last_event_ordinal FROM oldest_retained),
+                            locked_stream.latest_event_ordinal
+                        ),
+                        oldest_event_at_millis = retained_totals.oldest_event_at_millis
+                    FROM locked_stream, retained_totals
+                    WHERE stream.filesystem_uuid = ?
+                    RETURNING stream.latest_revision
                 )
-                SELECT stream.latest_revision,
-                       stream.oldest_available_since_revision,
-                       (SELECT minimum_revision FROM minimum_retained) AS minimum_revision,
-                       (SELECT count(*) FROM deleted_events) AS deleted_count
-                FROM namespace_event_streams AS stream
-                WHERE stream.filesystem_uuid = ?
-                FOR UPDATE""".trimIndent(),
+                SELECT updated_stream.latest_revision,
+                       (SELECT COUNT(*) FROM deleted_events) AS deleted_event_count,
+                       (SELECT COALESCE(SUM(event_count), 0) FROM deleted_revisions)
+                           AS deleted_revision_event_count
+                FROM updated_stream""".trimIndent(),
+            filesystemUuid,
             filesystemUuid,
             ageCutoff,
-            namespaceEventRetentionCount - 1,
+            namespaceEventRetentionCount,
             filesystemUuid,
             ageCutoff,
             filesystemUuid,
             ageCutoff,
             filesystemUuid,
         ).single()
-        val minimumRetainedRevision = retention.nullableLongValue("minimum_revision")
-        val latestRevision = retention.longValue("latest_revision")
-        val oldestAvailableSinceRevision = retention.longValue("oldest_available_since_revision")
-        val safeSinceRevision = minimumRetainedRevision?.let { it - 1L } ?: latestRevision
-        if (safeSinceRevision > oldestAvailableSinceRevision) {
-            database.execute(
-                """UPDATE namespace_event_streams SET oldest_available_since_revision = ?
-                    WHERE filesystem_uuid = ?""".trimIndent(),
-                safeSinceRevision,
-                filesystemUuid,
-            )
-        }
     }
 
     private fun managerRevision(database: Database, lock: Boolean = false): Long {
@@ -1977,7 +2157,7 @@ private data class ReconciliationSnapshot(
     val blobGcCandidates: List<String>,
 )
 
-private const val CURRENT_SCHEMA_VERSION = 1
+private const val CURRENT_SCHEMA_VERSION = 2
 
 private val schemaVersionCache = WeakHashMap<Database, Int>()
 
@@ -2020,11 +2200,21 @@ private val SCHEMA_INITIALIZATION_SQL = """
             CHECK (oldest_available_since_revision >= 0),
         terminal_reason STRING NULL CHECK (terminal_reason IS NULL OR terminal_reason IN
             ('FILESYSTEM_EXPIRED', 'FILESYSTEM_DELETED', 'FILESYSTEM_PURGED')),
+        latest_event_ordinal INT8 NOT NULL CHECK (latest_event_ordinal >= 0),
+        retained_event_count INT8 NOT NULL CHECK (retained_event_count >= 0),
+        oldest_retained_revision_last_event_ordinal INT8 NOT NULL
+            CHECK (oldest_retained_revision_last_event_ordinal >= 0),
+        oldest_event_at_millis INT8 NULL,
+        CHECK (oldest_retained_revision_last_event_ordinal <= latest_event_ordinal),
+        CHECK (retained_event_count <= latest_event_ordinal),
+        CHECK ((retained_event_count = 0) = (oldest_event_at_millis IS NULL)),
         CHECK (oldest_available_since_revision <= latest_revision)
     );
     INSERT INTO namespace_event_streams
-        (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason)
-        SELECT uuid, namespace_revision, namespace_revision, NULL FROM filesystems
+        (filesystem_uuid, latest_revision, oldest_available_since_revision, terminal_reason,
+         latest_event_ordinal, retained_event_count,
+         oldest_retained_revision_last_event_ordinal, oldest_event_at_millis)
+        SELECT uuid, namespace_revision, namespace_revision, NULL, 0, 0, 0, NULL FROM filesystems
         ON CONFLICT (filesystem_uuid) DO NOTHING;
     CREATE TABLE IF NOT EXISTS namespace_events (
         filesystem_uuid UUID NOT NULL,
@@ -2052,6 +2242,18 @@ private val SCHEMA_INITIALIZATION_SQL = """
                 is_directory = (entry_type = 'DIRECTORY') AND
                 is_regular_file = (entry_type = 'REGULAR_FILE') AND
                 (is_regular_file OR (size_bytes IS NULL AND content_hash IS NULL))))
+    );
+    CREATE TABLE IF NOT EXISTS namespace_event_revisions (
+        filesystem_uuid UUID NOT NULL,
+        revision INT8 NOT NULL CHECK (revision > 0),
+        event_count INT8 NOT NULL CHECK (event_count > 0),
+        event_at_millis INT8 NOT NULL,
+        last_event_ordinal INT8 NOT NULL CHECK (last_event_ordinal > 0),
+        PRIMARY KEY (filesystem_uuid, revision),
+        UNIQUE INDEX namespace_event_revisions_by_ordinal
+            (filesystem_uuid, last_event_ordinal),
+        INDEX namespace_event_revisions_by_age
+            (filesystem_uuid, event_at_millis, revision)
     );
     CREATE TABLE IF NOT EXISTS entries (
         filesystem_uuid UUID NOT NULL REFERENCES filesystems(uuid) ON DELETE CASCADE,
@@ -2112,6 +2314,84 @@ private val SCHEMA_INITIALIZATION_SQL = """
     INSERT INTO simple_filesystem_schema_version (singleton, schema_version)
         VALUES (true, $CURRENT_SCHEMA_VERSION)
         ON CONFLICT (singleton) DO NOTHING
+""".trimIndent()
+
+private val SCHEMA_MIGRATION_1_TO_2_DDL_SQL = """
+    ALTER TABLE namespace_event_streams
+        ADD COLUMN IF NOT EXISTS latest_event_ordinal INT8 NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS retained_event_count INT8 NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS oldest_retained_revision_last_event_ordinal
+            INT8 NOT NULL DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS oldest_event_at_millis INT8 NULL;
+    CREATE TABLE IF NOT EXISTS namespace_event_revisions (
+        filesystem_uuid UUID NOT NULL,
+        revision INT8 NOT NULL CHECK (revision > 0),
+        event_count INT8 NOT NULL CHECK (event_count > 0),
+        event_at_millis INT8 NOT NULL,
+        last_event_ordinal INT8 NOT NULL CHECK (last_event_ordinal > 0),
+        PRIMARY KEY (filesystem_uuid, revision),
+        UNIQUE INDEX namespace_event_revisions_by_ordinal
+            (filesystem_uuid, last_event_ordinal),
+        INDEX namespace_event_revisions_by_age
+            (filesystem_uuid, event_at_millis, revision)
+    )
+""".trimIndent()
+
+private val SCHEMA_MIGRATION_1_TO_2_CONSTRAINT_SQL = """
+    ALTER TABLE namespace_event_streams
+        ADD CONSTRAINT IF NOT EXISTS namespace_event_streams_latest_event_ordinal_nonnegative
+            CHECK (latest_event_ordinal >= 0),
+        ADD CONSTRAINT IF NOT EXISTS namespace_event_streams_retained_event_count_nonnegative
+            CHECK (retained_event_count >= 0),
+        ADD CONSTRAINT IF NOT EXISTS namespace_event_streams_oldest_event_ordinal_nonnegative
+            CHECK (oldest_retained_revision_last_event_ordinal >= 0),
+        ADD CONSTRAINT IF NOT EXISTS namespace_event_streams_event_ordinal_order
+            CHECK (oldest_retained_revision_last_event_ordinal <= latest_event_ordinal),
+        ADD CONSTRAINT IF NOT EXISTS namespace_event_streams_retained_event_count_bounded
+            CHECK (retained_event_count <= latest_event_ordinal),
+        ADD CONSTRAINT IF NOT EXISTS namespace_event_streams_oldest_event_time_presence
+            CHECK ((retained_event_count = 0) = (oldest_event_at_millis IS NULL))
+""".trimIndent()
+
+private val SCHEMA_MIGRATION_1_TO_2_DATA_SQL = """
+    WITH revision_counts AS (
+        SELECT filesystem_uuid, revision, COUNT(*) AS event_count,
+               MIN(event_at_millis) AS event_at_millis
+        FROM namespace_events
+        GROUP BY filesystem_uuid, revision
+    ),
+    numbered_revisions AS (
+        SELECT filesystem_uuid, revision, event_count, event_at_millis,
+               SUM(event_count) OVER (
+                   PARTITION BY filesystem_uuid ORDER BY revision
+               ) AS last_event_ordinal
+        FROM revision_counts
+    )
+    INSERT INTO namespace_event_revisions
+        (filesystem_uuid, revision, event_count, event_at_millis, last_event_ordinal)
+    SELECT filesystem_uuid, revision, event_count, event_at_millis, last_event_ordinal
+    FROM numbered_revisions
+    ON CONFLICT (filesystem_uuid, revision) DO NOTHING;
+    WITH event_summaries AS (
+        SELECT filesystem_uuid,
+               MAX(last_event_ordinal) AS latest_event_ordinal,
+               SUM(event_count) AS retained_event_count,
+               MIN(last_event_ordinal) AS oldest_retained_revision_last_event_ordinal,
+               MIN(event_at_millis) AS oldest_event_at_millis
+        FROM namespace_event_revisions
+        GROUP BY filesystem_uuid
+    )
+    UPDATE namespace_event_streams AS stream
+    SET latest_event_ordinal = summary.latest_event_ordinal,
+        retained_event_count = summary.retained_event_count,
+        oldest_retained_revision_last_event_ordinal =
+            summary.oldest_retained_revision_last_event_ordinal,
+        oldest_event_at_millis = summary.oldest_event_at_millis
+    FROM event_summaries AS summary
+    WHERE stream.filesystem_uuid = summary.filesystem_uuid;
+    UPDATE simple_filesystem_schema_version
+        SET schema_version = 2
+        WHERE singleton = true AND schema_version = 1
 """.trimIndent()
 
 private fun firstMalformedUnicodeIndex(text: String): Int? {

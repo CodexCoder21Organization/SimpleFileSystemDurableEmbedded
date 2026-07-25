@@ -76,6 +76,10 @@ internal data class NamespaceEventStreamRecord(
     val latestRevision: Long,
     val oldestAvailableSinceRevision: Long,
     val terminalReason: PathWatchTerminalReason?,
+    val latestEventOrdinal: Long,
+    val retainedEventCount: Long,
+    val oldestRetainedRevisionLastEventOrdinal: Long,
+    val oldestEventAtMillis: Long?,
 )
 
 internal data class NamespaceEventRecord(
@@ -221,6 +225,10 @@ internal fun DatabaseRow.toNamespaceEventStreamRecord(): NamespaceEventStreamRec
     latestRevision = longValue("latest_revision"),
     oldestAvailableSinceRevision = longValue("oldest_available_since_revision"),
     terminalReason = nullableStringValue("terminal_reason")?.let(PathWatchTerminalReason::valueOf),
+    latestEventOrdinal = longValue("latest_event_ordinal"),
+    retainedEventCount = longValue("retained_event_count"),
+    oldestRetainedRevisionLastEventOrdinal = longValue("oldest_retained_revision_last_event_ordinal"),
+    oldestEventAtMillis = nullableLongValue("oldest_event_at_millis"),
 )
 
 internal fun DatabaseRow.toNamespaceEventRecord(): NamespaceEventRecord = NamespaceEventRecord(
