@@ -53,14 +53,16 @@ val fixtureRuntimeDependencies = dependencies + testSupportDependencies + listOf
     MavenPrebuilt2("sql:sql:0.0.2"),
 )
 
+val fixtureRuntimeSources = listOf(File("test-support"), File("test-fixture-runtime"))
+    .flatMap { sourceDirectory ->
+        sourceDirectory.walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .toList()
+    }
+    .sortedBy(File::getPath)
+
 fun buildCockroachTestFixtureRuntime(): File = BuildKotlin(
-    src = listOf(File("test-support"), File("test-fixture-runtime"))
-        .flatMap { sourceDirectory ->
-            sourceDirectory.walkTopDown()
-                .filter { it.isFile && it.extension == "kt" }
-                .toList()
-        }
-        .sortedBy(File::getPath),
+    src = fixtureRuntimeSources,
     classpath = resolveDependencies2(fixtureRuntimeDependencies) +
         buildMaven(),
     buildAsJar = true,

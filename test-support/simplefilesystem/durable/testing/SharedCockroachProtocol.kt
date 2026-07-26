@@ -1,0 +1,218 @@
+package simplefilesystem.durable.testing
+
+import java.io.File
+import java.nio.charset.StandardCharsets
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.Properties
+
+internal const val SHARED_COCKROACH_PROTOCOL_VERSION = "2"
+internal const val SHARED_COCKROACH_STARTUP_TIMEOUT_MILLIS = 120_000L
+internal const val SHARED_COCKROACH_HEARTBEAT_STALE_MILLIS = 120_000L
+internal const val SHARED_COCKROACH_PROCESS_STOP_SECONDS = 5L
+
+internal fun sharedCockroachStateDirectory(): File {
+    val workspace = File(System.getProperty("user.dir")).canonicalFile
+    val digest = MessageDigest.getInstance("SHA-256")
+        .digest(workspace.absolutePath.toByteArray(StandardCharsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        .take(16)
+    return File(
+        System.getProperty("java.io.tmpdir"),
+        "simplefilesystem-durable-shared-cockroach-v2-$digest",
+    )
+}
+
+internal data class SharedProcessIdentity(
+    val pid: Long,
+    val startedAt: Instant,
+) {
+    fun liveHandle(): ProcessHandle? {
+        val handle = ProcessHandle.of(pid).orElse(null) ?: return null
+        if (!handle.isAlive || handle.info().startInstant().orElse(null) != startedAt) return null
+        val procStat = File("/proc/$pid/stat")
+        if (procStat.isFile) {
+            val stat = try {
+                procStat.readText()
+            } catch (failure: Exception) {
+                if (!handle.isAlive) return null
+                throw IllegalStateException(
+                    "Could not verify Linux process state for PID $pid started at $startedAt " +
+                        "from ${procStat.absolutePath}: ${failure.message}",
+                    failure,
+                )
+            }
+            val commandEnd = stat.lastIndexOf(") ")
+            check(commandEnd >= 0 && commandEnd + 2 < stat.length) {
+                "Linux process state ${procStat.absolutePath} had an unrecognised value '$stat'."
+            }
+            if (stat[commandEnd + 2] == 'Z') return null
+        }
+        return handle
+    }
+}
+
+internal data class SharedCockroachOwnerClaim(
+    val token: String,
+    val electionOwner: SharedProcessIdentity,
+    val createdAtMillis: Long,
+    val attachDeadlineMillis: Long,
+    val workDirectory: File,
+    val daemon: SharedProcessIdentity?,
+)
+
+internal data class SharedCockroachNodeRecord(
+    val token: String,
+    val cockroach: SharedProcessIdentity,
+    val processGroupId: Long,
+    val daemon: SharedProcessIdentity,
+    val jdbcUrl: String,
+    val workDirectory: File,
+)
+
+internal data class SharedCockroachHeartbeat(
+    val token: String,
+    val daemon: SharedProcessIdentity,
+    val writtenAtMillis: Long,
+)
+
+internal data class SharedCockroachStartupFailure(
+    val token: String,
+    val daemon: SharedProcessIdentity,
+    val message: String,
+)
+
+internal fun processIdentity(handle: ProcessHandle, description: String): SharedProcessIdentity {
+    val startedAt = requireNotNull(handle.info().startInstant().orElse(null)) {
+        "The $description ${handle.pid()} did not expose its process start time."
+    }
+    return SharedProcessIdentity(handle.pid(), startedAt)
+}
+
+internal fun requireManagedWorkDirectory(stateDirectory: File, workDirectory: File): File {
+    val managedRoot = stateDirectory.canonicalFile
+    val canonical = workDirectory.canonicalFile
+    require(canonical.parentFile == managedRoot && canonical.name.startsWith("node-")) {
+        "Shared CockroachDB work directory must be a node-* child of " +
+            "${managedRoot.absolutePath}, but was ${workDirectory.absolutePath}."
+    }
+    return canonical
+}
+
+internal fun loadVersionedProperties(file: File, description: String): Properties? {
+    if (!file.isFile) return null
+    val properties = try {
+        Properties().apply {
+            file.inputStream().use(::load)
+        }
+    } catch (failure: Exception) {
+        throw IllegalStateException(
+            "Could not read $description at ${file.absolutePath}: ${failure.message}",
+            failure,
+        )
+    }
+    val found = properties.getProperty("protocolVersion") ?: "<missing>"
+    if (found != SHARED_COCKROACH_PROTOCOL_VERSION) {
+        throw IllegalStateException(
+            "Cannot use $description at ${file.absolutePath}: found shared CockroachDB protocol " +
+                "version '$found', but this fixture requires version " +
+                "'$SHARED_COCKROACH_PROTOCOL_VERSION'. The record was left unchanged.",
+        )
+    }
+    return properties
+}
+
+internal fun versionedProperties(): Properties = Properties().apply {
+    setProperty("protocolVersion", SHARED_COCKROACH_PROTOCOL_VERSION)
+}
+
+internal fun writePropertiesAtomically(file: File, properties: Properties) {
+    require(
+        properties.getProperty("protocolVersion") == SHARED_COCKROACH_PROTOCOL_VERSION,
+    ) {
+        "Cannot write shared CockroachDB record ${file.absolutePath}: protocolVersion was " +
+            "'${properties.getProperty("protocolVersion")}', but expected " +
+            "'$SHARED_COCKROACH_PROTOCOL_VERSION'."
+    }
+    val stagingFile = File(file.parentFile, "${file.name}.${ProcessHandle.current().pid()}.part")
+    stagingFile.outputStream().use { properties.store(it, null) }
+    try {
+        Files.move(
+            stagingFile.toPath(),
+            file.toPath(),
+            StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+    } catch (_: AtomicMoveNotSupportedException) {
+        Files.move(
+            stagingFile.toPath(),
+            file.toPath(),
+            StandardCopyOption.REPLACE_EXISTING,
+        )
+    }
+}
+
+internal fun isAtomicStagingFile(file: File): Boolean =
+    file.name.endsWith(".part") &&
+        file.name.substringBeforeLast(".part").substringAfterLast('.').toLongOrNull() != null
+
+internal fun writeIdentity(file: File, identity: SharedProcessIdentity, token: String) {
+    writePropertiesAtomically(
+        file,
+        versionedProperties().apply {
+            setProperty("token", token)
+            setProperty("pid", identity.pid.toString())
+            setProperty("startedAtMillis", identity.startedAt.toEpochMilli().toString())
+        },
+    )
+}
+
+internal fun readIdentity(
+    file: File,
+    description: String,
+    expectedToken: String? = null,
+): SharedProcessIdentity? {
+    val properties = loadVersionedProperties(file, description) ?: return null
+    val token = properties.getProperty("token") ?: throw IllegalStateException(
+        "$description at ${file.absolutePath} did not contain token.",
+    )
+    if (expectedToken != null && token != expectedToken) {
+        throw IllegalStateException(
+            "$description at ${file.absolutePath} contained token '$token', but the live owner " +
+                "claim contains token '$expectedToken'.",
+        )
+    }
+    return parseIdentity(properties, "pid", "startedAtMillis", description, file)
+}
+
+internal fun parseIdentity(
+    properties: Properties,
+    pidKey: String,
+    startedAtKey: String,
+    description: String,
+    file: File,
+): SharedProcessIdentity {
+    val pidValue = properties.getProperty(pidKey) ?: throw IllegalStateException(
+        "$description at ${file.absolutePath} did not contain $pidKey.",
+    )
+    val startedAtValue = properties.getProperty(startedAtKey) ?: throw IllegalStateException(
+        "$description at ${file.absolutePath} contained $pidKey='$pidValue' without $startedAtKey.",
+    )
+    val pid = pidValue.toLongOrNull() ?: throw IllegalStateException(
+        "$description at ${file.absolutePath} contained non-numeric $pidKey='$pidValue'.",
+    )
+    val startedAtMillis = startedAtValue.toLongOrNull() ?: throw IllegalStateException(
+        "$description at ${file.absolutePath} contained non-numeric " +
+            "$startedAtKey='$startedAtValue'.",
+    )
+    return SharedProcessIdentity(pid, Instant.ofEpochMilli(startedAtMillis))
+}
+
+internal fun deleteIfPresent(file: File, description: String) {
+    if (file.exists() && !file.delete()) {
+        throw IllegalStateException("Could not delete $description at ${file.absolutePath}.")
+    }
+}

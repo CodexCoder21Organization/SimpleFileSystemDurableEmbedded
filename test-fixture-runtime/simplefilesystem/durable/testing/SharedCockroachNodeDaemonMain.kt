@@ -7,80 +7,295 @@ import java.nio.file.ClosedWatchServiceException
 import java.nio.file.FileSystems
 import java.nio.file.StandardWatchEventKinds
 import java.sql.DriverManager
-import java.time.Instant
 import java.util.Properties
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
-private const val NODE_STARTUP_TIMEOUT_MILLIS = 120_000L
+private const val HEARTBEAT_INTERVAL_MILLIS = 1_000L
 
 fun main(args: Array<String>) {
-    require(args.size == 2) {
-        "SharedCockroachNodeDaemonMain requires <state-directory> <work-directory>, " +
-            "but received ${args.size} argument(s)."
+    require(args.size == 4) {
+        "SharedCockroachNodeDaemonMain requires <state-directory> <work-directory> " +
+            "<election-token> <control-directory-or-dash>, but received ${args.size} argument(s)."
     }
     val stateDirectory = File(args[0]).canonicalFile
-    val workDirectory = File(args[1]).canonicalFile
-    require(workDirectory.parentFile == stateDirectory && workDirectory.name.startsWith("node-")) {
-        "Shared CockroachDB daemon work directory must be a node-* child of " +
-            "${stateDirectory.absolutePath}, but was ${workDirectory.absolutePath}."
+    val workDirectory = requireManagedWorkDirectory(stateDirectory, File(args[1]))
+    val token = args[2]
+    require(token.isNotBlank()) {
+        "Shared CockroachDB daemon election token must not be blank, but was '$token'."
     }
+    val controlDirectory = args[3].takeUnless { it == "-" }?.let { File(it).canonicalFile }
     check(workDirectory.isDirectory || workDirectory.mkdirs()) {
         "Could not create shared CockroachDB daemon work directory ${workDirectory.absolutePath}."
     }
 
     val daemonIdentity = processIdentity(ProcessHandle.current(), "shared CockroachDB daemon")
-    writeIdentity(File(workDirectory, "daemon.properties"), daemonIdentity)
-    var cockroach: ManagedCockroachProcess? = null
-    val cleanupLock = Any()
-    var cleaned = false
-    fun cleanupCockroach() = synchronized(cleanupLock) {
-        if (cleaned) return@synchronized
-        cleaned = true
-        cockroach?.stop()
-    }
-    val shutdownHook = Thread(::cleanupCockroach, "shared-cockroach-node-daemon-shutdown")
-    Runtime.getRuntime().addShutdownHook(shutdownHook)
-    try {
-        cockroach = adoptCockroach(workDirectory) ?: startCockroach(workDirectory)
-        configureSingleNodeTestCluster(cockroach.jdbcUrl)
-        warmUpDurableSchema(cockroach.jdbcUrl)
-        publishReadyState(
-            stateDirectory = stateDirectory,
-            workDirectory = workDirectory,
-            daemonIdentity = daemonIdentity,
-            cockroach = cockroach,
+    writeIdentity(File(workDirectory, "daemon.properties"), daemonIdentity, token)
+    recordObservedIdentity(controlDirectory, "daemon", token, daemonIdentity, null)
+    val preSpawnClaim = readOwnerClaim(stateDirectory)
+        ?: throw IllegalStateException(
+            "Shared CockroachDB daemon ${daemonIdentity.pid} received token '$token', but owner " +
+                "claim ${File(stateDirectory, "node-owner.properties").absolutePath} was missing.",
         )
-        CountDownLatch(1).await()
-    } finally {
-        cleanupCockroach()
-        try {
-            Runtime.getRuntime().removeShutdownHook(shutdownHook)
-        } catch (_: IllegalStateException) {
-            // The JVM is already shutting down, so the registered hook owns final cleanup.
+    verifyPreAttachOwnership(preSpawnClaim, token, workDirectory)
+    waitAtDaemonBarrier(
+        controlDirectory = controlDirectory,
+        barrierName = "daemon-before-attach",
+        token = token,
+        stateDirectory = stateDirectory,
+        deadlineMillis = preSpawnClaim.attachDeadlineMillis,
+    ) {
+        val claim = readOwnerClaim(stateDirectory)
+            ?: throw IllegalStateException(
+                "Shared CockroachDB daemon ${daemonIdentity.pid} lost owner claim for token " +
+                    "'$token' before attachment.",
+            )
+        verifyPreAttachOwnership(claim, token, workDirectory)
+    }
+    attachDaemon(stateDirectory, workDirectory, token, daemonIdentity)
+
+    try {
+        var cockroach: ManagedCockroachProcess? = null
+        val cleanupLock = Any()
+        var cleaned = false
+        fun cleanupCockroach() = synchronized(cleanupLock) {
+            if (cleaned) return@synchronized
+            cleaned = true
+            cockroach?.stop()
         }
+        val shutdownHook = Thread(::cleanupCockroach, "shared-cockroach-node-daemon-shutdown")
+        Runtime.getRuntime().addShutdownHook(shutdownHook)
+        val lifecycle = CountDownLatch(1)
+        val ownershipFailure = AtomicReference<Throwable?>(null)
+        val cockroachExitObserved = AtomicBoolean(false)
+        val heartbeatExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+            Thread(runnable, "shared-cockroach-owner-heartbeat").apply {
+                isDaemon = true
+            }
+        }
+        heartbeatExecutor.scheduleAtFixedRate(
+            {
+                try {
+                    val managedCockroach = cockroach
+                    if (managedCockroach != null &&
+                        !managedCockroach.isAlive() &&
+                        cockroachExitObserved.compareAndSet(false, true)
+                    ) {
+                        abandonHeartbeatAfterCockroachExit(
+                            stateDirectory,
+                            workDirectory,
+                            token,
+                            daemonIdentity,
+                        )
+                        lifecycle.countDown()
+                        return@scheduleAtFixedRate
+                    }
+                    renewHeartbeat(stateDirectory, workDirectory, token, daemonIdentity)
+                } catch (failure: Throwable) {
+                    if (ownershipFailure.compareAndSet(null, failure)) {
+                        try {
+                            cleanupCockroach()
+                        } catch (cleanupFailure: Throwable) {
+                            failure.addSuppressed(cleanupFailure)
+                        }
+                        lifecycle.countDown()
+                    }
+                }
+            },
+            0L,
+            HEARTBEAT_INTERVAL_MILLIS,
+            TimeUnit.MILLISECONDS,
+        )
+        try {
+            requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            cockroach = startCockroach(workDirectory, token)
+            val cockroachExit = cockroach.onExit {
+                cockroachExitObserved.set(true)
+                try {
+                    abandonHeartbeatAfterCockroachExit(
+                        stateDirectory,
+                        workDirectory,
+                        token,
+                        daemonIdentity,
+                    )
+                } catch (failure: Throwable) {
+                    ownershipFailure.compareAndSet(null, failure)
+                } finally {
+                    lifecycle.countDown()
+                }
+            }
+            recordObservedIdentity(
+                controlDirectory,
+                "cockroach",
+                token,
+                cockroach.identity,
+                cockroach.processGroupId,
+            )
+            waitAtDaemonBarrier(
+                controlDirectory = controlDirectory,
+                barrierName = "cockroach-before-readiness",
+                token = token,
+                stateDirectory = stateDirectory,
+                deadlineMillis = null,
+            ) {
+                requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            }
+            requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            configureSingleNodeTestCluster(cockroach.jdbcUrl)
+            warmUpDurableSchema(
+                adminJdbcUrl = cockroach.jdbcUrl,
+                controlDirectory = controlDirectory,
+                token = token,
+                ownershipDirectory = stateDirectory,
+            ) {
+                requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            }
+            requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            publishReadyState(
+                stateDirectory = stateDirectory,
+                workDirectory = workDirectory,
+                token = token,
+                daemonIdentity = daemonIdentity,
+                cockroach = cockroach,
+            )
+            lifecycle.await()
+            if (cockroachExit.isCompletedExceptionally) cockroachExit.join()
+            ownershipFailure.get()?.let { throw it }
+        } finally {
+            heartbeatExecutor.shutdownNow()
+            cleanupCockroach()
+            try {
+                Runtime.getRuntime().removeShutdownHook(shutdownHook)
+            } catch (_: IllegalStateException) {
+                // The JVM is already shutting down, so the registered hook owns final cleanup.
+            }
+        }
+    } catch (failure: Throwable) {
+        try {
+            publishStartupFailure(
+                stateDirectory,
+                workDirectory,
+                token,
+                daemonIdentity,
+                failure,
+            )
+        } catch (publicationFailure: Throwable) {
+            failure.addSuppressed(publicationFailure)
+        }
+        throw failure
     }
 }
 
-private fun adoptCockroach(workDirectory: File): ManagedCockroachProcess? {
-    val identity = readIdentity(File(workDirectory, "cockroach.properties")) ?: return null
-    val handle = ProcessHandle.of(identity.pid).orElse(null) ?: return null
-    if (!identity.matches(handle)) return null
-    val listeningUrlFile = File(workDirectory, "listening-url")
-    if (!listeningUrlFile.isFile || listeningUrlFile.length() == 0L) return null
-    val jdbcUrl = daemonListeningUrlToJdbcUrl(listeningUrlFile.readText().trim())
-    if (!canConnect(jdbcUrl)) return null
-    return ManagedCockroachProcess(handle, identity, jdbcUrl, File(workDirectory, "cockroach.out"))
-}
-
-private fun startCockroach(workDirectory: File): ManagedCockroachProcess {
-    listOf("listening-url", "cockroach.pid", "cockroach.properties").forEach { name ->
-        val file = File(workDirectory, name)
-        if (file.exists() && !file.delete()) {
-            throw IllegalStateException(
-                "Could not delete stale shared CockroachDB startup file ${file.absolutePath}.",
+private fun abandonHeartbeatAfterCockroachExit(
+    stateDirectory: File,
+    workDirectory: File,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
+) {
+    withStateLock(stateDirectory) {
+        val claim = readOwnerClaim(stateDirectory) ?: return@withStateLock
+        if (claim.token == token &&
+            claim.workDirectory == workDirectory &&
+            claim.daemon == daemonIdentity
+        ) {
+            deleteIfPresent(
+                File(stateDirectory, "node-heartbeat.properties"),
+                "heartbeat for exited shared CockroachDB process",
             )
         }
+    }
+}
+
+private fun attachDaemon(
+    stateDirectory: File,
+    workDirectory: File,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
+) {
+    withStateLock(stateDirectory) {
+        val claim = readOwnerClaim(stateDirectory)
+            ?: throw IllegalStateException(
+                "Shared CockroachDB daemon ${daemonIdentity.pid} cannot attach token '$token' " +
+                    "because the owner claim is missing.",
+            )
+        verifyPreAttachOwnership(claim, token, workDirectory)
+        val attached = claim.copy(daemon = daemonIdentity)
+        writeOwnerClaim(stateDirectory, attached)
+        writeHeartbeat(stateDirectory, token, daemonIdentity)
+    }
+}
+
+private fun renewHeartbeat(
+    stateDirectory: File,
+    workDirectory: File,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
+) {
+    withStateLock(stateDirectory) {
+        requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+        writeHeartbeat(stateDirectory, token, daemonIdentity)
+    }
+}
+
+private fun verifyPreAttachOwnership(
+    claim: SharedCockroachOwnerClaim,
+    token: String,
+    workDirectory: File,
+) {
+    check(claim.token == token) {
+        "Shared CockroachDB daemon token '$token' was superseded by owner token '${claim.token}'."
+    }
+    check(claim.workDirectory == workDirectory) {
+        "Shared CockroachDB daemon token '$token' was assigned work directory " +
+            "${claim.workDirectory.absolutePath}, not ${workDirectory.absolutePath}."
+    }
+    check(claim.daemon == null) {
+        "Shared CockroachDB daemon token '$token' was already attached to daemon " +
+            "${claim.daemon?.pid}."
+    }
+    check(claim.electionOwner.liveHandle() != null) {
+        "Shared CockroachDB daemon token '$token' belongs to dead election owner " +
+            "${claim.electionOwner.pid}."
+    }
+    val now = System.currentTimeMillis()
+    check(now <= claim.attachDeadlineMillis) {
+        "Shared CockroachDB daemon token '$token' missed its attachment deadline " +
+            "${claim.attachDeadlineMillis}; current time was $now."
+    }
+}
+
+private fun requireAttachedOwnership(
+    stateDirectory: File,
+    workDirectory: File,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
+) {
+    val claim = readOwnerClaim(stateDirectory)
+        ?: throw IllegalStateException(
+            "Shared CockroachDB daemon ${daemonIdentity.pid} lost owner claim for token '$token'.",
+        )
+    check(claim.token == token) {
+        "Shared CockroachDB daemon token '$token' was superseded by owner token '${claim.token}'."
+    }
+    check(claim.workDirectory == workDirectory) {
+        "Shared CockroachDB daemon token '$token' owner claim changed work directory from " +
+            "${workDirectory.absolutePath} to ${claim.workDirectory.absolutePath}."
+    }
+    check(claim.daemon == daemonIdentity) {
+        "Shared CockroachDB daemon token '$token' owner claim recorded daemon " +
+            "${claim.daemon?.pid} started at ${claim.daemon?.startedAt}, but this daemon is " +
+            "${daemonIdentity.pid} started at ${daemonIdentity.startedAt}."
+    }
+}
+
+private fun startCockroach(workDirectory: File, token: String): ManagedCockroachProcess {
+    listOf("listening-url", "cockroach.pid", "cockroach.properties").forEach { name ->
+        deleteIfPresent(File(workDirectory, name), "stale shared CockroachDB startup file")
     }
     val binaryProvider = LocalCockroachCluster()
     val binary = try {
@@ -98,6 +313,7 @@ private fun startCockroach(workDirectory: File): ManagedCockroachProcess {
         StandardWatchEventKinds.ENTRY_MODIFY,
     )
     val process = ProcessBuilder(
+        "/usr/bin/setsid",
         binary.absolutePath,
         "start-single-node",
         "--insecure",
@@ -116,18 +332,25 @@ private fun startCockroach(workDirectory: File): ManagedCockroachProcess {
         .redirectOutput(logFile)
         .redirectErrorStream(true)
         .start()
-    val identity = processIdentity(process.toHandle(), "shared CockroachDB process")
-    writeIdentity(File(workDirectory, "cockroach.properties"), identity)
+    val identity = processIdentity(process.toHandle(), "shared CockroachDB process-group leader")
+    val managed = ManagedCockroachProcess(
+        handle = process.toHandle(),
+        identity = identity,
+        processGroupId = identity.pid,
+        jdbcUrl = "",
+        logFile = logFile,
+    )
+    writeIdentity(File(workDirectory, "cockroach.properties"), identity, token)
     process.onExit().thenRun { watcher.close() }
     try {
         val deadlineNanos = System.nanoTime() +
-            TimeUnit.MILLISECONDS.toNanos(NODE_STARTUP_TIMEOUT_MILLIS)
+            TimeUnit.MILLISECONDS.toNanos(SHARED_COCKROACH_STARTUP_TIMEOUT_MILLIS)
         while (!listeningUrlFile.isFile || listeningUrlFile.length() == 0L) {
             val remainingNanos = deadlineNanos - System.nanoTime()
             if (remainingNanos <= 0L) {
                 throw IllegalStateException(
                     "The shared CockroachDB node did not become ready within " +
-                        "$NODE_STARTUP_TIMEOUT_MILLIS milliseconds; output:\n" +
+                        "$SHARED_COCKROACH_STARTUP_TIMEOUT_MILLIS milliseconds; output:\n" +
                         logFile.takeIf(File::isFile)?.readText().orEmpty(),
                 )
             }
@@ -135,17 +358,18 @@ private fun startCockroach(workDirectory: File): ManagedCockroachProcess {
                 val key = watcher.poll(remainingNanos, TimeUnit.NANOSECONDS)
                     ?: throw IllegalStateException(
                         "The shared CockroachDB node did not become ready within " +
-                            "$NODE_STARTUP_TIMEOUT_MILLIS milliseconds; output:\n" +
+                            "$SHARED_COCKROACH_STARTUP_TIMEOUT_MILLIS milliseconds; output:\n" +
                             logFile.takeIf(File::isFile)?.readText().orEmpty(),
                     )
                 key.pollEvents()
                 check(key.reset()) {
-                    "Could not continue watching ${workDirectory.absolutePath} for CockroachDB readiness."
+                    "Could not continue watching ${workDirectory.absolutePath} for CockroachDB " +
+                        "readiness."
                 }
             } catch (_: ClosedWatchServiceException) {
                 throw IllegalStateException(
-                    "The shared CockroachDB node exited with code ${process.exitValue()} " +
-                        "before becoming ready; output:\n" +
+                    "The shared CockroachDB process-group leader ${identity.pid} exited before " +
+                        "becoming ready; output:\n" +
                         logFile.takeIf(File::isFile)?.readText().orEmpty(),
                 )
             }
@@ -155,61 +379,44 @@ private fun startCockroach(workDirectory: File): ManagedCockroachProcess {
             "The shared CockroachDB node wrote ${listeningUrlFile.absolutePath}, but a JDBC " +
                 "connection to $jdbcUrl could not be established."
         }
-        return ManagedCockroachProcess(process.toHandle(), identity, jdbcUrl, logFile)
+        return managed.copyWithJdbcUrl(jdbcUrl)
     } catch (failure: Throwable) {
-        ManagedCockroachProcess(
-            process.toHandle(),
-            identity,
-            "",
-            logFile,
-        ).stop()
+        try {
+            managed.stop()
+        } catch (cleanupFailure: Throwable) {
+            failure.addSuppressed(cleanupFailure)
+        }
         throw failure
     } finally {
         watcher.close()
     }
 }
 
-private fun configureSingleNodeTestCluster(jdbcUrl: String) {
-    DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
-        connection.createStatement().use { statement ->
-            statement.execute("SET CLUSTER SETTING kv.range_split.by_load_enabled = false")
-        }
-    }
-}
-
 private fun publishReadyState(
     stateDirectory: File,
     workDirectory: File,
-    daemonIdentity: DaemonProcessIdentity,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
     cockroach: ManagedCockroachProcess,
 ) {
-    RandomAccessFile(File(stateDirectory, "state.lock"), "rw").use { lockAccess ->
-        lockAccess.channel.lock().use {
-            val startingFile = File(stateDirectory, "node-starting.properties")
-            val starting = loadProperties(startingFile)
-            val recordedDaemonPid = starting?.getProperty("daemonPid")?.toLongOrNull()
-            val recordedDaemonStartedAt = starting?.getProperty("daemonStartedAtMillis")?.toLongOrNull()
-            val recordedWorkDirectory = starting?.getProperty("workDirectory")
-            check(
-                recordedDaemonPid == daemonIdentity.pid &&
-                    recordedDaemonStartedAt == daemonIdentity.startedAt.toEpochMilli() &&
-                    recordedWorkDirectory == workDirectory.absolutePath,
-            ) {
-                "Shared CockroachDB startup ownership changed before daemon ${daemonIdentity.pid} " +
-                    "could publish readiness: recorded daemon PID was $recordedDaemonPid, " +
-                    "recorded start time was $recordedDaemonStartedAt, and recorded work directory " +
-                    "was '$recordedWorkDirectory'."
-            }
-            val leases = File(stateDirectory, "leases").listFiles().orEmpty().filter(File::isFile)
-            check(leases.isNotEmpty()) {
-                "Shared CockroachDB daemon ${daemonIdentity.pid} completed startup without a live lease."
-            }
-            val properties = Properties().apply {
+    withStateLock(stateDirectory) {
+        requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+        val leases = File(stateDirectory, "leases").listFiles().orEmpty()
+            .filter { it.isFile && !isAtomicStagingFile(it) }
+        check(leases.isNotEmpty()) {
+            "Shared CockroachDB daemon ${daemonIdentity.pid} completed startup for token '$token' " +
+                "without a live lease."
+        }
+        writePropertiesAtomically(
+            File(stateDirectory, "node.properties"),
+            versionedProperties().apply {
+                setProperty("token", token)
                 setProperty("pid", cockroach.identity.pid.toString())
                 setProperty(
                     "processStartedAtMillis",
                     cockroach.identity.startedAt.toEpochMilli().toString(),
                 )
+                setProperty("processGroupId", cockroach.processGroupId.toString())
                 setProperty("daemonPid", daemonIdentity.pid.toString())
                 setProperty(
                     "daemonStartedAtMillis",
@@ -217,13 +424,250 @@ private fun publishReadyState(
                 )
                 setProperty("jdbcUrl", cockroach.jdbcUrl)
                 setProperty("workDirectory", workDirectory.absolutePath)
-            }
-            writePropertiesAtomically(File(stateDirectory, "node.properties"), properties)
-            if (startingFile.exists() && !startingFile.delete()) {
-                throw IllegalStateException(
-                    "Could not delete shared CockroachDB startup state ${startingFile.absolutePath}.",
+            },
+        )
+        writeHeartbeat(stateDirectory, token, daemonIdentity)
+    }
+}
+
+private fun publishStartupFailure(
+    stateDirectory: File,
+    workDirectory: File,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
+    failure: Throwable,
+) {
+    withStateLock(stateDirectory) {
+        val claim = readOwnerClaim(stateDirectory) ?: return@withStateLock
+        if (claim.token != token ||
+            claim.workDirectory != workDirectory ||
+            claim.daemon != daemonIdentity
+        ) {
+            return@withStateLock
+        }
+        val readyProperties = loadVersionedProperties(
+            File(stateDirectory, "node.properties"),
+            "shared CockroachDB node state",
+        )
+        if (readyProperties?.getProperty("token") == token) return@withStateLock
+        deleteIfPresent(
+            File(stateDirectory, "node.properties"),
+            "failed shared CockroachDB node state",
+        )
+        deleteIfPresent(
+            File(stateDirectory, "node-heartbeat.properties"),
+            "failed shared CockroachDB heartbeat",
+        )
+        writePropertiesAtomically(
+            File(stateDirectory, "node-failure.properties"),
+            versionedProperties().apply {
+                setProperty("token", token)
+                setProperty("daemonPid", daemonIdentity.pid.toString())
+                setProperty(
+                    "daemonStartedAtMillis",
+                    daemonIdentity.startedAt.toEpochMilli().toString(),
+                )
+                setProperty(
+                    "message",
+                    failure.message ?: failure::class.java.name,
+                )
+            },
+        )
+    }
+}
+
+private fun readOwnerClaim(stateDirectory: File): SharedCockroachOwnerClaim? {
+    val ownerFile = File(stateDirectory, "node-owner.properties")
+    val properties = loadVersionedProperties(
+        ownerFile,
+        "shared CockroachDB owner claim",
+    ) ?: return null
+    val token = properties.getProperty("token") ?: throw IllegalStateException(
+        "Shared CockroachDB owner claim ${ownerFile.absolutePath} did not contain token.",
+    )
+    val daemonPid = properties.getProperty("daemonPid")
+    val daemonStartedAt = properties.getProperty("daemonStartedAtMillis")
+    check((daemonPid == null) == (daemonStartedAt == null)) {
+        "Shared CockroachDB owner claim ${ownerFile.absolutePath} must contain both daemonPid and " +
+            "daemonStartedAtMillis, but daemonPid='$daemonPid' and " +
+            "daemonStartedAtMillis='$daemonStartedAt'."
+    }
+    return SharedCockroachOwnerClaim(
+        token = token,
+        electionOwner = parseIdentity(
+            properties,
+            "ownerPid",
+            "ownerStartedAtMillis",
+            "shared CockroachDB owner claim",
+            ownerFile,
+        ),
+        createdAtMillis = requiredLong(properties, "createdAtMillis", ownerFile),
+        attachDeadlineMillis = requiredLong(properties, "attachDeadlineMillis", ownerFile),
+        workDirectory = requireManagedWorkDirectory(
+            stateDirectory,
+            File(
+                properties.getProperty("workDirectory") ?: throw IllegalStateException(
+                    "Shared CockroachDB owner claim ${ownerFile.absolutePath} did not contain " +
+                        "workDirectory.",
+                ),
+            ),
+        ),
+        daemon = if (daemonPid == null) {
+            null
+        } else {
+            parseIdentity(
+                properties,
+                "daemonPid",
+                "daemonStartedAtMillis",
+                "shared CockroachDB owner claim",
+                ownerFile,
+            )
+        },
+    )
+}
+
+private fun writeOwnerClaim(
+    stateDirectory: File,
+    claim: SharedCockroachOwnerClaim,
+) {
+    writePropertiesAtomically(
+        File(stateDirectory, "node-owner.properties"),
+        versionedProperties().apply {
+            setProperty("token", claim.token)
+            setProperty("ownerPid", claim.electionOwner.pid.toString())
+            setProperty(
+                "ownerStartedAtMillis",
+                claim.electionOwner.startedAt.toEpochMilli().toString(),
+            )
+            setProperty("createdAtMillis", claim.createdAtMillis.toString())
+            setProperty("attachDeadlineMillis", claim.attachDeadlineMillis.toString())
+            setProperty("workDirectory", claim.workDirectory.absolutePath)
+            claim.daemon?.let { daemon ->
+                setProperty("daemonPid", daemon.pid.toString())
+                setProperty(
+                    "daemonStartedAtMillis",
+                    daemon.startedAt.toEpochMilli().toString(),
                 )
             }
+        },
+    )
+}
+
+private fun writeHeartbeat(
+    stateDirectory: File,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
+) {
+    writePropertiesAtomically(
+        File(stateDirectory, "node-heartbeat.properties"),
+        versionedProperties().apply {
+            setProperty("token", token)
+            setProperty("daemonPid", daemonIdentity.pid.toString())
+            setProperty(
+                "daemonStartedAtMillis",
+                daemonIdentity.startedAt.toEpochMilli().toString(),
+            )
+            setProperty("writtenAtMillis", System.currentTimeMillis().toString())
+        },
+    )
+}
+
+private fun waitAtDaemonBarrier(
+    controlDirectory: File?,
+    barrierName: String,
+    token: String,
+    stateDirectory: File,
+    deadlineMillis: Long?,
+    verifyOwnership: () -> Unit,
+) {
+    if (controlDirectory == null || !File(controlDirectory, "pause-$barrierName").isFile) return
+    check(controlDirectory.isDirectory || controlDirectory.mkdirs()) {
+        "Could not create shared CockroachDB fixture-control directory " +
+            controlDirectory.absolutePath
+    }
+    writePropertiesAtomically(
+        File(controlDirectory, "$barrierName-arrived-$token.properties"),
+        versionedProperties().apply {
+            setProperty("token", token)
+            setProperty("pid", ProcessHandle.current().pid().toString())
+        },
+    )
+    val releaseFile = File(controlDirectory, "$barrierName-release-$token")
+    FileSystems.getDefault().newWatchService().use { watcher ->
+        controlDirectory.toPath().register(
+            watcher,
+            StandardWatchEventKinds.ENTRY_CREATE,
+            StandardWatchEventKinds.ENTRY_MODIFY,
+            StandardWatchEventKinds.ENTRY_DELETE,
+        )
+        stateDirectory.toPath().register(
+            watcher,
+            StandardWatchEventKinds.ENTRY_CREATE,
+            StandardWatchEventKinds.ENTRY_MODIFY,
+            StandardWatchEventKinds.ENTRY_DELETE,
+        )
+        while (!releaseFile.isFile) {
+            verifyOwnership()
+            val key = try {
+                if (deadlineMillis == null) {
+                    watcher.take()
+                } else {
+                    val remaining = deadlineMillis - System.currentTimeMillis()
+                    check(remaining > 0L) {
+                        "Shared CockroachDB daemon token '$token' did not leave $barrierName before " +
+                            "attachment deadline $deadlineMillis."
+                    }
+                    watcher.poll(remaining, TimeUnit.MILLISECONDS)
+                        ?: throw IllegalStateException(
+                            "Shared CockroachDB daemon token '$token' did not leave $barrierName " +
+                                "before attachment deadline $deadlineMillis.",
+                        )
+                }
+            } catch (failure: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException(
+                    "Interrupted while shared CockroachDB daemon token '$token' waited at " +
+                        "$barrierName.",
+                    failure,
+                )
+            }
+            key.pollEvents()
+            check(key.reset()) {
+                "Could not continue watching the shared CockroachDB $barrierName barrier for " +
+                    "token '$token'."
+            }
+        }
+    }
+    verifyOwnership()
+}
+
+private fun recordObservedIdentity(
+    controlDirectory: File?,
+    processType: String,
+    token: String,
+    identity: SharedProcessIdentity,
+    processGroupId: Long?,
+) {
+    if (controlDirectory == null) return
+    check(controlDirectory.isDirectory || controlDirectory.mkdirs()) {
+        "Could not create shared CockroachDB fixture-control directory " +
+            controlDirectory.absolutePath
+    }
+    writePropertiesAtomically(
+        File(controlDirectory, "$processType-$token.properties"),
+        versionedProperties().apply {
+            setProperty("token", token)
+            setProperty("pid", identity.pid.toString())
+            setProperty("startedAtMillis", identity.startedAt.toEpochMilli().toString())
+            processGroupId?.let { setProperty("processGroupId", it.toString()) }
+        },
+    )
+}
+
+private fun configureSingleNodeTestCluster(jdbcUrl: String) {
+    DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
+        connection.createStatement().use { statement ->
+            statement.execute("SET CLUSTER SETTING kv.range_split.by_load_enabled = false")
         }
     }
 }
@@ -252,87 +696,71 @@ private fun daemonListeningUrlToJdbcUrl(listeningUrl: String): String {
         match.groupValues[3]
 }
 
-private fun processIdentity(handle: ProcessHandle, description: String): DaemonProcessIdentity {
-    val startedAt = requireNotNull(handle.info().startInstant().orElse(null)) {
-        "The $description ${handle.pid()} did not expose its start time."
-    }
-    return DaemonProcessIdentity(handle.pid(), startedAt)
+private fun requiredLong(properties: Properties, key: String, file: File): Long {
+    val value = properties.getProperty(key) ?: throw IllegalStateException(
+        "Shared CockroachDB record ${file.absolutePath} did not contain $key.",
+    )
+    return value.toLongOrNull() ?: throw IllegalStateException(
+        "Shared CockroachDB record ${file.absolutePath} contained non-numeric $key='$value'.",
+    )
 }
 
-private fun writeIdentity(file: File, identity: DaemonProcessIdentity) {
-    val properties = Properties().apply {
-        setProperty("pid", identity.pid.toString())
-        setProperty("startedAtMillis", identity.startedAt.toEpochMilli().toString())
-    }
-    writePropertiesAtomically(file, properties)
-}
-
-private fun readIdentity(file: File): DaemonProcessIdentity? {
-    val properties = loadProperties(file) ?: return null
-    return try {
-        DaemonProcessIdentity(
-            pid = requireNotNull(properties.getProperty("pid")).toLong(),
-            startedAt = Instant.ofEpochMilli(
-                requireNotNull(properties.getProperty("startedAtMillis")).toLong(),
-            ),
-        )
-    } catch (_: Exception) {
-        null
+private fun <T> withStateLock(stateDirectory: File, block: () -> T): T {
+    val lockFile = File(stateDirectory, "state.lock")
+    return RandomAccessFile(lockFile, "rw").use { lockAccess ->
+        lockAccess.channel.lock().use { block() }
     }
 }
 
-private fun loadProperties(file: File): Properties? {
-    if (!file.isFile) return null
-    return try {
-        Properties().apply {
-            file.inputStream().use(::load)
-        }
-    } catch (_: Exception) {
-        null
-    }
-}
-
-private fun writePropertiesAtomically(file: File, properties: Properties) {
-    val stagingFile = File(file.parentFile, "${file.name}.part")
-    stagingFile.outputStream().use { properties.store(it, null) }
-    try {
-        java.nio.file.Files.move(
-            stagingFile.toPath(),
-            file.toPath(),
-            java.nio.file.StandardCopyOption.ATOMIC_MOVE,
-            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-        )
-    } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-        java.nio.file.Files.move(
-            stagingFile.toPath(),
-            file.toPath(),
-            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-        )
-    }
-}
-
-private data class DaemonProcessIdentity(
-    val pid: Long,
-    val startedAt: Instant,
-) {
-    fun matches(handle: ProcessHandle): Boolean =
-        handle.isAlive && handle.info().startInstant().orElse(null) == startedAt
-}
-
-private class ManagedCockroachProcess(
+private data class ManagedCockroachProcess(
     private val handle: ProcessHandle,
-    val identity: DaemonProcessIdentity,
+    val identity: SharedProcessIdentity,
+    val processGroupId: Long,
     val jdbcUrl: String,
     private val logFile: File,
 ) {
+    fun copyWithJdbcUrl(jdbcUrl: String): ManagedCockroachProcess = copy(jdbcUrl = jdbcUrl)
+
+    fun onExit(action: () -> Unit): CompletableFuture<Void> = handle.onExit().thenRun(action)
+
+    fun isAlive(): Boolean = identity.liveHandle() != null
+
     fun stop() {
-        handle.destroyForcibly()
-        if (handle.isAlive) {
-            handle.onExit().join()
+        val liveHandle = identity.liveHandle() ?: return
+        check(processGroupId == identity.pid) {
+            "Cannot stop shared CockroachDB process group $processGroupId because its verified " +
+                "leader PID was ${identity.pid}."
         }
-        check(!handle.isAlive) {
-            "Shared CockroachDB process ${identity.pid} remained alive after forcible shutdown; " +
-                "output:\n${logFile.takeIf(File::isFile)?.readText().orEmpty()}"
+        val kill = ProcessBuilder("/bin/kill", "-KILL", "--", "-$processGroupId").start()
+        val exitCode = kill.waitFor()
+        check(exitCode == 0 || !liveHandle.isAlive) {
+            "Could not signal shared CockroachDB process group $processGroupId; /bin/kill exited " +
+                "with code $exitCode and process ${identity.pid} remained alive."
+        }
+        if (liveHandle.isAlive) {
+            try {
+                liveHandle.onExit().get(
+                    SHARED_COCKROACH_PROCESS_STOP_SECONDS,
+                    TimeUnit.SECONDS,
+                )
+            } catch (failure: TimeoutException) {
+                throw IllegalStateException(
+                    "Shared CockroachDB process group $processGroupId remained alive after forcible " +
+                        "shutdown; output:\n${logFile.takeIf(File::isFile)?.readText().orEmpty()}",
+                    failure,
+                )
+            } catch (failure: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IllegalStateException(
+                    "Interrupted while waiting for shared CockroachDB process group " +
+                        "$processGroupId to exit.",
+                    failure,
+                )
+            }
+        }
+        check(!liveHandle.isAlive) {
+            "Shared CockroachDB process group $processGroupId remained alive after forcible " +
+                "shutdown; output:\n${logFile.takeIf(File::isFile)?.readText().orEmpty()}"
         }
     }
 }

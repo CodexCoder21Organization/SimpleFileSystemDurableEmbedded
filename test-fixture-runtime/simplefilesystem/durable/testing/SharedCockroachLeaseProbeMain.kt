@@ -8,12 +8,29 @@ import simplefilesystem.durable.DurableSimpleFileSystemManager
 import sql.Database
 
 fun main(args: Array<String>) {
-    require(args.size == 2) {
-        "SharedCockroachLeaseProbeMain requires <ready-file> <release-file>, but received ${args.size} argument(s)."
+    require(args.size == 2 || args.size == 5) {
+        "SharedCockroachLeaseProbeMain requires <ready-file> <release-file> or <ready-file> " +
+            "<release-file> <armed-file> <start-gate> <control-directory-or-dash>, but received " +
+            "${args.size} argument(s)."
     }
     val readyFile = File(args[0])
     val releaseFile = File(args[1])
-    SharedCockroachCluster().start().use { cluster ->
+    val control = if (args.size == 5 && args[4] != "-") {
+        SharedCockroachFixtureControl(File(args[4]).canonicalFile)
+    } else {
+        null
+    }
+    if (args.size == 5) {
+        val armedFile = File(args[2])
+        writePropertiesAtomically(
+            armedFile,
+            versionedProperties().apply {
+                setProperty("pid", ProcessHandle.current().pid().toString())
+            },
+        )
+        waitForFileCreation(File(args[3]))
+    }
+    SharedCockroachCluster(fixtureControl = control).start().use { cluster ->
         Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password).use { database ->
             DurableSimpleFileSystemManager(
                 blobstoreService = InMemoryBlobstoreService(),
@@ -22,7 +39,30 @@ fun main(args: Array<String>) {
                 manager.listFilesystems(null, 1)
             }
         }
-        writeAtomically(readyFile, cluster.jdbcUrl())
+        val diagnostics = cluster.diagnostics()
+        writePropertiesAtomically(
+            readyFile,
+            versionedProperties().apply {
+                setProperty("jdbcUrl", cluster.jdbcUrl())
+                setProperty("stateDirectory", diagnostics.stateDirectory.absolutePath)
+                setProperty("lockFile", diagnostics.lockFile.absolutePath)
+                setProperty("token", diagnostics.electionToken)
+                setProperty("daemonPid", diagnostics.daemonPid.toString())
+                setProperty(
+                    "daemonStartedAtMillis",
+                    diagnostics.daemonStartedAtMillis.toString(),
+                )
+                setProperty("cockroachPid", diagnostics.cockroachPid.toString())
+                setProperty(
+                    "cockroachStartedAtMillis",
+                    diagnostics.cockroachStartedAtMillis.toString(),
+                )
+                setProperty(
+                    "cockroachProcessGroupId",
+                    diagnostics.cockroachProcessGroupId.toString(),
+                )
+            },
+        )
         waitForFileCreation(releaseFile)
     }
 }

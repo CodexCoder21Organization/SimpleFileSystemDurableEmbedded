@@ -19,15 +19,19 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 fun testSharedCockroachCrossProcessElectionAndRecovery() {
-    val privateTemp = Files.createTempDirectory("durable-cross-process-node-").toFile()
+    var privateTemp: File? = null
+    var managedStateDirectory: File? = null
     val javaBinary = File(System.getProperty("java.home"), "bin/java").absolutePath
     val fixtureJar = File(
         SharedCockroachLeaseProbe::class.java.protectionDomain.codeSource.location.toURI(),
     ).absolutePath
     val processes = mutableListOf<Process>()
     val releases = mutableListOf<File>()
+    val observedIdentities = linkedSetOf<Pair<Long, Long>>()
     var testFailure: Throwable? = null
     try {
+        privateTemp = Files.createTempDirectory("durable-cross-process-node-").toFile()
+        val privateTemp = requireNotNull(privateTemp)
         val readyFiles = (0 until 4).map { index -> File(privateTemp, "ready-$index") }
         repeat(4) { index ->
             val release = File(privateTemp, "release-$index")
@@ -52,13 +56,26 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
 
         waitForCrossProcessReadyFiles(readyFiles, TimeUnit.SECONDS.toNanos(20L))
         readyFiles.forEachIndexed { index, ready ->
-            check(ready.isFile && ready.length() > 0L) {
+            check(ready.isFile) {
                 "Cross-process CockroachDB child $index did not become ready; output:\n" +
                     File(privateTemp, "child-$index.log").takeIf(File::isFile)?.readText().orEmpty()
             }
         }
 
-        val jdbcUrls = readyFiles.map { it.readText().trim() }
+        val readyProperties = readyFiles.map { readyFile ->
+            Properties().apply {
+                readyFile.inputStream().use(::load)
+            }
+        }
+        readyProperties.forEach { properties ->
+            observedIdentities +=
+                requireNotNull(properties.getProperty("daemonPid")).toLong() to
+                requireNotNull(properties.getProperty("daemonStartedAtMillis")).toLong()
+            observedIdentities +=
+                requireNotNull(properties.getProperty("cockroachPid")).toLong() to
+                requireNotNull(properties.getProperty("cockroachStartedAtMillis")).toLong()
+        }
+        val jdbcUrls = readyProperties.map { requireNotNull(it.getProperty("jdbcUrl")) }
         assertEquals(
             1,
             jdbcUrls.map { it.substringBeforeLast('/') }.distinct().size,
@@ -70,16 +87,23 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "Every independently forked JVM must receive a distinct logical database.",
         )
         jdbcUrls.forEachIndexed { index, jdbcUrl ->
-            assertDurableSchemaReady(
+            assertDurableSchemaInitialized(
                 jdbcUrl,
                 "Forked JVM $index must publish readiness only after production schema bootstrap.",
             )
         }
 
-        val stateFile = File(
-            privateTemp,
-            "simplefilesystem-durable-shared-cockroach-v1/node.properties",
+        managedStateDirectory = File(
+            requireNotNull(readyProperties.first().getProperty("stateDirectory")),
+        ).canonicalFile
+        assertTrue(
+            managedStateDirectory!!.name.startsWith(
+                "simplefilesystem-durable-shared-cockroach-v2-",
+            ),
+            "Managed state namespace must use protocol v2 plus a stable workspace digest, but was " +
+                managedStateDirectory!!.absolutePath,
         )
+        val stateFile = File(managedStateDirectory, "node.properties")
         val originalState = Properties().apply {
             stateFile.inputStream().use(::load)
         }
@@ -117,7 +141,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             listOf(stateRecoveryReady),
             TimeUnit.SECONDS.toNanos(5L),
         )
-        check(stateRecoveryReady.isFile && stateRecoveryReady.length() > 0L) {
+        check(stateRecoveryReady.isFile) {
             "A new JVM did not recover the live node from corrupt node state; output:\n" +
                 File(privateTemp, "child-state-recovery.log").takeIf(File::isFile)?.readText().orEmpty()
         }
@@ -134,11 +158,24 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             File(requireNotNull(repairedState.getProperty("workDirectory"))).canonicalFile,
             "State recovery must not retain an untrusted work-directory path.",
         )
-        DriverManager.getConnection(stateRecoveryReady.readText().trim(), "root", "").use { connection ->
+        val stateRecoveryProperties = Properties().apply {
+            stateRecoveryReady.inputStream().use(::load)
+        }
+        observedIdentities +=
+            requireNotNull(stateRecoveryProperties.getProperty("daemonPid")).toLong() to
+            requireNotNull(stateRecoveryProperties.getProperty("daemonStartedAtMillis")).toLong()
+        observedIdentities +=
+            requireNotNull(stateRecoveryProperties.getProperty("cockroachPid")).toLong() to
+            requireNotNull(stateRecoveryProperties.getProperty("cockroachStartedAtMillis")).toLong()
+        DriverManager.getConnection(
+            requireNotNull(stateRecoveryProperties.getProperty("jdbcUrl")),
+            "root",
+            "",
+        ).use { connection ->
             assertTrue(connection.isValid(2), "The state-recovered logical database must accept JDBC connections.")
         }
-        assertDurableSchemaReady(
-            stateRecoveryReady.readText().trim(),
+        assertDurableSchemaInitialized(
+            requireNotNull(stateRecoveryProperties.getProperty("jdbcUrl")),
             "A second bootstrap attempt must adopt the live node and initialize its isolated schema.",
         )
 
@@ -186,7 +223,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             listOf(staleLeaseRecoveryReady),
             TimeUnit.SECONDS.toNanos(5L),
         )
-        check(staleLeaseRecoveryReady.isFile && staleLeaseRecoveryReady.length() > 0L) {
+        check(staleLeaseRecoveryReady.isFile) {
             "A new JVM did not purge the killed holder's stale lease and adopt the live node; output:\n" +
                 File(privateTemp, "child-stale-lease-recovery.log")
                     .takeIf(File::isFile)?.readText().orEmpty()
@@ -203,8 +240,17 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             staleLease.exists(),
             "A new acquisition must purge stale lease ${staleLease.absolutePath}.",
         )
-        assertDurableSchemaReady(
-            staleLeaseRecoveryReady.readText().trim(),
+        val staleLeaseRecoveryProperties = Properties().apply {
+            staleLeaseRecoveryReady.inputStream().use(::load)
+        }
+        observedIdentities +=
+            requireNotNull(staleLeaseRecoveryProperties.getProperty("daemonPid")).toLong() to
+            requireNotNull(staleLeaseRecoveryProperties.getProperty("daemonStartedAtMillis")).toLong()
+        observedIdentities +=
+            requireNotNull(staleLeaseRecoveryProperties.getProperty("cockroachPid")).toLong() to
+            requireNotNull(staleLeaseRecoveryProperties.getProperty("cockroachStartedAtMillis")).toLong()
+        assertDurableSchemaInitialized(
+            requireNotNull(staleLeaseRecoveryProperties.getProperty("jdbcUrl")),
             "The acquisition that purges a stale lease must initialize its isolated schema.",
         )
 
@@ -213,6 +259,12 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         }
         assertTrue(originalNode.destroyForcibly(), "Could not kill elected CockroachDB process $originalPid.")
         originalNode.onExit().get(10L, TimeUnit.SECONDS)
+        assertFalse(
+            originalNode.isAlive,
+            "CockroachDB ProcessHandle.onExit completed for PID $originalPid, but the same handle " +
+                "still reported isAlive=true with command=" +
+                originalNode.info().command().orElse("<missing>") + ".",
+        )
 
         val recoveryReady = File(privateTemp, "ready-recovery")
         val recoveryRelease = File(privateTemp, "release-recovery")
@@ -238,11 +290,28 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             listOf(recoveryReady),
             TimeUnit.SECONDS.toNanos(20L),
         )
-        check(recoveryReady.isFile && recoveryReady.length() > 0L) {
+        check(recoveryReady.isFile) {
             "A new JVM did not replace the crashed shared CockroachDB node; output:\n" +
-                File(privateTemp, "child-recovery.log").takeIf(File::isFile)?.readText().orEmpty()
+                File(privateTemp, "child-recovery.log").takeIf(File::isFile)?.readText().orEmpty() +
+                "\nManaged state evidence:\n" +
+                managedStateDirectory!!.walkTopDown().joinToString("\n") { evidence ->
+                    if (evidence.isFile && evidence.length() < 32_768L) {
+                        "${evidence.absolutePath}:\n${evidence.readText()}"
+                    } else {
+                        evidence.absolutePath
+                    }
+                }
         }
-        val recoveredJdbcUrl = recoveryReady.readText().trim()
+        val recoveryProperties = Properties().apply {
+            recoveryReady.inputStream().use(::load)
+        }
+        observedIdentities +=
+            requireNotNull(recoveryProperties.getProperty("daemonPid")).toLong() to
+            requireNotNull(recoveryProperties.getProperty("daemonStartedAtMillis")).toLong()
+        observedIdentities +=
+            requireNotNull(recoveryProperties.getProperty("cockroachPid")).toLong() to
+            requireNotNull(recoveryProperties.getProperty("cockroachStartedAtMillis")).toLong()
+        val recoveredJdbcUrl = requireNotNull(recoveryProperties.getProperty("jdbcUrl"))
         val recoveredPid = Properties().apply {
             stateFile.inputStream().use(::load)
         }.getProperty("pid").toLong()
@@ -283,8 +352,12 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "Final lease release must remove shared node state at ${stateFile.absolutePath}.",
         )
         assertFalse(
-            File(stateFile.parentFile, "node-starting.properties").exists(),
-            "Final lease release must remove in-progress node state.",
+            File(stateFile.parentFile, "node-owner.properties").exists(),
+            "Final lease release must remove the durable owner claim.",
+        )
+        assertFalse(
+            File(stateFile.parentFile, "node-heartbeat.properties").exists(),
+            "Final lease release must remove the daemon ownership heartbeat.",
         )
         assertTrue(
             leasesDirectory.listFiles().orEmpty().none { it.isFile },
@@ -297,11 +370,23 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "Final lease release must remove every node-* work directory from " +
                 "${stateFile.parentFile.absolutePath}.",
         )
+        observedIdentities.forEach { (pid, startedAtMillis) ->
+            val sameProcessIsAlive = ProcessHandle.of(pid).map { handle ->
+                handle.isAlive &&
+                    handle.info().startInstant().orElse(null)?.toEpochMilli() == startedAtMillis
+            }.orElse(false)
+            assertFalse(
+                sameProcessIsAlive,
+                "Every observed fixture daemon and CockroachDB identity must be dead after final " +
+                    "release, but PID $pid started at $startedAtMillis was still alive.",
+            )
+        }
     } catch (failure: Throwable) {
         testFailure = failure
         throw failure
     } finally {
         val cleanupFailures = mutableListOf<Throwable>()
+        val cleanupRoot = privateTemp
         releases.forEach { release ->
             try {
                 release.writeText("release")
@@ -321,20 +406,23 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
                 cleanupFailures += failure
             }
         }
-        val stateDirectory = File(
-            privateTemp,
-            "simplefilesystem-durable-shared-cockroach-v1",
-        )
-        if (stateDirectory.isDirectory) {
+        var fixtureProcessesConfirmedDead = processes.none(Process::isAlive)
+        val stateDirectory = managedStateDirectory
+        if (stateDirectory != null && stateDirectory.isDirectory) {
             try {
                 cleanupCrossProcessFixtureProcesses(stateDirectory)
             } catch (failure: Throwable) {
+                fixtureProcessesConfirmedDead = false
                 cleanupFailures += failure
             }
         }
-        if (privateTemp.exists() && !privateTemp.deleteRecursively()) {
+        if (fixtureProcessesConfirmedDead &&
+            cleanupRoot != null &&
+            cleanupRoot.exists() &&
+            !cleanupRoot.deleteRecursively()
+        ) {
             cleanupFailures += IllegalStateException(
-                "Could not delete private cross-process test directory ${privateTemp.absolutePath}.",
+                "Could not delete private cross-process test directory ${cleanupRoot.absolutePath}.",
             )
         }
         val primaryFailure = testFailure
@@ -363,10 +451,9 @@ fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
         parent.toPath().register(
             watcher,
             StandardWatchEventKinds.ENTRY_CREATE,
-            StandardWatchEventKinds.ENTRY_MODIFY,
         )
         val deadline = System.nanoTime() + timeoutNanos
-        while (readyFiles.any { !it.isFile || it.length() == 0L }) {
+        while (readyFiles.any { !it.isFile }) {
             val remaining = deadline - System.nanoTime()
             if (remaining <= 0L) return
             val key = watcher.poll(remaining, TimeUnit.NANOSECONDS) ?: return
@@ -380,35 +467,43 @@ fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
 
 fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
     val identities = linkedSetOf<Pair<Long, Long>>()
+    val failures = mutableListOf<Throwable>()
     fun record(file: File, pidKey: String, startedAtKey: String) {
         if (!file.isFile) return
-        val properties = Properties().apply {
-            file.inputStream().use(::load)
+        try {
+            val properties = Properties().apply {
+                file.inputStream().use(::load)
+            }
+            val pidValue = properties.getProperty(pidKey)
+                ?: throw IllegalStateException(
+                    "Fixture identity file ${file.absolutePath} did not contain $pidKey.",
+                )
+            val startedAtValue = properties.getProperty(startedAtKey)
+                ?: throw IllegalStateException(
+                    "Fixture identity file ${file.absolutePath} contained $pidKey='$pidValue' " +
+                        "without $startedAtKey.",
+                )
+            val pid = pidValue.toLongOrNull()
+                ?: throw IllegalStateException(
+                    "Fixture identity file ${file.absolutePath} contained non-numeric " +
+                        "$pidKey='$pidValue'.",
+                )
+            val startedAt = startedAtValue.toLongOrNull()
+                ?: throw IllegalStateException(
+                    "Fixture identity file ${file.absolutePath} contained non-numeric " +
+                        "$startedAtKey='$startedAtValue'.",
+                )
+            identities += pid to startedAt
+        } catch (failure: Throwable) {
+            failures += failure
         }
-        val pidValue = properties.getProperty(pidKey) ?: return
-        val startedAtValue = properties.getProperty(startedAtKey)
-            ?: throw IllegalStateException(
-                "Fixture identity file ${file.absolutePath} contained $pidKey='$pidValue' " +
-                    "without $startedAtKey.",
-            )
-        val pid = pidValue.toLongOrNull()
-            ?: throw IllegalStateException(
-                "Fixture identity file ${file.absolutePath} contained non-numeric " +
-                    "$pidKey='$pidValue'.",
-            )
-        val startedAt = startedAtValue.toLongOrNull()
-            ?: throw IllegalStateException(
-                "Fixture identity file ${file.absolutePath} contained non-numeric " +
-                    "$startedAtKey='$startedAtValue'.",
-            )
-        identities += pid to startedAt
     }
 
     val nodeState = File(stateDirectory, "node.properties")
     record(nodeState, "daemonPid", "daemonStartedAtMillis")
     record(nodeState, "pid", "processStartedAtMillis")
     record(
-        File(stateDirectory, "node-starting.properties"),
+        File(stateDirectory, "node-owner.properties"),
         "daemonPid",
         "daemonStartedAtMillis",
     )
@@ -419,18 +514,34 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
             record(File(workDirectory, "cockroach.properties"), "pid", "startedAtMillis")
         }
     identities.forEach { (pid, startedAtMillis) ->
-        val handle = ProcessHandle.of(pid).orElse(null)
-        if (handle != null &&
-            handle.isAlive &&
-            handle.info().startInstant().orElse(null)?.toEpochMilli() == startedAtMillis
-        ) {
-            handle.destroyForcibly()
-            handle.onExit().get(10L, TimeUnit.SECONDS)
+        try {
+            val handle = ProcessHandle.of(pid).orElse(null)
+            if (handle != null &&
+                handle.isAlive &&
+                handle.info().startInstant().orElse(null)?.toEpochMilli() == startedAtMillis
+            ) {
+                handle.destroyForcibly()
+                handle.onExit().get(10L, TimeUnit.SECONDS)
+                check(!handle.isAlive) {
+                    "Fixture process $pid started at $startedAtMillis remained alive after " +
+                        "forcible cleanup."
+                }
+            }
+        } catch (failure: Throwable) {
+            failures += failure
         }
+    }
+    if (failures.isNotEmpty()) {
+        val failure = IllegalStateException(
+            "Cross-process fixture cleanup failed ${failures.size} time(s); the state directory " +
+                "${stateDirectory.absolutePath} was preserved with its process identity evidence.",
+        )
+        failures.forEach(failure::addSuppressed)
+        throw failure
     }
 }
 
-fun assertDurableSchemaReady(jdbcUrl: String, message: String) {
+fun assertDurableSchemaInitialized(jdbcUrl: String, message: String) {
     DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
         connection.createStatement().use { statement ->
             statement.executeQuery(
