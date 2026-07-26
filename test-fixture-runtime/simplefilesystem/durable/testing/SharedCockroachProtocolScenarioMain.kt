@@ -821,6 +821,7 @@ private class ScenarioHarness(
         val log = File(runFiles, "$name.log")
         val processBuilder = ProcessBuilder(
             javaBinary.absolutePath,
+            *SHARED_COCKROACH_CHILD_JVM_ARGUMENTS.toTypedArray(),
             "-Djava.io.tmpdir=${root.absolutePath}",
             "-cp",
             fixtureJar.absolutePath,

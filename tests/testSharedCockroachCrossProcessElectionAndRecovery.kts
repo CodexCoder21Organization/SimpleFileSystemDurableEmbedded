@@ -38,6 +38,9 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             releases += release
             val process = ProcessBuilder(
                 javaBinary,
+                "-XX:+UseSerialGC",
+                "-XX:ActiveProcessorCount=1",
+                "-XX:TieredStopAtLevel=1",
                 "-Djava.io.tmpdir=${privateTemp.absolutePath}",
                 "-cp",
                 fixtureJar,
@@ -123,6 +126,9 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         releases += stateRecoveryRelease
         val stateRecovery = ProcessBuilder(
             javaBinary,
+            "-XX:+UseSerialGC",
+            "-XX:ActiveProcessorCount=1",
+            "-XX:TieredStopAtLevel=1",
             "-Djava.io.tmpdir=${privateTemp.absolutePath}",
             "-cp",
             fixtureJar,
@@ -229,6 +235,9 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         releases += staleLeaseRecoveryRelease
         val staleLeaseRecovery = ProcessBuilder(
             javaBinary,
+            "-XX:+UseSerialGC",
+            "-XX:ActiveProcessorCount=1",
+            "-XX:TieredStopAtLevel=1",
             "-Djava.io.tmpdir=${privateTemp.absolutePath}",
             "-cp",
             fixtureJar,
@@ -295,6 +304,9 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         releases += recoveryRelease
         val recovery = ProcessBuilder(
             javaBinary,
+            "-XX:+UseSerialGC",
+            "-XX:ActiveProcessorCount=1",
+            "-XX:TieredStopAtLevel=1",
             "-Djava.io.tmpdir=${privateTemp.absolutePath}",
             "-cp",
             fixtureJar,

@@ -14,6 +14,11 @@ internal const val SHARED_COCKROACH_PROTOCOL_VERSION = "2"
 internal const val SHARED_COCKROACH_STARTUP_TIMEOUT_MILLIS = 120_000L
 internal const val SHARED_COCKROACH_HEARTBEAT_STALE_MILLIS = 120_000L
 internal const val SHARED_COCKROACH_PROCESS_STOP_SECONDS = 5L
+internal val SHARED_COCKROACH_CHILD_JVM_ARGUMENTS = listOf(
+    "-XX:+UseSerialGC",
+    "-XX:ActiveProcessorCount=1",
+    "-XX:TieredStopAtLevel=1",
+)
 
 internal fun sharedCockroachStateDirectory(): File {
     val workspace = File(System.getProperty("user.dir")).canonicalFile

@@ -333,6 +333,7 @@ private object SharedCockroachNode {
             "/usr/bin/setsid",
             javaBinary.absolutePath,
             "-Xmx128m",
+            *SHARED_COCKROACH_CHILD_JVM_ARGUMENTS.toTypedArray(),
             "-cp",
             fixtureJar.absolutePath,
             "simplefilesystem.durable.testing.SharedCockroachNodeDaemonMainKt",
