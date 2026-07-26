@@ -241,7 +241,7 @@ private object SharedCockroachNode {
                 when (outcome) {
                     is Acquisition.Ready -> return outcome.node.toAcquisition()
                     is Acquisition.Starting -> {
-                        val ready = waitForReadyNode(outcome, clock)
+                        val ready = waitForReadyNode(outcome, clock, fixtureControl)
                         if (ready != null) return ready.toAcquisition()
                     }
                 }
@@ -340,6 +340,7 @@ private object SharedCockroachNode {
     private fun waitForReadyNode(
         starting: Acquisition.Starting,
         clock: Clock,
+        fixtureControl: SharedCockroachFixtureControl?,
     ): ManagedNodeAcquisitionRecord? {
         FileSystems.getDefault().newWatchService().use { watcher ->
             stateDirectory.toPath().register(
