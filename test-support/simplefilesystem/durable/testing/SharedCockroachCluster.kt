@@ -620,8 +620,13 @@ private object SharedCockroachNode {
     }
 
     private fun <T> withStateLock(block: () -> T): T = synchronized(processLocalLock) {
-        check(stateDirectory.isDirectory || stateDirectory.mkdirs()) {
-            "Could not create shared CockroachDB state directory ${stateDirectory.absolutePath}"
+        if (!stateDirectory.isDirectory) {
+            stateDirectory.mkdirs()
+        }
+        check(stateDirectory.isDirectory) {
+            "Could not create shared CockroachDB state directory ${stateDirectory.absolutePath}; " +
+                "path exists=${stateDirectory.exists()} and " +
+                "isDirectory=${stateDirectory.isDirectory}."
         }
         RandomAccessFile(lockFile, "rw").use { lockAccess ->
             lockAccess.channel.lock().use {
