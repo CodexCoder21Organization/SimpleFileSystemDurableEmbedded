@@ -6,8 +6,10 @@ import java.io.Closeable
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.file.ClosedWatchServiceException
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileSystems
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.nio.file.StandardWatchEventKinds
 import java.sql.DriverManager
 import java.time.Instant
@@ -161,6 +163,7 @@ private object SharedCockroachNode {
     private val heartbeatFile get() = File(stateDirectory, "node-heartbeat.properties")
     private val failureFile get() = File(stateDirectory, "node-failure.properties")
     private val leasesDirectory get() = File(stateDirectory, "leases")
+    private val quarantineDirectory get() = File(stateDirectory, "quarantine")
 
     fun acquire(
         leaseName: String,
@@ -171,7 +174,7 @@ private object SharedCockroachNode {
         try {
             while (true) {
                 val outcome = withStateLock {
-                    validateProtocolNamespace()
+                    quarantineUnknownProtocolRecords()
                     purgeStaleLeases()
                     readOwnerClaim()?.let { recordedOwner ->
                         readStartupFailure(recordedOwner.token)?.let { startupFailure ->
@@ -267,7 +270,7 @@ private object SharedCockroachNode {
         leaseName: String,
         fixtureControl: SharedCockroachFixtureControl?,
     ) = withStateLock {
-        validateProtocolNamespace()
+        quarantineUnknownProtocolRecords()
         deleteIfPresent(File(leasesDirectory, leaseName), "shared CockroachDB lease")
         purgeStaleLeases()
         reconcileOwner()
@@ -360,7 +363,7 @@ private object SharedCockroachNode {
             while (true) {
                 var ownerStillStarting = true
                 val ready = withStateLock {
-                    validateProtocolNamespace()
+                    quarantineUnknownProtocolRecords()
                     readOwnerClaim()?.takeIf { it.token == starting.token }?.let { recordedOwner ->
                         readStartupFailure(starting.token)?.let { startupFailure ->
                             throw startupFailureException(
@@ -985,29 +988,77 @@ private object SharedCockroachNode {
         }
     }
 
-    private fun validateProtocolNamespace() {
-        loadVersionedProperties(ownerFile, "shared CockroachDB owner claim")
-        loadVersionedProperties(stateFile, "shared CockroachDB node state")
-        loadVersionedProperties(warmupProofFile, "shared CockroachDB warmup proof")
-        loadVersionedProperties(heartbeatFile, "shared CockroachDB heartbeat")
-        loadVersionedProperties(failureFile, "shared CockroachDB startup failure")
+    private fun quarantineUnknownProtocolRecords() {
+        quarantineIfUnknown(ownerFile, "shared CockroachDB owner claim")
+        quarantineIfUnknown(stateFile, "shared CockroachDB node state")
+        quarantineIfUnknown(warmupProofFile, "shared CockroachDB warmup proof")
+        quarantineIfUnknown(heartbeatFile, "shared CockroachDB heartbeat")
+        quarantineIfUnknown(failureFile, "shared CockroachDB startup failure")
         leasesDirectory.listFiles().orEmpty()
             .filter { it.isFile && !isAtomicStagingFile(it) }
             .forEach { lease ->
-            loadVersionedProperties(lease, "shared CockroachDB lease")
-        }
+                quarantineIfUnknown(lease, "shared CockroachDB lease")
+            }
         stateDirectory.listFiles().orEmpty()
             .filter { it.isDirectory && it.name.startsWith("node-") }
             .forEach { workDirectory ->
-                loadVersionedProperties(
+                quarantineIfUnknown(
                     File(workDirectory, "daemon.properties"),
                     "shared CockroachDB daemon identity",
                 )
-                loadVersionedProperties(
+                quarantineIfUnknown(
                     File(workDirectory, "cockroach.properties"),
                     "shared CockroachDB process identity",
                 )
             }
+    }
+
+    private fun quarantineIfUnknown(file: File, description: String) {
+        if (!file.isFile) return
+        val properties = try {
+            Properties().apply {
+                file.inputStream().use(::load)
+            }
+        } catch (failure: Exception) {
+            throw IllegalStateException(
+                "Could not inspect $description at ${file.absolutePath} for protocol quarantine: " +
+                    failure.message,
+                failure,
+            )
+        }
+        val foundVersion = properties.getProperty("protocolVersion") ?: "<missing>"
+        if (foundVersion == SHARED_COCKROACH_PROTOCOL_VERSION) return
+        val safeVersion = foundVersion.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        val versionDirectory = File(quarantineDirectory, "protocol-$safeVersion")
+        check(versionDirectory.isDirectory || versionDirectory.mkdirs()) {
+            "Could not create shared CockroachDB protocol quarantine directory " +
+                versionDirectory.absolutePath
+        }
+        val target = File(
+            versionDirectory,
+            "${UUID.randomUUID()}-${file.parentFile.name}-${file.name}",
+        )
+        try {
+            Files.move(
+                file.toPath(),
+                target.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+            )
+        } catch (failure: AtomicMoveNotSupportedException) {
+            throw IllegalStateException(
+                "Cannot quarantine unknown-version $description ${file.absolutePath} at " +
+                    "${target.absolutePath}: the filesystem does not support the required " +
+                    "ATOMIC_MOVE operation. The unknown record was left unchanged.",
+                failure,
+            )
+        } catch (failure: Exception) {
+            throw IllegalStateException(
+                "Could not quarantine unknown-version $description ${file.absolutePath} at " +
+                    "${target.absolutePath}: ${failure.message}. The unknown record was left " +
+                    "unchanged.",
+                failure,
+            )
+        }
     }
 
     private fun readOwnerClaim(): SharedCockroachOwnerClaim? {

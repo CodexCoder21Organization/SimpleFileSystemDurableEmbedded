@@ -23,7 +23,7 @@ internal fun sharedCockroachStateDirectory(): File {
         .take(16)
     return File(
         System.getProperty("java.io.tmpdir"),
-        "simplefilesystem-durable-shared-cockroach-v2-$digest",
+        "simplefilesystem-durable-shared-cockroach-v$SHARED_COCKROACH_PROTOCOL_VERSION-$digest",
     )
 }
 

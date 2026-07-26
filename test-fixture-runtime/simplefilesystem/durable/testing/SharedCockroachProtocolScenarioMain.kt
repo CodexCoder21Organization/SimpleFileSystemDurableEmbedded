@@ -599,6 +599,13 @@ private class ScenarioHarness(
         check(firstState != secondState) {
             "Independent workspaces shared state namespace ${firstState.absolutePath}."
         }
+        listOf(firstReady to firstState, secondReady to secondState).forEach { (ready, state) ->
+            val protocolVersion = required(ready, "protocolVersion", state)
+            check("-v$protocolVersion-" in state.name) {
+                "Shared state directory ${state.absolutePath} did not derive its namespace suffix " +
+                    "from protocolVersion='$protocolVersion'."
+            }
+        }
         check(required(firstReady, "token", first.readyFile) !=
             required(secondReady, "token", second.readyFile)
         ) {
@@ -615,22 +622,37 @@ private class ScenarioHarness(
             foreign.outputStream().use { values.store(it, null) }
         }
         val contender = startProbe("foreign-version", workspace = workspaceB)
-        val contenderExit = contender.awaitExit()
-        check(contenderExit != 0 && !contender.readyFile.exists()) {
-            "A claimant adopted or overwrote an unknown protocol-version record."
+        val contenderReady = contender.awaitReady()
+        check(
+            required(contenderReady, "token", contender.readyFile) ==
+                required(secondReady, "token", second.readyFile),
+        ) {
+            "An unknown-version lease stranded the known protocol owner instead of being " +
+                "quarantined."
         }
-        val foreignOutput = contender.logFile.readText()
-        check("version '999'" in foreignOutput && "requires version '2'" in foreignOutput) {
-            "Unknown-version failure did not name found version 999 and expected version 2:\n" +
-                foreignOutput
+        check(!foreign.exists()) {
+            "Unknown protocol-version record ${foreign.absolutePath} remained a namespace poison " +
+                "pill instead of moving to quarantine."
         }
-        check(properties(foreign).getProperty("sentinel") == "must-remain") {
-            "Unknown protocol-version record ${foreign.absolutePath} was modified."
+        val quarantined = File(secondState, "quarantine")
+            .walkTopDown()
+            .filter { it.isFile && it.name.endsWith("-leases-foreign-protocol") }
+            .toList()
+        check(quarantined.size == 1) {
+            "Expected one preserved unknown-version lease in ${File(secondState, "quarantine")}, " +
+                "but found ${quarantined.map(File::getAbsolutePath)}."
+        }
+        val quarantinedProperties = Properties().apply {
+            quarantined.single().inputStream().use(::load)
+        }
+        check(
+            quarantinedProperties.getProperty("protocolVersion") == "999" &&
+                quarantinedProperties.getProperty("sentinel") == "must-remain"
+        ) {
+            "Quarantined unknown-version record ${quarantined.single().absolutePath} was modified."
         }
         assertUsable(required(secondReady, "jdbcUrl", second.readyFile))
-        check(foreign.delete()) {
-            "Could not remove test-owned unknown-version record ${foreign.absolutePath}."
-        }
+        contender.releaseAndAwait()
 
         val firstDaemon = readyIdentity(firstReady, first.readyFile, "daemon")
         val secondDaemon = readyIdentity(secondReady, second.readyFile, "daemon")
