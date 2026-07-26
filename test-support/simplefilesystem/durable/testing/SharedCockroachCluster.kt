@@ -904,18 +904,25 @@ private object SharedCockroachNode {
             "Cannot stop shared CockroachDB process group $recordedProcessGroupId because its " +
                 "verified leader PID was ${groupLeader.pid}."
         }
-        if (groupLeader.liveHandle() == null) return
-        val actualProcessGroupId = processGroupId(
-            groupLeader,
-            "shared CockroachDB recorded process-group leader",
-        )
-        check(actualProcessGroupId == recordedProcessGroupId) {
-            "Cannot stop recorded shared CockroachDB process group $recordedProcessGroupId because " +
-                "its verified leader PID ${groupLeader.pid} started at ${groupLeader.startedAt} " +
-                "currently belongs to process group $actualProcessGroupId."
-        }
         val members = liveProcessGroupMembers(recordedProcessGroupId)
         if (members.isEmpty()) return
+        val liveLeader = groupLeader.liveHandle()
+        if (liveLeader != null) {
+            val actualProcessGroupId = processGroupId(
+                groupLeader,
+                "shared CockroachDB recorded process-group leader",
+            )
+            check(actualProcessGroupId == recordedProcessGroupId) {
+                "Cannot stop recorded shared CockroachDB process group $recordedProcessGroupId " +
+                    "because its verified leader PID ${groupLeader.pid} started at " +
+                    "${groupLeader.startedAt} currently belongs to process group " +
+                    "$actualProcessGroupId."
+            }
+        } else if (members.any { it.identity.pid == recordedProcessGroupId }) {
+            // The recorded leader identity is dead but its PID now leads a live group, proving
+            // reuse. Those processes are not owned by this record and must not be signalled.
+            return
+        }
         val kill = ProcessBuilder(
             "/bin/kill",
             "-KILL",
