@@ -27,11 +27,14 @@ scripts/test.bash --test . --log test_log_file.xml
 ```
 
 The test-support library also starts that shared node lazily when tests are dispatched directly
-instead of through `scripts/test.bash`. A cross-process lock ensures the independently forked test
-JVMs converge on one memory-bounded CockroachDB process, while per-test leases keep the process
-alive until every isolated logical database is finished. Direct dispatch retains those uniquely
-named databases only until the disposable in-memory node stops after its final lease; a
-caller-supplied longer-lived fixture drops each logical database when its test closes.
+instead of through `scripts/test.bash`. A cross-process lock elects a detached fixture daemon, then
+forked test JVMs wait on its atomic readiness state without holding the lock through CockroachDB
+startup. Before publishing readiness, both launch paths run the production schema bootstrap in a
+throwaway database so concurrent test databases reach a warm SQL layer. Per-test leases keep the
+memory-bounded process alive until every isolated logical database is finished, and the final
+lease removes the daemon, node, state, and work directory. Direct dispatch retains uniquely named
+databases only until that disposable node stops; a caller-supplied longer-lived fixture drops each
+logical database when its test closes.
 
 ## Programmatic example
 

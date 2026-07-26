@@ -4,6 +4,7 @@ package simplefilesystem.durable
 
 import build.kotlin.annotations.MavenArtifactCoordinates
 import build.kotlin.jvm.BuildJar
+import build.kotlin.jvm.BuildKotlin
 import build.kotlin.jvm.Manifest
 import build.kotlin.jvm.MavenPrebuilt2
 import build.kotlin.jvm.buildSimpleKotlinMavenArtifact2
@@ -48,8 +49,28 @@ fun buildTestSupportMaven(): File = buildSimpleKotlinMavenArtifact2(
     compileDependencies = testSupportDependencies,
 )
 
+val fixtureRuntimeDependencies = dependencies + testSupportDependencies + listOf(
+    MavenPrebuilt2("sql:sql:0.0.2"),
+)
+
+fun buildCockroachTestFixtureRuntime(): File = BuildKotlin(
+    src = listOf(File("test-support"), File("test-fixture-runtime"))
+        .flatMap { sourceDirectory ->
+            sourceDirectory.walkTopDown()
+                .filter { it.isFile && it.extension == "kt" }
+                .toList()
+        }
+        .sortedBy(File::getPath),
+    classpath = resolveDependencies2(fixtureRuntimeDependencies) +
+        buildMaven(),
+    buildAsJar = true,
+)
+
 fun buildCockroachTestFixtureFatJar(): File = BuildJar(
     Manifest("simplefilesystem.durable.testing.CockroachSuiteFixtureMainKt"),
-    resolveDependencies2(testSupportDependencies).map { it.jar } +
-        buildTestSupportMaven().jar,
+    resolveDependencies2(fixtureRuntimeDependencies).map { it.jar } +
+        listOf(
+            buildMaven().jar,
+            buildCockroachTestFixtureRuntime(),
+        ),
 )
