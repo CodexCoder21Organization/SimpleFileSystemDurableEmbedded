@@ -6,7 +6,9 @@ package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
 import java.io.File
+import java.nio.file.FileSystems
 import java.nio.file.Files
+import java.nio.file.StandardWatchEventKinds
 import java.sql.DriverManager
 import java.util.Properties
 import java.util.concurrent.TimeUnit
@@ -48,10 +50,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             processes += process
         }
 
-        val readyDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20L)
-        while (readyFiles.any { !it.isFile || it.length() == 0L } && System.nanoTime() < readyDeadline) {
-            Thread.sleep(20L)
-        }
+        waitForCrossProcessReadyFiles(readyFiles, TimeUnit.SECONDS.toNanos(20L))
         readyFiles.forEachIndexed { index, ready ->
             check(ready.isFile && ready.length() > 0L) {
                 "Cross-process CockroachDB child $index did not become ready; output:\n" +
@@ -114,12 +113,10 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             }
             .start()
         processes += stateRecovery
-        val stateRecoveryDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L)
-        while ((!stateRecoveryReady.isFile || stateRecoveryReady.length() == 0L) &&
-            System.nanoTime() < stateRecoveryDeadline
-        ) {
-            Thread.sleep(20L)
-        }
+        waitForCrossProcessReadyFiles(
+            listOf(stateRecoveryReady),
+            TimeUnit.SECONDS.toNanos(5L),
+        )
         check(stateRecoveryReady.isFile && stateRecoveryReady.length() > 0L) {
             "A new JVM did not recover the live node from corrupt node state; output:\n" +
                 File(privateTemp, "child-state-recovery.log").takeIf(File::isFile)?.readText().orEmpty()
@@ -185,12 +182,10 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             }
             .start()
         processes += staleLeaseRecovery
-        val staleLeaseRecoveryDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L)
-        while ((!staleLeaseRecoveryReady.isFile || staleLeaseRecoveryReady.length() == 0L) &&
-            System.nanoTime() < staleLeaseRecoveryDeadline
-        ) {
-            Thread.sleep(20L)
-        }
+        waitForCrossProcessReadyFiles(
+            listOf(staleLeaseRecoveryReady),
+            TimeUnit.SECONDS.toNanos(5L),
+        )
         check(staleLeaseRecoveryReady.isFile && staleLeaseRecoveryReady.length() > 0L) {
             "A new JVM did not purge the killed holder's stale lease and adopt the live node; output:\n" +
                 File(privateTemp, "child-stale-lease-recovery.log")
@@ -239,12 +234,10 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             .start()
         processes += recovery
 
-        val recoveryDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20L)
-        while ((!recoveryReady.isFile || recoveryReady.length() == 0L) &&
-            System.nanoTime() < recoveryDeadline
-        ) {
-            Thread.sleep(20L)
-        }
+        waitForCrossProcessReadyFiles(
+            listOf(recoveryReady),
+            TimeUnit.SECONDS.toNanos(20L),
+        )
         check(recoveryReady.isFile && recoveryReady.length() > 0L) {
             "A new JVM did not replace the crashed shared CockroachDB node; output:\n" +
                 File(privateTemp, "child-recovery.log").takeIf(File::isFile)?.readText().orEmpty()
@@ -328,21 +321,13 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
                 cleanupFailures += failure
             }
         }
-        val stateFile = File(
+        val stateDirectory = File(
             privateTemp,
-            "simplefilesystem-durable-shared-cockroach-v1/node.properties",
+            "simplefilesystem-durable-shared-cockroach-v1",
         )
-        if (stateFile.isFile) {
+        if (stateDirectory.isDirectory) {
             try {
-                val nodePid = Properties().apply {
-                    stateFile.inputStream().use(::load)
-                }.getProperty("pid").toLong()
-                ProcessHandle.of(nodePid).ifPresent { node ->
-                    if (node.isAlive) {
-                        node.destroyForcibly()
-                        node.onExit().get(10L, TimeUnit.SECONDS)
-                    }
-                }
+                cleanupCrossProcessFixtureProcesses(stateDirectory)
             } catch (failure: Throwable) {
                 cleanupFailures += failure
             }
@@ -361,6 +346,86 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             )
             cleanupFailures.forEach(cleanupFailure::addSuppressed)
             throw cleanupFailure
+        }
+    }
+}
+
+fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
+    require(readyFiles.isNotEmpty()) {
+        "At least one cross-process readiness file is required, but the list was empty."
+    }
+    val parent = readyFiles.first().parentFile.canonicalFile
+    require(readyFiles.all { it.parentFile.canonicalFile == parent }) {
+        "Cross-process readiness files must share parent ${parent.absolutePath}, but were " +
+            readyFiles.joinToString { it.absolutePath }
+    }
+    FileSystems.getDefault().newWatchService().use { watcher ->
+        parent.toPath().register(
+            watcher,
+            StandardWatchEventKinds.ENTRY_CREATE,
+            StandardWatchEventKinds.ENTRY_MODIFY,
+        )
+        val deadline = System.nanoTime() + timeoutNanos
+        while (readyFiles.any { !it.isFile || it.length() == 0L }) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0L) return
+            val key = watcher.poll(remaining, TimeUnit.NANOSECONDS) ?: return
+            key.pollEvents()
+            if (!key.reset()) {
+                return
+            }
+        }
+    }
+}
+
+fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
+    val identities = linkedSetOf<Pair<Long, Long>>()
+    fun record(file: File, pidKey: String, startedAtKey: String) {
+        if (!file.isFile) return
+        val properties = Properties().apply {
+            file.inputStream().use(::load)
+        }
+        val pidValue = properties.getProperty(pidKey) ?: return
+        val startedAtValue = properties.getProperty(startedAtKey)
+            ?: throw IllegalStateException(
+                "Fixture identity file ${file.absolutePath} contained $pidKey='$pidValue' " +
+                    "without $startedAtKey.",
+            )
+        val pid = pidValue.toLongOrNull()
+            ?: throw IllegalStateException(
+                "Fixture identity file ${file.absolutePath} contained non-numeric " +
+                    "$pidKey='$pidValue'.",
+            )
+        val startedAt = startedAtValue.toLongOrNull()
+            ?: throw IllegalStateException(
+                "Fixture identity file ${file.absolutePath} contained non-numeric " +
+                    "$startedAtKey='$startedAtValue'.",
+            )
+        identities += pid to startedAt
+    }
+
+    val nodeState = File(stateDirectory, "node.properties")
+    record(nodeState, "daemonPid", "daemonStartedAtMillis")
+    record(nodeState, "pid", "processStartedAtMillis")
+    record(
+        File(stateDirectory, "node-starting.properties"),
+        "daemonPid",
+        "daemonStartedAtMillis",
+    )
+    stateDirectory.listFiles().orEmpty()
+        .filter { it.isDirectory && it.name.startsWith("node-") }
+        .forEach { workDirectory ->
+            record(File(workDirectory, "daemon.properties"), "pid", "startedAtMillis")
+            record(File(workDirectory, "cockroach.properties"), "pid", "startedAtMillis")
+        }
+    identities.forEach { (pid, startedAtMillis) ->
+        val handle = ProcessHandle.of(pid).orElse(null)
+        if (handle != null &&
+            handle.isAlive &&
+            handle.info().startInstant().orElse(null)?.toEpochMilli() == startedAtMillis
+        ) {
+            handle.destroyForcibly()
+            handle.onExit().get(10L, TimeUnit.SECONDS)
         }
     }
 }

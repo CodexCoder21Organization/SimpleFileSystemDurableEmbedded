@@ -147,7 +147,7 @@ private object SharedCockroachNode {
                 writeLease(leaseName)
                 return@withStateLock Acquisition.Ready(existing.jdbcUrl)
             }
-            if (recorded != null) {
+            if (recorded != null && !isLiveCockroach(recorded)) {
                 cleanupManagedNodeDirectory(recorded.workDirectory)
             }
 
@@ -304,6 +304,27 @@ private object SharedCockroachNode {
 
     private fun cleanupManagedNodeDirectories(preserve: File? = null) {
         val preserved = preserve?.let(::requireManagedWorkDirectory)
+        readProcessIdentity(
+            stateFile,
+            pidKey = "daemonPid",
+            startedAtKey = "daemonStartedAtMillis",
+        )?.let { identity ->
+            stopDaemonAndDescendants(identity, File(stateDirectory, "daemon.out"))
+        }
+        readProcessIdentity(
+            startingStateFile,
+            pidKey = "daemonPid",
+            startedAtKey = "daemonStartedAtMillis",
+        )?.let { identity ->
+            stopDaemonAndDescendants(identity, File(stateDirectory, "daemon.out"))
+        }
+        readProcessIdentity(
+            stateFile,
+            pidKey = "pid",
+            startedAtKey = "processStartedAtMillis",
+        )?.let { identity ->
+            stopProcess(identity, File(stateDirectory, "cockroach.out"))
+        }
         stateDirectory.listFiles().orEmpty()
             .filter { it.isDirectory && it.name.startsWith("node-") }
             .map(::requireManagedWorkDirectory)
@@ -313,19 +334,8 @@ private object SharedCockroachNode {
 
     private fun cleanupManagedNodeDirectory(workDirectory: File) {
         val daemonIdentity = readProcessIdentity(File(workDirectory, "daemon.properties"))
-        val daemonHandle = daemonIdentity?.liveHandle()
-        val descendants = daemonHandle?.descendants()?.use { handles ->
-            handles.iterator().asSequence().mapNotNull { handle ->
-                handle.info().startInstant().orElse(null)?.let { startedAt ->
-                    NodeProcessIdentity(handle.pid(), startedAt)
-                }
-            }.toList()
-        }.orEmpty()
         daemonIdentity?.let { identity ->
-            stopProcess(identity, File(workDirectory, "daemon.out"))
-        }
-        descendants.forEach { identity ->
-            stopProcess(identity, File(workDirectory, "cockroach.out"))
+            stopDaemonAndDescendants(identity, File(workDirectory, "daemon.out"))
         }
         readProcessIdentity(File(workDirectory, "cockroach.properties"))?.let { identity ->
             stopProcess(identity, File(workDirectory, "cockroach.out"))
@@ -335,6 +345,20 @@ private object SharedCockroachNode {
                 "Could not delete shared CockroachDB work directory " +
                     workDirectory.absolutePath,
             )
+        }
+    }
+
+    private fun stopDaemonAndDescendants(identity: NodeProcessIdentity, logFile: File) {
+        val descendants = identity.liveHandle()?.descendants()?.use { handles ->
+            handles.iterator().asSequence().mapNotNull { handle ->
+                handle.info().startInstant().orElse(null)?.let { startedAt ->
+                    NodeProcessIdentity(handle.pid(), startedAt)
+                }
+            }.toList()
+        }.orEmpty()
+        stopProcess(identity, logFile)
+        descendants.forEach { descendant ->
+            stopProcess(descendant, logFile)
         }
     }
 
@@ -365,6 +389,10 @@ private object SharedCockroachNode {
     }
 
     private fun isUsable(state: NodeState): Boolean = isLiveNode(state) && canConnect(state.jdbcUrl)
+
+    private fun isLiveCockroach(state: NodeState): Boolean =
+        NodeProcessIdentity(state.pid, state.processStartedAt).liveHandle() != null &&
+            canConnect(state.jdbcUrl)
 
     private fun isLiveNode(state: NodeState): Boolean =
         NodeProcessIdentity(state.pid, state.processStartedAt).liveHandle() != null &&
@@ -602,19 +630,25 @@ private object SharedCockroachNode {
             handle.info().startInstant().orElse(null)?.toEpochMilli() == startedAtMillis
     }
 
-    private fun readProcessIdentity(file: File): NodeProcessIdentity? {
+    private fun readProcessIdentity(
+        file: File,
+        pidKey: String = "pid",
+        startedAtKey: String = "startedAtMillis",
+    ): NodeProcessIdentity? {
         if (!file.isFile) return null
         return try {
             val properties = Properties().apply {
                 file.inputStream().use(::load)
             }
             NodeProcessIdentity(
-                pid = requireNotNull(properties.getProperty("pid")).toLong(),
+                pid = requireNotNull(properties.getProperty(pidKey)).toLong(),
                 startedAt = Instant.ofEpochMilli(
-                    requireNotNull(properties.getProperty("startedAtMillis")).toLong(),
+                    requireNotNull(properties.getProperty(startedAtKey)).toLong(),
                 ),
             )
         } catch (_: Exception) {
+            // Partial/corrupt state is recoverable through work-directory discovery. Without both
+            // PID and start time, no process can be terminated safely because the PID may be reused.
             null
         }
     }
