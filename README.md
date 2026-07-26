@@ -37,25 +37,27 @@ directory and its never-replaced lock file remain available for later runs. Dire
 uniquely named databases only until that disposable node stops; a caller-supplied longer-lived
 fixture drops each logical database when its test closes.
 
-The daemon atomically records a versioned warmup attestation immediately before readiness. A
-claimant may use that daemon-authored attestation to repair a malformed readiness record for the
-same live owner and process identities, but raw PID or listening-URL files never establish
-readiness and cannot bypass schema warmup.
+The daemon atomically records a versioned warmup attestation immediately before readiness. Node,
+warmup, lease, heartbeat, failure, owner, and work-directory records are parsed independently:
+malformed evidence is preserved and reported rather than treated as missing or stale. Raw PID or
+listening-URL files never establish readiness and cannot bypass schema warmup. Publication fails
+closed when the filesystem cannot provide `ATOMIC_MOVE`.
 
-Managed state uses protocol version 2 under `java.io.tmpdir`, scoped by the first 16 hexadecimal
-characters of SHA-256 over the canonical workspace root. Kompile gives every child test JVM in one
-run the same workspace working directory, so those children rendezvous while independent checkouts
-cannot share fixture records. Every durable record carries the protocol version; encountering any
-other version fails without adopting, overwriting, or tearing down that record.
+Managed state uses a `v<protocolVersion>` namespace under `java.io.tmpdir`, scoped by the first 16
+hexadecimal characters of SHA-256 over the canonical workspace root. Launcher-level tests verify
+that Kompile child JVMs in one run inherit the same canonical working directory, so those children
+rendezvous while independent checkouts cannot share fixture records. Every durable record carries
+the protocol version. Foreign-version records are atomically moved unchanged into a versioned
+quarantine, where they cannot poison acquisition or prevent known-version leases from releasing.
 
 The daemon ownership handshake prevents CockroachDB from starting until the daemon has atomically
-attached its PID and process-start time to the still-live pre-spawn election claim. Cooperative
-daemon shutdown kills the dedicated CockroachDB process group. An uncatchable daemon `SIGKILL`
-cannot run cleanup code, so immediate child cleanup is not promised in that case; a subsequent
-acquire or release recovers by detecting the dead owner or stale heartbeat, verifying PID plus
-start time, and reaping the recorded process group before replacement. This orphan mechanism also
-existed when the node was a direct child of a test JVM, although the detached daemon adds another
-process whose abrupt death must be recovered.
+attached its PID, process-start time, daemon-led process group, and absolute startup deadline to
+the still-live pre-spawn election claim. Every subsequently spawned CockroachDB child inherits that
+durably recorded group, including the interval immediately after process creation and before child
+identity publication. Heartbeats and readiness checks enforce the startup deadline until readiness
+exists. A subsequent acquire or release detects a dead owner or stale heartbeat, independently
+collects every durable process identity, verifies PID plus start time and group leadership, reaps
+all verified members, confirms them dead, and only then removes recovery evidence.
 
 ## Programmatic example
 
