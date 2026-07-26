@@ -109,14 +109,21 @@ private class ScenarioHarness(
 
     fun preReadinessDaemonCrash() = protect {
         marker("pause-cockroach-before-readiness")
+        marker("pause-waiter-after-readiness-check")
         val winner = startProbe("winner")
         val arrival = waitForPrefix(control, "cockroach-before-readiness-arrived-")
         val token = required(properties(arrival), "token", arrival)
         val firstDaemon = observation("daemon", token)
         val firstCockroach = observation("cockroach", token)
+        val waiterArrival = waitForPrefix(
+            control,
+            "waiter-after-readiness-check-arrived-",
+        )
         assertNoReadyState(onlyStateDirectory(), "CockroachDB-before-readiness barrier")
 
         killIdentity(firstDaemon)
+        releaseStateLockBarrier(waiterArrival)
+        removeMarker("pause-waiter-after-readiness-check")
         removeMarker("pause-cockroach-before-readiness")
         val replacement = startProbe("replacement")
         val replacementReady = replacement.awaitReady()
@@ -225,13 +232,20 @@ private class ScenarioHarness(
 
     fun warmupPublication() = protect {
         marker("pause-warmup")
+        marker("pause-waiter-after-readiness-check")
         val blocked = startProbe("warmup-blocked")
         waitForPrefix(control, "warmup-arrived-")
         val stateDirectory = onlyStateDirectory()
+        val waiterArrival = waitForPrefix(
+            control,
+            "waiter-after-readiness-check-arrived-",
+        )
         assertNoReadyState(stateDirectory, "production warmup barrier")
         check(!blocked.readyFile.exists()) {
             "Probe readiness ${blocked.readyFile.absolutePath} appeared before production warmup."
         }
+        releaseStateLockBarrier(waiterArrival)
+        removeMarker("pause-waiter-after-readiness-check")
         val warmupArrival = waitForPrefix(control, "warmup-arrived-")
         val token = required(properties(warmupArrival), "token", warmupArrival)
         marker(File(control, "warmup-release-$token"))
@@ -555,6 +569,13 @@ private class ScenarioHarness(
                 "Could not remove scenario control marker ${file.absolutePath}."
             }
         }
+    }
+
+    private fun releaseStateLockBarrier(arrival: File) {
+        val releaseName = arrival.name
+            .removeSuffix(".properties")
+            .replace("-arrived-", "-release-")
+        marker(File(control, releaseName))
     }
 
     private fun marker(file: File): File {

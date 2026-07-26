@@ -372,6 +372,10 @@ private object SharedCockroachNode {
                         if (node != null && isLiveNode(owner, node)) {
                             return@withStateLock ManagedNodeAcquisitionRecord(owner, node)
                         }
+                        waitAtStateLockBarrier(
+                            fixtureControl,
+                            "waiter-after-readiness-check",
+                        )
                         if (daemon.liveHandle() == null) ownerStillStarting = false
                     } else if (owner.electionOwner.liveHandle() == null) {
                         ownerStillStarting = false
