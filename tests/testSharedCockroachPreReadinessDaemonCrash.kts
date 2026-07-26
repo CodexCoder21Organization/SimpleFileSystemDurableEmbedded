@@ -2,9 +2,9 @@
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
-import simplefilesystem.durable.testing.SharedCockroachProtocolScenario
+import simplefilesystem.durable.testing.SharedCockroachProtocolV2Scenarios
 
 /** Proves a daemon killed after child spawn is reaped before one replacement is elected. */
 fun testSharedCockroachPreReadinessDaemonCrash() {
-    SharedCockroachProtocolScenario.run("pre-readiness-daemon-crash")
+    SharedCockroachProtocolV2Scenarios.run("pre-readiness-daemon-crash")
 }

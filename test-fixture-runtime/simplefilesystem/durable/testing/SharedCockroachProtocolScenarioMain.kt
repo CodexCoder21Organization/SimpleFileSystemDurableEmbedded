@@ -45,7 +45,7 @@ private class ScenarioHarness(
     private val root: File,
 ) : AutoCloseable {
     private val fixtureJar = File(
-        SharedCockroachProtocolScenario::class.java.protectionDomain.codeSource.location.toURI(),
+        SharedCockroachProtocolV2Scenarios::class.java.protectionDomain.codeSource.location.toURI(),
     )
     private val javaBinary = File(System.getProperty("java.home"), "bin/java")
     private val control = File(root, "control")
@@ -713,7 +713,7 @@ private class ScenarioHarness(
             }
         }
         try {
-            cleanupSharedCockroachScenarioEvidence(root, deleteRoot = false)
+            cleanupSharedCockroachProtocolV2ScenarioEvidence(root, deleteRoot = false)
         } catch (failure: Throwable) {
             failures += failure
         }

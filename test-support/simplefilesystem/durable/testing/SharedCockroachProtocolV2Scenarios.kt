@@ -7,10 +7,10 @@ import java.util.Properties
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
-/** Entry point and marker for the canonical protocol scenario executable in the fixture jar. */
-object SharedCockroachProtocolScenario {
+/** Entry point and marker for the protocol-v2 scenario executable in the fixture jar. */
+object SharedCockroachProtocolV2Scenarios {
     fun run(scenario: String) {
-        runSharedCockroachProtocolScenarioTest(scenario)
+        runSharedCockroachProtocolV2ScenarioTest(scenario)
     }
 }
 
@@ -20,14 +20,14 @@ object SharedCockroachProtocolScenario {
  * The child has no suite-fixture JDBC override, so every scenario exercises the workspace-scoped
  * detached-daemon protocol rather than the suite launcher's already-running CockroachDB node.
  */
-fun runSharedCockroachProtocolScenarioTest(scenario: String) {
+private fun runSharedCockroachProtocolV2ScenarioTest(scenario: String) {
     var root: File? = null
     var process: Process? = null
     var failure: Throwable? = null
     try {
         root = Files.createTempDirectory("shared-cockroach-$scenario-").toFile()
         val fixtureJar = File(
-            SharedCockroachProtocolScenario::class.java.protectionDomain.codeSource.location.toURI(),
+            SharedCockroachProtocolV2Scenarios::class.java.protectionDomain.codeSource.location.toURI(),
         )
         check(fixtureJar.isFile) {
             "The shared CockroachDB protocol scenario runtime must be a jar file, but was " +
@@ -77,7 +77,10 @@ fun runSharedCockroachProtocolScenarioTest(scenario: String) {
         }
         root?.let { scenarioRoot ->
             try {
-                cleanupSharedCockroachScenarioEvidence(scenarioRoot, deleteRoot = true)
+                cleanupSharedCockroachProtocolV2ScenarioEvidence(
+                    scenarioRoot,
+                    deleteRoot = true,
+                )
             } catch (cleanupFailure: Throwable) {
                 cleanupFailures += cleanupFailure
             }
@@ -99,7 +102,7 @@ fun runSharedCockroachProtocolScenarioTest(scenario: String) {
  * handled. Evidence is deleted only after every readable identity is confirmed dead and every
  * identity record was parseable.
  */
-internal fun cleanupSharedCockroachScenarioEvidence(root: File, deleteRoot: Boolean) {
+internal fun cleanupSharedCockroachProtocolV2ScenarioEvidence(root: File, deleteRoot: Boolean) {
     val failures = mutableListOf<Throwable>()
     val identities = linkedMapOf<Triple<Long, Long, Boolean>, ScenarioProcessIdentity>()
     root.walkTopDown()
