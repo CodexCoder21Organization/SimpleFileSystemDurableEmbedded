@@ -4,7 +4,6 @@ package simplefilesystem.durable
 
 import build.kotlin.annotations.MavenArtifactCoordinates
 import build.kotlin.jvm.BuildJar
-import build.kotlin.jvm.BuildKotlin
 import build.kotlin.jvm.Manifest
 import build.kotlin.jvm.MavenPrebuilt2
 import build.kotlin.jvm.buildSimpleKotlinMavenArtifact2
@@ -53,28 +52,20 @@ val fixtureRuntimeDependencies = dependencies + testSupportDependencies + listOf
     MavenPrebuilt2("sql:sql:0.0.2"),
 )
 
-val fixtureRuntimeSources = listOf(File("test-support"), File("test-fixture-runtime"))
-    .flatMap { sourceDirectory ->
-        sourceDirectory.walkTopDown()
-            .filter { it.isFile && it.extension == "kt" }
-            .toList()
-    }
-    .sortedBy(File::getPath)
-
-fun buildCockroachTestFixtureRuntime(): File = BuildKotlin(
-    src = fixtureRuntimeSources,
-    classpath = resolveDependencies2(fixtureRuntimeDependencies) +
-        buildMaven(),
-    buildAsJar = true,
+@MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-fixture-runtime:")
+fun buildCockroachTestFixtureRuntime(): File = buildSimpleKotlinMavenArtifact2(
+    coordinates = "simplefilesystem.durable:simplefilesystem-durable-test-fixture-runtime:0.1.2",
+    // This artifact deliberately compiles every repository-owned .kt source tree together. The
+    // fixture runtime invokes the current checkout's production warmup and protocol support, while
+    // this kompile toolchain cannot put sibling build-rule outputs on a *2 builder's classpath.
+    src = File("."),
+    compileDependencies = fixtureRuntimeDependencies,
 )
 
 fun buildCockroachTestFixtureFatJar(): File = BuildJar(
     Manifest("simplefilesystem.durable.testing.CockroachSuiteFixtureMainKt"),
     resolveDependencies2(fixtureRuntimeDependencies).map { it.jar } +
-        listOf(
-            buildMaven().jar,
-            buildCockroachTestFixtureRuntime(),
-        ),
+        buildCockroachTestFixtureRuntime().jar,
 )
 
 /**
