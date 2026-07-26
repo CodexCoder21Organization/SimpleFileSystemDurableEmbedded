@@ -442,7 +442,12 @@ private class ScenarioHarness(
 
     private fun observations(type: String): List<ScenarioIdentity> =
         control.listFiles().orEmpty()
-            .filter { it.isFile && it.name.startsWith("$type-") && it.name.endsWith(".properties") }
+            .filter {
+                it.isFile &&
+                    it.name.startsWith("$type-") &&
+                    "-arrived-" !in it.name &&
+                    it.name.endsWith(".properties")
+            }
             .map(::identity)
             .distinct()
 
