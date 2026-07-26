@@ -1,4 +1,4 @@
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable.buildCockroachProtocolScenarioFatJar()")
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
