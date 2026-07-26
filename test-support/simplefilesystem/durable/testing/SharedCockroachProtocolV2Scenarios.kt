@@ -1,7 +1,6 @@
 package simplefilesystem.durable.testing
 
 import java.io.File
-import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.time.Instant
 import java.util.Properties
@@ -11,35 +10,7 @@ import java.util.concurrent.TimeoutException
 /** Entry point and marker for the protocol-v2 scenario executable in the fixture jar. */
 object SharedCockroachProtocolV2Scenarios {
     fun run(scenario: String) {
-        withProtocolScenarioAdmission(scenario) {
-            runSharedCockroachProtocolV2ScenarioTest(scenario)
-        }
-    }
-}
-
-/**
- * Direct kompile dispatch starts four test JVMs on a two-CPU worker. These two stable lanes keep
- * this suite's scenarios plus the separately implemented cross-process test at no more than three
- * simultaneous real CockroachDB bootstraps, while retaining parallel coverage and keeping each
- * scenario's own contenders fully concurrent.
- */
-private fun <T> withProtocolScenarioAdmission(scenario: String, block: () -> T): T {
-    val lane = when (scenario) {
-        "deterministic-contention", "lease-and-pid-reuse-recovery",
-        "pre-readiness-daemon-crash", "warmup-publication" -> 0
-        "last-release-acquire-race", "pre-attach-owner-crash", "workspace-isolation" -> 1
-        else -> throw IllegalArgumentException(
-            "Unknown shared CockroachDB protocol scenario '$scenario' has no admission lane.",
-        )
-    }
-    val lockFile = File(
-        System.getProperty("java.io.tmpdir"),
-        "simplefilesystem-durable-protocol-scenario-lane-$lane.lock",
-    )
-    return RandomAccessFile(lockFile, "rw").use { access ->
-        access.channel.lock().use {
-            block()
-        }
+        runSharedCockroachProtocolV2ScenarioTest(scenario)
     }
 }
 
