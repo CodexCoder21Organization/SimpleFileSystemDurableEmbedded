@@ -182,7 +182,7 @@ private object SharedCockroachNode {
                     }
                     val owner = reconcileOwner()
                     val node = owner?.daemon?.let { daemon ->
-                        readOrRecoverNode(owner, daemon)
+                        readReadyNode(owner, daemon)
                     }
                     if (node != null && isLiveNode(owner, node)) {
                         writeLease(leaseName)
@@ -368,7 +368,7 @@ private object SharedCockroachNode {
                     }
                     val daemon = owner.daemon
                     if (daemon != null) {
-                        val node = readOrRecoverNode(owner, daemon)
+                        val node = readReadyNode(owner, daemon)
                         if (node != null && isLiveNode(owner, node)) {
                             return@withStateLock ManagedNodeAcquisitionRecord(owner, node)
                         }
@@ -473,45 +473,16 @@ private object SharedCockroachNode {
         return null
     }
 
-    private fun readOrRecoverNode(
+    private fun readReadyNode(
         owner: SharedCockroachOwnerClaim,
         daemon: SharedProcessIdentity,
     ): SharedCockroachNodeRecord? {
-        val recorded = readNodeRecord()
-        if (recorded != null &&
+        val recorded = readNodeRecord() ?: return null
+        return recorded.takeIf {
             recorded.token == owner.token &&
-            recorded.daemon == daemon &&
-            recorded.workDirectory == owner.workDirectory
-        ) {
-            return recorded
+                recorded.daemon == daemon &&
+                recorded.workDirectory == owner.workDirectory
         }
-        val cockroach = try {
-            readIdentity(
-                File(owner.workDirectory, "cockroach.properties"),
-                "shared CockroachDB process identity",
-                owner.token,
-            )
-        } catch (_: IllegalStateException) {
-            return null
-        } ?: return null
-        val listeningUrlFile = File(owner.workDirectory, "listening-url")
-        if (!listeningUrlFile.isFile || listeningUrlFile.length() == 0L) return null
-        val jdbcUrl = try {
-            listeningUrlToJdbcUrl(listeningUrlFile.readText().trim())
-        } catch (_: Exception) {
-            return null
-        }
-        if (!canConnect(jdbcUrl)) return null
-        val recovered = SharedCockroachNodeRecord(
-            token = owner.token,
-            cockroach = cockroach,
-            processGroupId = cockroach.pid,
-            daemon = daemon,
-            jdbcUrl = jdbcUrl,
-            workDirectory = owner.workDirectory,
-        )
-        writeNodeRecord(recovered)
-        return recovered
     }
 
     private fun isLiveNode(
@@ -829,28 +800,6 @@ private object SharedCockroachNode {
         }
     }
 
-    private fun writeNodeRecord(node: SharedCockroachNodeRecord) {
-        writePropertiesAtomically(
-            stateFile,
-            versionedProperties().apply {
-                setProperty("token", node.token)
-                setProperty("pid", node.cockroach.pid.toString())
-                setProperty(
-                    "processStartedAtMillis",
-                    node.cockroach.startedAt.toEpochMilli().toString(),
-                )
-                setProperty("processGroupId", node.processGroupId.toString())
-                setProperty("daemonPid", node.daemon.pid.toString())
-                setProperty(
-                    "daemonStartedAtMillis",
-                    node.daemon.startedAt.toEpochMilli().toString(),
-                )
-                setProperty("jdbcUrl", node.jdbcUrl)
-                setProperty("workDirectory", node.workDirectory.absolutePath)
-            },
-        )
-    }
-
     private fun readHeartbeat(): SharedCockroachHeartbeat? {
         val properties = loadVersionedProperties(
             heartbeatFile,
@@ -1013,20 +962,6 @@ private object SharedCockroachNode {
         )
     }
 
-    private fun canConnect(jdbcUrl: String): Boolean = try {
-        Class.forName("org.postgresql.Driver")
-        val boundedUrl = jdbcUrl + if (jdbcUrl.contains('?')) {
-            "&connectTimeout=2"
-        } else {
-            "?connectTimeout=2"
-        }
-        DriverManager.getConnection(boundedUrl, "root", "").use { connection ->
-            connection.isValid(2)
-        }
-    } catch (_: Exception) {
-        false
-    }
-
     private fun <T> withStateLock(block: () -> T): T = synchronized(processLocalLock) {
         if (!stateDirectory.isDirectory) stateDirectory.mkdirs()
         check(stateDirectory.isDirectory) {
@@ -1066,16 +1001,6 @@ private data class ManagedNodeAcquisition(
     val jdbcUrl: String,
     val diagnostics: SharedCockroachFixtureDiagnostics,
 )
-
-private fun listeningUrlToJdbcUrl(listeningUrl: String): String {
-    val match = Regex("""^postgresql://[^@]+@([^/]+)/([^?]+)(\?.*)?$""").matchEntire(listeningUrl)
-        ?: throw IllegalArgumentException(
-            "The CockroachDB listening URL must have the form " +
-                "postgresql://user@host:port/database?parameters, but was $listeningUrl",
-        )
-    return "jdbc:postgresql://${match.groupValues[1]}/${match.groupValues[2]}" +
-        match.groupValues[3]
-}
 
 private fun jdbcUrlForDatabase(adminJdbcUrl: String, databaseName: String): String {
     val match = Regex("""^(jdbc:postgresql://[^/]+)/[^?]+(\?.*)?$""").matchEntire(adminJdbcUrl)
