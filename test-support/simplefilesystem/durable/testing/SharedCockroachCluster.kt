@@ -457,7 +457,7 @@ private object SharedCockroachNode {
             val managedCockroachIsLive = if (!stateFile.isFile) {
                 true
             } else {
-                val readyNode = readNodeRecord()
+                val readyNode = readNodeRecord().valueOrThrow()
                 val managedIdentity =
                     readyNode?.takeIf {
                         it.token == owner.token &&
@@ -497,7 +497,20 @@ private object SharedCockroachNode {
         owner: SharedCockroachOwnerClaim,
         daemon: SharedProcessIdentity,
     ): SharedCockroachNodeRecord? {
-        val recorded = readNodeRecord()
+        val recordedResult = readNodeRecord()
+        val warmupResult = readWarmupProof()
+        val invalidRecords = listOf(recordedResult, warmupResult)
+            .filterIsInstance<RecordReadResult.Invalid>()
+            .map(RecordReadResult.Invalid::failure)
+        if (invalidRecords.isNotEmpty()) {
+            val failure = IllegalStateException(
+                "Shared CockroachDB readiness contained ${invalidRecords.size} invalid durable " +
+                    "record(s); every invalid record was preserved.",
+            )
+            invalidRecords.forEach(failure::addSuppressed)
+            throw failure
+        }
+        val recorded = recordedResult.valueOrThrow()
         if (recorded != null &&
             recorded.token == owner.token &&
             recorded.daemon == daemon &&
@@ -505,7 +518,7 @@ private object SharedCockroachNode {
         ) {
             return recorded
         }
-        val warmupProof = readWarmupProof() ?: return null
+        val warmupProof = warmupResult.valueOrThrow() ?: return null
         if (warmupProof.token != owner.token ||
             warmupProof.daemon != daemon ||
             warmupProof.workDirectory != owner.workDirectory
@@ -1158,48 +1171,57 @@ private object SharedCockroachNode {
         )
     }
 
-    private fun readNodeRecord(): SharedCockroachNodeRecord? =
+    private fun readNodeRecord(): RecordReadResult<SharedCockroachNodeRecord> =
         readNodeRecord(stateFile, "shared CockroachDB node state")
 
-    private fun readWarmupProof(): SharedCockroachNodeRecord? =
+    private fun readWarmupProof(): RecordReadResult<SharedCockroachNodeRecord> =
         readNodeRecord(warmupProofFile, "shared CockroachDB warmup proof")
 
     private fun readNodeRecord(
         file: File,
         description: String,
-    ): SharedCockroachNodeRecord? {
-        val properties = loadVersionedProperties(
-            file,
-            description,
-        ) ?: return null
+    ): RecordReadResult<SharedCockroachNodeRecord> {
+        if (!file.isFile) return RecordReadResult.Missing
         return try {
-            val jdbcUrl = requireNotNull(properties.getProperty("jdbcUrl"))
+            val properties = loadVersionedProperties(
+                file,
+                description,
+            ) ?: return RecordReadResult.Missing
+            val jdbcUrl = requiredProperty(properties, "jdbcUrl", file, description)
             jdbcUrlForDatabase(jdbcUrl, "state_validation")
-            SharedCockroachNodeRecord(
-                token = requireNotNull(properties.getProperty("token")),
-                cockroach = parseIdentity(
-                    properties,
-                    "pid",
-                    "processStartedAtMillis",
-                    description,
-                    file,
-                ),
-                processGroupId = requiredLong(properties, "processGroupId", file),
-                daemon = parseIdentity(
-                    properties,
-                    "daemonPid",
-                    "daemonStartedAtMillis",
-                    description,
-                    file,
-                ),
-                jdbcUrl = jdbcUrl,
-                workDirectory = requireManagedWorkDirectory(
-                    stateDirectory,
-                    File(requireNotNull(properties.getProperty("workDirectory"))),
+            RecordReadResult.Valid(
+                SharedCockroachNodeRecord(
+                    token = requiredProperty(properties, "token", file, description),
+                    cockroach = parseIdentity(
+                        properties,
+                        "pid",
+                        "processStartedAtMillis",
+                        description,
+                        file,
+                    ),
+                    processGroupId = requiredLong(properties, "processGroupId", file),
+                    daemon = parseIdentity(
+                        properties,
+                        "daemonPid",
+                        "daemonStartedAtMillis",
+                        description,
+                        file,
+                    ),
+                    jdbcUrl = jdbcUrl,
+                    workDirectory = requireManagedWorkDirectory(
+                        stateDirectory,
+                        File(requiredProperty(properties, "workDirectory", file, description)),
+                    ),
                 ),
             )
-        } catch (_: Exception) {
-            null
+        } catch (failure: Exception) {
+            RecordReadResult.Invalid(
+                IllegalStateException(
+                    "Invalid $description at ${file.absolutePath}: ${failure.message}. The record " +
+                        "was preserved.",
+                    failure,
+                ),
+            )
         }
     }
 
@@ -1307,30 +1329,50 @@ private object SharedCockroachNode {
         leasesDirectory.listFiles().orEmpty()
             .filter { it.isFile && !isAtomicStagingFile(it) }
             .forEach { lease ->
-            try {
-                val properties = loadVersionedProperties(
-                    lease,
-                    "shared CockroachDB lease",
-                ) ?: return@forEach
-                val identity = try {
-                    parseIdentity(
-                        properties,
-                        "pid",
-                        "startedAtMillis",
-                        "shared CockroachDB lease",
-                        lease,
-                    )
-                } catch (_: IllegalStateException) {
-                    null
+                when (val result = readLeaseIdentity(lease)) {
+                    RecordReadResult.Missing -> Unit
+                    is RecordReadResult.Invalid -> failures += result.failure
+                    is RecordReadResult.Valid -> {
+                        try {
+                            if (result.value.liveHandle() == null) {
+                                deleteIfPresent(lease, "stale shared CockroachDB lease")
+                            }
+                        } catch (failure: Throwable) {
+                            failures += failure
+                        }
+                    }
                 }
-                if (identity?.liveHandle() == null) {
-                    deleteIfPresent(lease, "stale shared CockroachDB lease")
-                }
-            } catch (failure: Throwable) {
-                failures += failure
-            }
             }
         throwCleanupFailures("stale shared CockroachDB lease purge", failures)
+    }
+
+    private fun readLeaseIdentity(
+        lease: File,
+    ): RecordReadResult<SharedProcessIdentity> {
+        if (!lease.isFile) return RecordReadResult.Missing
+        return try {
+            val properties = loadVersionedProperties(
+                lease,
+                "shared CockroachDB lease",
+            ) ?: return RecordReadResult.Missing
+            RecordReadResult.Valid(
+                parseIdentity(
+                    properties,
+                    "pid",
+                    "startedAtMillis",
+                    "shared CockroachDB lease",
+                    lease,
+                ),
+            )
+        } catch (failure: Exception) {
+            RecordReadResult.Invalid(
+                IllegalStateException(
+                    "Invalid shared CockroachDB lease at ${lease.absolutePath}: " +
+                        "${failure.message}. The lease was preserved.",
+                    failure,
+                ),
+            )
+        }
     }
 
     private fun waitAtStateLockBarrier(
@@ -1419,6 +1461,18 @@ private object SharedCockroachNode {
         failures.forEach(failure::addSuppressed)
         throw failure
     }
+}
+
+private sealed interface RecordReadResult<out T> {
+    data object Missing : RecordReadResult<Nothing>
+    data class Valid<T>(val value: T) : RecordReadResult<T>
+    data class Invalid(val failure: IllegalStateException) : RecordReadResult<Nothing>
+}
+
+private fun <T> RecordReadResult<T>.valueOrThrow(): T? = when (this) {
+    RecordReadResult.Missing -> null
+    is RecordReadResult.Valid -> value
+    is RecordReadResult.Invalid -> throw failure
 }
 
 private sealed interface Acquisition {

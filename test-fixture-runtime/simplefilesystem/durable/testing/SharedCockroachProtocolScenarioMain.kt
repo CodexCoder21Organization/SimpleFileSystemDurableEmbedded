@@ -39,6 +39,7 @@ fun main(args: Array<String>) {
             "warmup-publication" -> harness.warmupPublication()
             "workspace-isolation" -> harness.workspaceIsolation()
             "lease-and-pid-reuse-recovery" -> harness.leaseAndPidReuseRecovery()
+            "malformed-record-diagnostics" -> harness.malformedRecordDiagnostics()
             else -> throw IllegalArgumentException(
                 "Unknown shared CockroachDB protocol scenario '$scenario'.",
             )
@@ -734,6 +735,67 @@ private class ScenarioHarness(
         check(unrelated.isAlive) {
             "Final teardown killed unrelated PID ${unrelated.pid()} despite mismatched start time."
         }
+        assertAllObservedDead()
+    }
+
+    fun malformedRecordDiagnostics() = protect {
+        val owner = startProbe("valid-owner")
+        val ready = owner.awaitReady()
+        val stateDirectory = File(required(ready, "stateDirectory", owner.readyFile))
+        val malformedLease = File(stateDirectory, "leases/malformed-lease")
+        writePropertiesAtomically(
+            malformedLease,
+            versionedProperties().apply {
+                setProperty("pid", "not-a-pid")
+                setProperty("startedAtMillis", "0")
+            },
+        )
+        val leaseReader = startProbe("invalid-lease-reader")
+        check(leaseReader.awaitExit() != 0) {
+            "A contender accepted malformed lease ${malformedLease.absolutePath}."
+        }
+        val leaseFailure = leaseReader.logFile.readText()
+        check(
+            malformedLease.absolutePath in leaseFailure &&
+                "pid='not-a-pid'" in leaseFailure &&
+                "preserved" in leaseFailure
+        ) {
+            "Malformed lease diagnostics did not name the path, offending pid and preservation " +
+                "decision:\n$leaseFailure"
+        }
+        check(malformedLease.isFile) {
+            "Malformed lease ${malformedLease.absolutePath} was deleted as stale."
+        }
+        check(malformedLease.delete()) {
+            "Could not remove test-owned malformed lease ${malformedLease.absolutePath}."
+        }
+
+        val nodeFile = File(stateDirectory, "node.properties")
+        val validNode = properties(nodeFile)
+        val malformedNode = Properties().apply {
+            putAll(validNode)
+            setProperty("pid", "not-a-node-pid")
+        }
+        writePropertiesAtomically(nodeFile, malformedNode)
+        val nodeReader = startProbe("invalid-node-reader")
+        check(nodeReader.awaitExit() != 0) {
+            "A contender treated malformed node state ${nodeFile.absolutePath} as missing."
+        }
+        val nodeFailure = nodeReader.logFile.readText()
+        check(
+            nodeFile.absolutePath in nodeFailure &&
+                "pid='not-a-node-pid'" in nodeFailure &&
+                "preserved" in nodeFailure
+        ) {
+            "Malformed node diagnostics did not name the path, offending pid and preservation " +
+                "decision:\n$nodeFailure"
+        }
+        check(properties(nodeFile).getProperty("pid") == "not-a-node-pid") {
+            "Malformed node state ${nodeFile.absolutePath} was overwritten or deleted."
+        }
+        writePropertiesAtomically(nodeFile, validNode)
+        assertUsable(required(ready, "jdbcUrl", owner.readyFile))
+        owner.releaseAndAwait()
         assertAllObservedDead()
     }
 
