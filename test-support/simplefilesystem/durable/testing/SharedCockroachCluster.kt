@@ -765,7 +765,9 @@ private object SharedCockroachNode {
                     ),
                 ),
             )
-            val daemonPid = properties.getProperty("daemonPid") ?: return@collectProcessEvidence null
+            if (properties.getProperty("daemonPid") == null) {
+                return@collectProcessEvidence null
+            }
             val daemon = parseIdentity(
                 properties,
                 "daemonPid",
