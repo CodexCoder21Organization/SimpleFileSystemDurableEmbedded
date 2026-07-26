@@ -21,6 +21,11 @@ fun main(args: Array<String>) {
     }
     val scenario = args[0]
     val root = File(args[1]).canonicalFile
+    runSharedCockroachProtocolScenario(scenario, root)
+    println("SCENARIO PASSED: $scenario")
+}
+
+internal fun runSharedCockroachProtocolScenario(scenario: String, root: File) {
     check(root.isDirectory) {
         "Shared CockroachDB protocol scenario root must be a directory, but was " +
             root.absolutePath
@@ -45,7 +50,6 @@ fun main(args: Array<String>) {
             )
         }
     }
-    println("SCENARIO PASSED: $scenario")
 }
 
 private class ScenarioHarness(

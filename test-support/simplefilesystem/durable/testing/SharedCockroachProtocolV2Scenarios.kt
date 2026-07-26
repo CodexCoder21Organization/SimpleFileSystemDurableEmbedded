@@ -15,66 +15,23 @@ object SharedCockroachProtocolV2Scenarios {
 }
 
 /**
- * Runs one end-to-end shared-CockroachDB protocol scenario in a clean child process.
+ * Runs one end-to-end shared-CockroachDB protocol scenario with a private process tree.
  *
- * The child has no suite-fixture JDBC override, so every scenario exercises the workspace-scoped
- * detached-daemon protocol rather than the suite launcher's already-running CockroachDB node.
+ * Scenario contenders, the detached daemon, and CockroachDB still run as real child processes
+ * without the suite-fixture JDBC override. Running the orchestration harness in the test JVM avoids
+ * spending a second, narrower process deadline around Kompile's own unchanged test deadline.
  */
 private fun runSharedCockroachProtocolV2ScenarioTest(scenario: String) {
     var root: File? = null
-    var process: Process? = null
     var failure: Throwable? = null
     try {
         root = Files.createTempDirectory("shared-cockroach-$scenario-").toFile()
-        val fixtureJar = File(
-            SharedCockroachProtocolV2Scenarios::class.java.protectionDomain.codeSource.location.toURI(),
-        )
-        check(fixtureJar.isFile) {
-            "The shared CockroachDB protocol scenario runtime must be a jar file, but was " +
-                "${fixtureJar.absolutePath}."
-        }
-        val javaBinary = File(System.getProperty("java.home"), "bin/java")
-        process = ProcessBuilder(
-            javaBinary.absolutePath,
-            *SHARED_COCKROACH_CHILD_JVM_ARGUMENTS.toTypedArray(),
-            "-Djava.io.tmpdir=${root.absolutePath}",
-            "-cp",
-            fixtureJar.absolutePath,
-            "simplefilesystem.durable.testing.SharedCockroachProtocolScenarioMainKt",
-            scenario,
-            root.absolutePath,
-        )
-            .redirectErrorStream(true)
-            .redirectOutput(File(root, "scenario.log"))
-            .also {
-                it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
-            }
-            .start()
-        check(process.waitFor(20L, TimeUnit.SECONDS)) {
-            "Shared CockroachDB protocol scenario '$scenario' did not finish within 20 seconds; " +
-                "output:\n${File(root, "scenario.log").takeIf(File::isFile)?.readText().orEmpty()}"
-        }
-        check(process.exitValue() == 0) {
-            "Shared CockroachDB protocol scenario '$scenario' exited with code " +
-                "${process.exitValue()}; output:\n" +
-                File(root, "scenario.log").takeIf(File::isFile)?.readText().orEmpty()
-        }
+        runSharedCockroachProtocolScenario(scenario, root)
     } catch (caught: Throwable) {
         failure = caught
         throw caught
     } finally {
         val cleanupFailures = mutableListOf<Throwable>()
-        process?.takeIf(Process::isAlive)?.let { liveProcess ->
-            try {
-                liveProcess.destroyForcibly()
-                check(liveProcess.waitFor(10L, TimeUnit.SECONDS)) {
-                    "Shared CockroachDB protocol scenario '$scenario' process ${liveProcess.pid()} " +
-                        "remained alive after forcible cleanup."
-                }
-            } catch (cleanupFailure: Throwable) {
-                cleanupFailures += cleanupFailure
-            }
-        }
         root?.let { scenarioRoot ->
             try {
                 cleanupSharedCockroachProtocolV2ScenarioEvidence(
