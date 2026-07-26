@@ -56,6 +56,10 @@ fun main(args: Array<String>) {
             versionedProperties().apply {
                 setProperty("jdbcUrl", cluster.jdbcUrl())
                 setProperty("stateDirectory", diagnostics.stateDirectory.absolutePath)
+                setProperty(
+                    "userDirectory",
+                    File(System.getProperty("user.dir")).canonicalPath,
+                )
                 setProperty("lockFile", diagnostics.lockFile.absolutePath)
                 setProperty("token", diagnostics.electionToken)
                 setProperty("daemonPid", diagnostics.daemonPid.toString())

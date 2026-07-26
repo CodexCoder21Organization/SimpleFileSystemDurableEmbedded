@@ -43,7 +43,6 @@ private fun runSharedCockroachProtocolV2ScenarioTest(scenario: String) {
             scenario,
             root.absolutePath,
         )
-            .directory(File(System.getProperty("user.dir")).canonicalFile)
             .redirectErrorStream(true)
             .redirectOutput(File(root, "scenario.log"))
             .also {

@@ -782,7 +782,10 @@ private fun recordObservedIdentity(
             controlDirectory.absolutePath
     }
     writePropertiesAtomically(
-        File(controlDirectory, "$processType-$token.properties"),
+        File(
+            controlDirectory,
+            "$processType-$token-${identity.pid}-${identity.startedAt.toEpochMilli()}.properties",
+        ),
         versionedProperties().apply {
             setProperty("token", token)
             setProperty("pid", identity.pid.toString())

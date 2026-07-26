@@ -33,6 +33,7 @@ fun main(args: Array<String>) {
             "expired-attached-startup" -> harness.expiredAttachedStartup()
             "missing-local-process-evidence" -> harness.missingLocalProcessEvidence()
             "atomic-publication-required" -> harness.atomicPublicationRequired()
+            "launcher-rendezvous" -> harness.launcherRendezvous()
             "deterministic-contention" -> harness.deterministicContention()
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
             "warmup-publication" -> harness.warmupPublication()
@@ -407,6 +408,46 @@ private class ScenarioHarness(
         }
     }
 
+    fun launcherRendezvous() = protect {
+        val first = startProbe("launcher-a", workspace = null)
+        val second = startProbe("launcher-b", workspace = null)
+        val firstReady = first.awaitReady()
+        val secondReady = second.awaitReady()
+        val scenarioUserDirectory = File(System.getProperty("user.dir")).canonicalPath
+        val observedUserDirectories = setOf(
+            required(firstReady, "userDirectory", first.readyFile),
+            required(secondReady, "userDirectory", second.readyFile),
+        )
+        check(observedUserDirectories == setOf(scenarioUserDirectory)) {
+            "Child JVMs launched without an explicit working directory observed " +
+                "$observedUserDirectories, but their real launcher parent used " +
+                "'$scenarioUserDirectory'."
+        }
+        check(
+            required(firstReady, "stateDirectory", first.readyFile) ==
+                required(secondReady, "stateDirectory", second.readyFile),
+        ) {
+            "Child JVMs inheriting one launcher working directory fragmented shared state into " +
+                "${required(firstReady, "stateDirectory", first.readyFile)} and " +
+                "${required(secondReady, "stateDirectory", second.readyFile)}."
+        }
+        check(
+            required(firstReady, "token", first.readyFile) ==
+                required(secondReady, "token", second.readyFile),
+        ) {
+            "Child JVMs inheriting one launcher working directory elected distinct tokens."
+        }
+        check(observations("daemon").size == 1 && observations("cockroach").size == 1) {
+            "Launcher rendezvous observed daemons=${observations("daemon").map { it.pid }} and " +
+                "CockroachDB processes=${observations("cockroach").map { it.pid }}."
+        }
+        assertObservationFilenamesAreIdentityUnique()
+        assertUsable(required(firstReady, "jdbcUrl", first.readyFile))
+        first.releaseAndAwait()
+        second.releaseAndAwait()
+        assertAllObservedDead()
+    }
+
     fun deterministicContention() = protect {
         val gate = File(runFiles, "contention-start-gate")
         val contenders = (0 until 4).map { index ->
@@ -685,15 +726,15 @@ private class ScenarioHarness(
 
     private fun startProbe(
         name: String,
-        workspace: File = defaultWorkspace,
+        workspace: File? = defaultWorkspace,
         startGate: File = File(runFiles, "$name-start-gate").also(::marker),
     ): Probe {
-        requireDirectory(workspace)
+        workspace?.let(::requireDirectory)
         val ready = File(runFiles, "$name-ready.properties")
         val release = File(runFiles, "$name-release")
         val armed = File(runFiles, "$name-armed.properties")
         val log = File(runFiles, "$name.log")
-        val process = ProcessBuilder(
+        val processBuilder = ProcessBuilder(
             javaBinary.absolutePath,
             "-Djava.io.tmpdir=${root.absolutePath}",
             "-cp",
@@ -706,7 +747,8 @@ private class ScenarioHarness(
             control.absolutePath,
             "lease-only",
         )
-            .directory(workspace)
+        workspace?.let(processBuilder::directory)
+        val process = processBuilder
             .redirectErrorStream(true)
             .redirectOutput(log)
             .also {
@@ -727,8 +769,45 @@ private class ScenarioHarness(
             .map(::identity)
             .distinct()
 
-    private fun observation(type: String, token: String): ScenarioIdentity =
-        identity(File(control, "$type-$token.properties").also(::waitForFile))
+    private fun observation(type: String, token: String): ScenarioIdentity {
+        waitForPrefix(control, "$type-$token-")
+        val matches = control.listFiles().orEmpty()
+            .filter {
+                it.isFile &&
+                    it.name.startsWith("$type-$token-") &&
+                    it.name.endsWith(".properties")
+            }
+        check(matches.size == 1) {
+            "Expected exactly one $type observation for token '$token', but found " +
+                matches.map(File::getName)
+        }
+        return identity(matches.single())
+    }
+
+    private fun assertObservationFilenamesAreIdentityUnique() {
+        listOf("daemon", "cockroach").forEach { type ->
+            control.listFiles().orEmpty()
+                .filter {
+                    it.isFile &&
+                        it.name.startsWith("$type-") &&
+                        "-arrived-" !in it.name &&
+                        it.name.endsWith(".properties")
+                }
+                .forEach { file ->
+                    val values = properties(file)
+                    val token = required(values, "token", file)
+                    val pid = requiredLong(values, "pid", file)
+                    val startedAtMillis = requiredLong(values, "startedAtMillis", file)
+                    check(
+                        file.name ==
+                            "$type-$token-$pid-$startedAtMillis.properties",
+                    ) {
+                        "Observation ${file.absolutePath} was not keyed by its complete process " +
+                            "identity; expected $type-$token-$pid-$startedAtMillis.properties."
+                    }
+                }
+        }
+    }
 
     private fun identity(file: File): ScenarioIdentity {
         val values = properties(file)
