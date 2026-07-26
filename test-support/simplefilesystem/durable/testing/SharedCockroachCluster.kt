@@ -457,7 +457,16 @@ private object SharedCockroachNode {
             val managedCockroachIsLive = if (!stateFile.isFile) {
                 true
             } else {
-                val readyNode = readNodeRecord().valueOrThrow()
+                val readyNode = when (val recordedNode = readNodeRecord()) {
+                    is RecordReadResult.Valid -> recordedNode.value
+                    RecordReadResult.Missing -> null
+                    is RecordReadResult.Invalid ->
+                        when (val warmupProof = readWarmupProof()) {
+                            is RecordReadResult.Valid -> warmupProof.value
+                            RecordReadResult.Missing -> null
+                            is RecordReadResult.Invalid -> null
+                        }
+                }
                 val managedIdentity =
                     readyNode?.takeIf {
                         it.token == owner.token &&
@@ -499,6 +508,18 @@ private object SharedCockroachNode {
     ): SharedCockroachNodeRecord? {
         val recordedResult = readNodeRecord()
         val warmupResult = readWarmupProof()
+        val validWarmupProof = (warmupResult as? RecordReadResult.Valid)?.value
+        if (recordedResult is RecordReadResult.Invalid &&
+            validWarmupProof != null &&
+            validWarmupProof.token == owner.token &&
+            validWarmupProof.daemon == daemon &&
+            validWarmupProof.workDirectory == owner.workDirectory &&
+            recordedResult.recoveryIdentity == validWarmupProof.recoveryIdentity()
+        ) {
+            preserveInvalidReadinessRecord(stateFile)
+            writeNodeRecord(validWarmupProof)
+            return validWarmupProof
+        }
         val invalidRecords = listOf(recordedResult, warmupResult)
             .filterIsInstance<RecordReadResult.Invalid>()
             .map(RecordReadResult.Invalid::failure)
@@ -527,6 +548,32 @@ private object SharedCockroachNode {
         }
         writeNodeRecord(warmupProof)
         return warmupProof
+    }
+
+    private fun preserveInvalidReadinessRecord(file: File) {
+        val invalidDirectory = File(quarantineDirectory, "invalid-readiness")
+        check(invalidDirectory.isDirectory || invalidDirectory.mkdirs()) {
+            "Could not create invalid shared CockroachDB readiness quarantine directory " +
+                invalidDirectory.absolutePath
+        }
+        val preserved = File(
+            invalidDirectory,
+            "${file.name}.${UUID.randomUUID()}.invalid",
+        )
+        try {
+            Files.move(
+                file.toPath(),
+                preserved.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+            )
+        } catch (failure: AtomicMoveNotSupportedException) {
+            throw IllegalStateException(
+                "Could not atomically preserve invalid shared CockroachDB readiness record " +
+                    "${file.absolutePath} at ${preserved.absolutePath}: the filesystem does not " +
+                    "support the required ATOMIC_MOVE operation.",
+                failure,
+            )
+        }
     }
 
     private fun isLiveNode(
@@ -657,17 +704,6 @@ private object SharedCockroachNode {
             )
         }
 
-        evidence.filter { it.processGroupId == null }.forEach { process ->
-            try {
-                stopProcess(
-                    process.identity,
-                    File(workDirectory, "daemon.out"),
-                    "recorded process",
-                )
-            } catch (failure: Throwable) {
-                failures += failure
-            }
-        }
         evidence.filter { it.processGroupId != null }
             .groupBy { requireNotNull(it.processGroupId) }
             .forEach { (groupId, members) ->
@@ -682,6 +718,17 @@ private object SharedCockroachNode {
                     leader.identity,
                     groupId,
                     File(workDirectory, "cockroach.out"),
+                )
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+        }
+        evidence.forEach { process ->
+            try {
+                stopProcess(
+                    process.identity,
+                    File(workDirectory, "daemon.out"),
+                    "recorded process",
                 )
             } catch (failure: Throwable) {
                 failures += failure
@@ -850,25 +897,37 @@ private object SharedCockroachNode {
 
     private fun stopRecordedProcessGroup(
         groupLeader: SharedProcessIdentity,
-        processGroupId: Long,
+        recordedProcessGroupId: Long,
         logFile: File,
     ) {
-        check(processGroupId == groupLeader.pid) {
-            "Cannot stop shared CockroachDB process group $processGroupId because its verified " +
-                "leader PID was ${groupLeader.pid}."
+        check(recordedProcessGroupId == groupLeader.pid) {
+            "Cannot stop shared CockroachDB process group $recordedProcessGroupId because its " +
+                "verified leader PID was ${groupLeader.pid}."
         }
-        val members = liveProcessGroupMembers(processGroupId)
+        if (groupLeader.liveHandle() == null) return
+        val actualProcessGroupId = processGroupId(
+            groupLeader,
+            "shared CockroachDB recorded process-group leader",
+        )
+        check(actualProcessGroupId == recordedProcessGroupId) {
+            "Cannot stop recorded shared CockroachDB process group $recordedProcessGroupId because " +
+                "its verified leader PID ${groupLeader.pid} started at ${groupLeader.startedAt} " +
+                "currently belongs to process group $actualProcessGroupId."
+        }
+        val members = liveProcessGroupMembers(recordedProcessGroupId)
         if (members.isEmpty()) return
         val kill = ProcessBuilder(
             "/bin/kill",
             "-KILL",
             "--",
-            "-$processGroupId",
+            "-$recordedProcessGroupId",
         ).start()
         val exitCode = kill.waitFor()
-        check(exitCode == 0 || liveProcessGroupMembers(processGroupId).isEmpty()) {
-            "Could not signal shared CockroachDB process group $processGroupId; /bin/kill exited " +
-                "with code $exitCode and the process group remained alive."
+        check(
+            exitCode == 0 || liveProcessGroupMembers(recordedProcessGroupId).isEmpty(),
+        ) {
+            "Could not signal shared CockroachDB process group $recordedProcessGroupId; /bin/kill " +
+                "exited with code $exitCode and the process group remained alive."
         }
         members.forEach { member ->
             member.identity.liveHandle()?.let { liveHandle ->
@@ -876,12 +935,12 @@ private object SharedCockroachNode {
                     member.identity,
                     liveHandle,
                     logFile,
-                    "process-group $processGroupId member",
+                    "process-group $recordedProcessGroupId member",
                 )
             }
         }
-        check(liveProcessGroupMembers(processGroupId).isEmpty()) {
-            "Shared CockroachDB process group $processGroupId still had live members after " +
+        check(liveProcessGroupMembers(recordedProcessGroupId).isEmpty()) {
+            "Shared CockroachDB process group $recordedProcessGroupId still had live members after " +
                 "forcible shutdown."
         }
     }
@@ -1184,31 +1243,42 @@ private object SharedCockroachNode {
         description: String,
     ): RecordReadResult<SharedCockroachNodeRecord> {
         if (!file.isFile) return RecordReadResult.Missing
+        var recoveryIdentity: SharedCockroachNodeRecoveryIdentity? = null
         return try {
             val properties = loadVersionedProperties(
                 file,
                 description,
             ) ?: return RecordReadResult.Missing
+            val token = requiredProperty(properties, "token", file, description)
+            val cockroach = parseIdentity(
+                properties,
+                "pid",
+                "processStartedAtMillis",
+                description,
+                file,
+            )
+            val processGroupId = requiredLong(properties, "processGroupId", file)
+            val daemon = parseIdentity(
+                properties,
+                "daemonPid",
+                "daemonStartedAtMillis",
+                description,
+                file,
+            )
+            recoveryIdentity = SharedCockroachNodeRecoveryIdentity(
+                token = token,
+                cockroach = cockroach,
+                processGroupId = processGroupId,
+                daemon = daemon,
+            )
             val jdbcUrl = requiredProperty(properties, "jdbcUrl", file, description)
             jdbcUrlForDatabase(jdbcUrl, "state_validation")
             RecordReadResult.Valid(
                 SharedCockroachNodeRecord(
-                    token = requiredProperty(properties, "token", file, description),
-                    cockroach = parseIdentity(
-                        properties,
-                        "pid",
-                        "processStartedAtMillis",
-                        description,
-                        file,
-                    ),
-                    processGroupId = requiredLong(properties, "processGroupId", file),
-                    daemon = parseIdentity(
-                        properties,
-                        "daemonPid",
-                        "daemonStartedAtMillis",
-                        description,
-                        file,
-                    ),
+                    token = token,
+                    cockroach = cockroach,
+                    processGroupId = processGroupId,
+                    daemon = daemon,
                     jdbcUrl = jdbcUrl,
                     workDirectory = requireManagedWorkDirectory(
                         stateDirectory,
@@ -1223,6 +1293,7 @@ private object SharedCockroachNode {
                         "was preserved.",
                     failure,
                 ),
+                recoveryIdentity,
             )
         }
     }
@@ -1468,7 +1539,10 @@ private object SharedCockroachNode {
 private sealed interface RecordReadResult<out T> {
     data object Missing : RecordReadResult<Nothing>
     data class Valid<T>(val value: T) : RecordReadResult<T>
-    data class Invalid(val failure: IllegalStateException) : RecordReadResult<Nothing>
+    data class Invalid(
+        val failure: IllegalStateException,
+        val recoveryIdentity: SharedCockroachNodeRecoveryIdentity? = null,
+    ) : RecordReadResult<Nothing>
 }
 
 private fun <T> RecordReadResult<T>.valueOrThrow(): T? = when (this) {
@@ -1486,6 +1560,21 @@ private data class ManagedNodeAcquisitionRecord(
     val owner: SharedCockroachOwnerClaim,
     val node: SharedCockroachNodeRecord,
 )
+
+private data class SharedCockroachNodeRecoveryIdentity(
+    val token: String,
+    val cockroach: SharedProcessIdentity,
+    val processGroupId: Long,
+    val daemon: SharedProcessIdentity,
+)
+
+private fun SharedCockroachNodeRecord.recoveryIdentity() =
+    SharedCockroachNodeRecoveryIdentity(
+        token = token,
+        cockroach = cockroach,
+        processGroupId = processGroupId,
+        daemon = daemon,
+    )
 
 private data class ManagedNodeAcquisition(
     val jdbcUrl: String,

@@ -145,6 +145,30 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "A new JVM did not recover the live node from corrupt node state; output:\n" +
                 File(privateTemp, "child-state-recovery.log").takeIf(File::isFile)?.readText().orEmpty()
         }
+        val preservedInvalidStates = File(
+            managedStateDirectory,
+            "quarantine/invalid-readiness",
+        ).listFiles().orEmpty().filter {
+            it.isFile && it.name.startsWith("node.properties.") && it.name.endsWith(".invalid")
+        }
+        assertEquals(
+            1,
+            preservedInvalidStates.size,
+            "Recovering from the warmup proof must preserve the invalid node record exactly once.",
+        )
+        val preservedInvalidState = Properties().apply {
+            preservedInvalidStates.single().inputStream().use(::load)
+        }
+        assertEquals(
+            "truncated-state-file-url",
+            preservedInvalidState.getProperty("jdbcUrl"),
+            "Recovery must preserve the invalid JDBC URL as diagnostic evidence.",
+        )
+        assertEquals(
+            File(privateTemp, "unsafe-work-directory").absolutePath,
+            preservedInvalidState.getProperty("workDirectory"),
+            "Recovery must preserve the untrusted work-directory value as diagnostic evidence.",
+        )
         val repairedState = Properties().apply {
             stateFile.inputStream().use(::load)
         }
@@ -473,13 +497,13 @@ fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
 }
 
 fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
-    val identities = linkedSetOf<Triple<Long, Long, Boolean>>()
+    val identities = linkedSetOf<Triple<Long, Long, Long?>>()
     val failures = mutableListOf<Throwable>()
     fun record(
         file: File,
         pidKey: String,
         startedAtKey: String,
-        cockroachProcessGroupLeader: Boolean,
+        processGroupKey: String?,
     ) {
         if (!file.isFile) return
         try {
@@ -505,10 +529,20 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
                     "Fixture identity file ${file.absolutePath} contained non-numeric " +
                         "$startedAtKey='$startedAtValue'.",
                 )
+            val processGroupId = processGroupKey?.let { key ->
+                val value = properties.getProperty(key)
+                    ?: throw IllegalStateException(
+                        "Fixture identity file ${file.absolutePath} contained $pidKey='$pidValue' " +
+                            "without $key.",
+                    )
+                value.toLongOrNull() ?: throw IllegalStateException(
+                    "Fixture identity file ${file.absolutePath} contained non-numeric $key='$value'.",
+                )
+            }
             identities += Triple(
                 pid,
                 startedAt,
-                cockroachProcessGroupLeader,
+                processGroupId,
             )
         } catch (failure: Throwable) {
             failures += failure
@@ -516,13 +550,13 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
     }
 
     val nodeState = File(stateDirectory, "node.properties")
-    record(nodeState, "daemonPid", "daemonStartedAtMillis", false)
-    record(nodeState, "pid", "processStartedAtMillis", true)
+    record(nodeState, "daemonPid", "daemonStartedAtMillis", "processGroupId")
+    record(nodeState, "pid", "processStartedAtMillis", "processGroupId")
     record(
         File(stateDirectory, "node-owner.properties"),
         "daemonPid",
         "daemonStartedAtMillis",
-        false,
+        "daemonProcessGroupId",
     )
     stateDirectory.listFiles().orEmpty()
         .filter { it.isDirectory && it.name.startsWith("node-") }
@@ -531,17 +565,66 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
                 File(workDirectory, "daemon.properties"),
                 "pid",
                 "startedAtMillis",
-                false,
+                "processGroupId",
             )
             record(
                 File(workDirectory, "cockroach.properties"),
                 "pid",
                 "startedAtMillis",
-                true,
+                "processGroupId",
             )
         }
+    identities.mapNotNull { it.third }.distinct().forEach { processGroupId ->
+        try {
+            val leader = identities.singleOrNull { it.first == processGroupId }
+                ?: throw IllegalStateException(
+                    "Fixture evidence for process group $processGroupId did not contain exactly " +
+                        "one group-leader identity.",
+                )
+            val handle = ProcessHandle.of(leader.first).orElse(null)
+            if (handle != null &&
+                handle.isAlive &&
+                handle.info().startInstant().orElse(null)?.toEpochMilli() ==
+                leader.second
+            ) {
+                val processGroupInspection = ProcessBuilder(
+                    "/bin/ps",
+                    "-o",
+                    "pgid=",
+                    "-p",
+                    leader.first.toString(),
+                ).start()
+                val actualProcessGroupId = processGroupInspection.inputStream
+                    .bufferedReader()
+                    .use { it.readText() }
+                    .trim()
+                    .toLongOrNull()
+                val inspectionExitCode = processGroupInspection.waitFor()
+                check(
+                    inspectionExitCode == 0 && actualProcessGroupId == processGroupId,
+                ) {
+                    "Could not verify fixture process-group leader PID ${leader.first} started at " +
+                        "${leader.second}: expected process group $processGroupId, but /bin/ps " +
+                        "exited with code $inspectionExitCode and reported '$actualProcessGroupId'."
+                }
+                val kill = ProcessBuilder(
+                    "/bin/kill",
+                    "-KILL",
+                    "--",
+                    "-$processGroupId",
+                ).start()
+                val exitCode = kill.waitFor()
+                check(exitCode == 0 || !handle.isAlive) {
+                    "Could not signal CockroachDB process group $processGroupId; /bin/kill " +
+                        "exited with code $exitCode and its verified leader remained alive."
+                }
+            }
+        } catch (failure: Throwable) {
+            failures += failure
+        }
+    }
     identities.forEach { identity ->
-        val (pid, startedAtMillis, cockroachProcessGroupLeader) = identity
+        val (pid, startedAtMillis) = identity
         try {
             val handle = ProcessHandle.of(pid).orElse(null)
             if (handle != null &&
@@ -549,21 +632,7 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
                 handle.info().startInstant().orElse(null)?.toEpochMilli() ==
                 startedAtMillis
             ) {
-                if (cockroachProcessGroupLeader) {
-                    val kill = ProcessBuilder(
-                        "/bin/kill",
-                        "-KILL",
-                        "--",
-                        "-$pid",
-                    ).start()
-                    val exitCode = kill.waitFor()
-                    check(exitCode == 0 || !handle.isAlive) {
-                        "Could not signal CockroachDB process group $pid; /bin/kill " +
-                            "exited with code $exitCode and its verified leader remained alive."
-                    }
-                } else {
-                    handle.destroyForcibly()
-                }
+                handle.destroyForcibly()
                 handle.onExit().get(10L, TimeUnit.SECONDS)
                 check(!handle.isAlive) {
                     "Fixture process $pid started at $startedAtMillis " +
