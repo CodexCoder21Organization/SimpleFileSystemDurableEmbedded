@@ -8,11 +8,15 @@ import simplefilesystem.durable.DurableSimpleFileSystemManager
 import sql.Database
 
 fun main(args: Array<String>) {
-    require(args.size == 2 || args.size == 5) {
+    require(args.size == 2 || args.size == 5 || args.size == 6) {
         "SharedCockroachLeaseProbeMain requires <ready-file> <release-file> or <ready-file> " +
-            "<release-file> <armed-file> <start-gate> <control-directory-or-dash>, but received " +
-            "${args.size} argument(s)."
+            "<release-file> <armed-file> <start-gate> <control-directory-or-dash> " +
+            "[lease-only], but received ${args.size} argument(s)."
     }
+    require(args.size != 6 || args[5] == "lease-only") {
+        "SharedCockroachLeaseProbeMain optional mode must be 'lease-only', but was '${args[5]}'."
+    }
+    val initializeDurableSchema = args.size != 6
     val readyFile = File(args[0])
     val releaseFile = File(args[1])
     val control = if (args.size == 5 && args[4] != "-") {
@@ -31,12 +35,19 @@ fun main(args: Array<String>) {
         waitForFileCreation(File(args[3]))
     }
     SharedCockroachCluster(fixtureControl = control).start().use { cluster ->
-        Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password).use { database ->
-            DurableSimpleFileSystemManager(
-                blobstoreService = InMemoryBlobstoreService(),
-                metadataDatabase = database,
-            ).use { manager ->
-                manager.listFilesystems(null, 1)
+        if (initializeDurableSchema) {
+            Database(
+                "org.postgresql.Driver",
+                cluster.jdbcUrl(),
+                cluster.username,
+                cluster.password,
+            ).use { database ->
+                DurableSimpleFileSystemManager(
+                    blobstoreService = InMemoryBlobstoreService(),
+                    metadataDatabase = database,
+                ).use { manager ->
+                    manager.listFilesystems(null, 1)
+                }
             }
         }
         val diagnostics = cluster.diagnostics()

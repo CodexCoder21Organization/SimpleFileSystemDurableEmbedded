@@ -81,5 +81,5 @@ fun buildCockroachTestFixtureFatJar(): File = BuildJar(
  * Gives protocol-scenario tests their own declared build-rule dependency so additions to the
  * scenario runtime cannot be hidden by a previously resolved fixture annotation.
  */
-fun buildCockroachProtocolV2WarmupAttestedScenarioFatJar(): File =
+fun buildCockroachProtocolV2WarmupAttestedLeaseOnlyScenarioFatJar(): File =
     buildCockroachTestFixtureFatJar()

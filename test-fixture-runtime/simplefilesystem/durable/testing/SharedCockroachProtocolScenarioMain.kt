@@ -446,6 +446,7 @@ private class ScenarioHarness(
             armed.absolutePath,
             startGate.absolutePath,
             control.absolutePath,
+            "lease-only",
         )
             .directory(workspace)
             .redirectErrorStream(true)
