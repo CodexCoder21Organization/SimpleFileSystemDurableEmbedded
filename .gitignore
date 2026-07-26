@@ -1,0 +1,7 @@
+/jars/
+/build/
+/out/
+/*.xml
+/*.log
+/.idea/
+*.iml
