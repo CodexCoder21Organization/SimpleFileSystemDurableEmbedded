@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 private const val HEARTBEAT_INTERVAL_MILLIS = 1_000L
+private val daemonProcessLocalStateLock = Any()
 
 fun main(args: Array<String>) {
     require(args.size == 4) {
@@ -837,9 +838,11 @@ private fun requiredLong(properties: Properties, key: String, file: File): Long 
 }
 
 private fun <T> withStateLock(stateDirectory: File, block: () -> T): T {
-    val lockFile = File(stateDirectory, "state.lock")
-    return RandomAccessFile(lockFile, "rw").use { lockAccess ->
-        lockAccess.channel.lock().use { block() }
+    return synchronized(daemonProcessLocalStateLock) {
+        val lockFile = File(stateDirectory, "state.lock")
+        RandomAccessFile(lockFile, "rw").use { lockAccess ->
+            lockAccess.channel.lock().use { block() }
+        }
     }
 }
 
