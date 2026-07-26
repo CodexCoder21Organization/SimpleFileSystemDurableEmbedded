@@ -60,6 +60,7 @@ internal data class SharedCockroachOwnerClaim(
     val electionOwner: SharedProcessIdentity,
     val createdAtMillis: Long,
     val attachDeadlineMillis: Long,
+    val startupDeadlineMillis: Long,
     val workDirectory: File,
     val daemon: SharedProcessIdentity?,
     val daemonProcessGroupId: Long?,

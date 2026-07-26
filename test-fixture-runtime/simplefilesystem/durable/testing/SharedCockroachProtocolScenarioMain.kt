@@ -29,6 +29,7 @@ fun main(args: Array<String>) {
             "pre-attach-owner-crash" -> harness.preAttachOwnerCrash()
             "post-spawn-identity-crash" -> harness.postSpawnIdentityCrash()
             "pre-readiness-daemon-crash" -> harness.preReadinessDaemonCrash()
+            "expired-attached-startup" -> harness.expiredAttachedStartup()
             "deterministic-contention" -> harness.deterministicContention()
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
             "warmup-publication" -> harness.warmupPublication()
@@ -201,6 +202,36 @@ private class ScenarioHarness(
         assertUsable(required(replacementReady, "jdbcUrl", replacement.readyFile))
         winner.releaseAndAwait()
         replacement.releaseAndAwait()
+        assertAllObservedDead()
+    }
+
+    fun expiredAttachedStartup() = protect {
+        marker("pause-cockroach-before-readiness")
+        val probe = startProbe("expired-startup")
+        val arrival = waitForPrefix(control, "cockroach-before-readiness-arrived-")
+        val token = required(properties(arrival), "token", arrival)
+        val expiredCockroach = observation("cockroach", token)
+        val stateDirectory = onlyStateDirectory()
+        val ownerFile = File(stateDirectory, "node-owner.properties")
+        val owner = properties(ownerFile)
+        val expiredDeadline = System.currentTimeMillis() - 1L
+        owner.setProperty("attachDeadlineMillis", expiredDeadline.toString())
+        if (owner.containsKey("startupDeadlineMillis")) {
+            owner.setProperty("startupDeadlineMillis", expiredDeadline.toString())
+        }
+        writePropertiesAtomically(ownerFile, owner)
+        marker(File(control, "cockroach-before-readiness-release-$token"))
+        removeMarker("pause-cockroach-before-readiness")
+
+        val ready = probe.awaitReady()
+        val replacementToken = required(ready, "token", probe.readyFile)
+        check(replacementToken != token) {
+            "Shared CockroachDB token '$token' published readiness after its absolute startup " +
+                "deadline $expiredDeadline had elapsed instead of yielding to a replacement."
+        }
+        assertDead(expiredCockroach, "CockroachDB child of expired startup token")
+        assertUsable(required(ready, "jdbcUrl", probe.readyFile))
+        probe.releaseAndAwait()
         assertAllObservedDead()
     }
 

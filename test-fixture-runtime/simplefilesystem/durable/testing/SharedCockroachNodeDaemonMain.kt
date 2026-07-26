@@ -332,6 +332,29 @@ private fun requireAttachedOwnership(
         "Shared CockroachDB daemon token '$token' owner claim recorded process group " +
             "${claim.daemonProcessGroupId}, but daemon ${daemonIdentity.pid} must lead its group."
     }
+    val readyFile = File(stateDirectory, "node.properties")
+    val readyProperties = loadVersionedProperties(
+        readyFile,
+        "shared CockroachDB node state",
+    )
+    val startupCompleted = readyProperties?.let { properties ->
+        val readyToken = properties.getProperty("token") ?: throw IllegalStateException(
+            "Shared CockroachDB node state ${readyFile.absolutePath} did not contain token.",
+        )
+        check(readyToken == token) {
+            "Shared CockroachDB daemon token '$token' found readiness for token '$readyToken' in " +
+                "${readyFile.absolutePath}."
+        }
+        true
+    } ?: false
+    if (!startupCompleted) {
+        val now = System.currentTimeMillis()
+        check(now <= claim.startupDeadlineMillis) {
+            "Shared CockroachDB daemon token '$token' missed its absolute startup deadline " +
+                "${claim.startupDeadlineMillis}; current time was $now and readiness " +
+                "${readyFile.absolutePath} had not been published."
+        }
+    }
 }
 
 private fun startCockroach(
@@ -582,6 +605,11 @@ private fun readOwnerClaim(stateDirectory: File): SharedCockroachOwnerClaim? {
         ),
         createdAtMillis = requiredLong(properties, "createdAtMillis", ownerFile),
         attachDeadlineMillis = requiredLong(properties, "attachDeadlineMillis", ownerFile),
+        startupDeadlineMillis = requiredLong(
+            properties,
+            "startupDeadlineMillis",
+            ownerFile,
+        ),
         workDirectory = requireManagedWorkDirectory(
             stateDirectory,
             File(
@@ -623,6 +651,7 @@ private fun writeOwnerClaim(
             )
             setProperty("createdAtMillis", claim.createdAtMillis.toString())
             setProperty("attachDeadlineMillis", claim.attachDeadlineMillis.toString())
+            setProperty("startupDeadlineMillis", claim.startupDeadlineMillis.toString())
             setProperty("workDirectory", claim.workDirectory.absolutePath)
             claim.daemon?.let { daemon ->
                 setProperty("daemonPid", daemon.pid.toString())
