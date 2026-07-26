@@ -452,9 +452,10 @@ private class ScenarioHarness(
     fun deterministicContention() = protect {
         val gate = File(runFiles, "contention-start-gate")
         val contenders = (0 until 4).map { index ->
-            startProbe("contender-$index", startGate = gate)
+            startProbe("contender-$index", startGate = gate).also { contender ->
+                waitForFile(contender.armedFile)
+            }
         }
-        contenders.forEach { contender -> waitForFile(contender.armedFile) }
         marker(gate)
         val ready = contenders.map(Probe::awaitReady)
         val tokens = ready.mapIndexed { index, value ->

@@ -704,6 +704,20 @@ private object SharedCockroachNode {
             )
         }
 
+        evidence.filter { process ->
+            process.processGroupId != null &&
+                process.identity.pid != process.processGroupId
+        }.forEach { process ->
+            try {
+                stopProcess(
+                    process.identity,
+                    File(workDirectory, "cockroach.out"),
+                    "recorded process-group member",
+                )
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+        }
         evidence.filter { it.processGroupId != null }
             .groupBy { requireNotNull(it.processGroupId) }
             .forEach { (groupId, members) ->
@@ -723,7 +737,10 @@ private object SharedCockroachNode {
                 failures += failure
             }
         }
-        evidence.forEach { process ->
+        evidence.filter { process ->
+            process.processGroupId == null ||
+                process.identity.pid == process.processGroupId
+        }.forEach { process ->
             try {
                 stopProcess(
                     process.identity,
