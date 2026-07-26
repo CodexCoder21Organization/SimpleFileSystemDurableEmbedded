@@ -157,6 +157,7 @@ private object SharedCockroachNode {
     private val lockFile get() = File(stateDirectory, "state.lock")
     private val ownerFile get() = File(stateDirectory, "node-owner.properties")
     private val stateFile get() = File(stateDirectory, "node.properties")
+    private val warmupProofFile get() = File(stateDirectory, "node-warmup.properties")
     private val heartbeatFile get() = File(stateDirectory, "node-heartbeat.properties")
     private val failureFile get() = File(stateDirectory, "node-failure.properties")
     private val leasesDirectory get() = File(stateDirectory, "leases")
@@ -199,6 +200,7 @@ private object SharedCockroachNode {
 
                     cleanupUnclaimedWorkDirectories()
                     deleteIfPresent(stateFile, "stale shared CockroachDB node state")
+                    deleteIfPresent(warmupProofFile, "stale shared CockroachDB warmup proof")
                     deleteIfPresent(heartbeatFile, "stale shared CockroachDB heartbeat")
                     deleteIfPresent(failureFile, "stale shared CockroachDB startup failure")
                     val workDirectory = Files.createTempDirectory(
@@ -272,6 +274,7 @@ private object SharedCockroachNode {
         if (remainingLeases.isEmpty()) {
             cleanupAllManagedProcesses()
             deleteIfPresent(stateFile, "shared CockroachDB node state")
+            deleteIfPresent(warmupProofFile, "shared CockroachDB warmup proof")
             deleteIfPresent(heartbeatFile, "shared CockroachDB heartbeat")
             deleteIfPresent(failureFile, "shared CockroachDB startup failure")
             deleteIfPresent(ownerFile, "shared CockroachDB owner claim")
@@ -428,9 +431,10 @@ private object SharedCockroachNode {
 
     private fun reconcileOwner(): SharedCockroachOwnerClaim? {
         val owner = readOwnerClaim() ?: run {
-            if (stateFile.exists() || heartbeatFile.exists()) {
+            if (stateFile.exists() || warmupProofFile.exists() || heartbeatFile.exists()) {
                 cleanupAllManagedProcesses()
                 deleteIfPresent(stateFile, "unowned shared CockroachDB node state")
+                deleteIfPresent(warmupProofFile, "unowned shared CockroachDB warmup proof")
                 deleteIfPresent(heartbeatFile, "unowned shared CockroachDB heartbeat")
             }
             return null
@@ -472,6 +476,7 @@ private object SharedCockroachNode {
         // uses the process-group identity below to reap a CockroachDB tree left by a dead daemon.
         cleanupManagedWorkDirectory(owner.workDirectory, owner.token)
         deleteIfPresent(stateFile, "dead-owner shared CockroachDB node state")
+        deleteIfPresent(warmupProofFile, "dead-owner shared CockroachDB warmup proof")
         deleteIfPresent(heartbeatFile, "dead-owner shared CockroachDB heartbeat")
         deleteIfPresent(failureFile, "dead-owner shared CockroachDB startup failure")
         deleteIfPresent(ownerFile, "dead shared CockroachDB owner claim")
@@ -482,12 +487,23 @@ private object SharedCockroachNode {
         owner: SharedCockroachOwnerClaim,
         daemon: SharedProcessIdentity,
     ): SharedCockroachNodeRecord? {
-        val recorded = readNodeRecord() ?: return null
-        return recorded.takeIf {
+        val recorded = readNodeRecord()
+        if (recorded != null &&
             recorded.token == owner.token &&
-                recorded.daemon == daemon &&
-                recorded.workDirectory == owner.workDirectory
+            recorded.daemon == daemon &&
+            recorded.workDirectory == owner.workDirectory
+        ) {
+            return recorded
         }
+        val warmupProof = readWarmupProof() ?: return null
+        if (warmupProof.token != owner.token ||
+            warmupProof.daemon != daemon ||
+            warmupProof.workDirectory != owner.workDirectory
+        ) {
+            return null
+        }
+        writeNodeRecord(warmupProof)
+        return warmupProof
     }
 
     private fun isLiveNode(
@@ -673,6 +689,7 @@ private object SharedCockroachNode {
     private fun validateProtocolNamespace() {
         loadVersionedProperties(ownerFile, "shared CockroachDB owner claim")
         loadVersionedProperties(stateFile, "shared CockroachDB node state")
+        loadVersionedProperties(warmupProofFile, "shared CockroachDB warmup proof")
         loadVersionedProperties(heartbeatFile, "shared CockroachDB heartbeat")
         loadVersionedProperties(failureFile, "shared CockroachDB startup failure")
         leasesDirectory.listFiles().orEmpty()
@@ -769,10 +786,19 @@ private object SharedCockroachNode {
         )
     }
 
-    private fun readNodeRecord(): SharedCockroachNodeRecord? {
+    private fun readNodeRecord(): SharedCockroachNodeRecord? =
+        readNodeRecord(stateFile, "shared CockroachDB node state")
+
+    private fun readWarmupProof(): SharedCockroachNodeRecord? =
+        readNodeRecord(warmupProofFile, "shared CockroachDB warmup proof")
+
+    private fun readNodeRecord(
+        file: File,
+        description: String,
+    ): SharedCockroachNodeRecord? {
         val properties = loadVersionedProperties(
-            stateFile,
-            "shared CockroachDB node state",
+            file,
+            description,
         ) ?: return null
         return try {
             val jdbcUrl = requireNotNull(properties.getProperty("jdbcUrl"))
@@ -783,16 +809,16 @@ private object SharedCockroachNode {
                     properties,
                     "pid",
                     "processStartedAtMillis",
-                    "shared CockroachDB node state",
-                    stateFile,
+                    description,
+                    file,
                 ),
-                processGroupId = requiredLong(properties, "processGroupId", stateFile),
+                processGroupId = requiredLong(properties, "processGroupId", file),
                 daemon = parseIdentity(
                     properties,
                     "daemonPid",
                     "daemonStartedAtMillis",
-                    "shared CockroachDB node state",
-                    stateFile,
+                    description,
+                    file,
                 ),
                 jdbcUrl = jdbcUrl,
                 workDirectory = requireManagedWorkDirectory(
@@ -803,6 +829,28 @@ private object SharedCockroachNode {
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun writeNodeRecord(node: SharedCockroachNodeRecord) {
+        writePropertiesAtomically(
+            stateFile,
+            versionedProperties().apply {
+                setProperty("token", node.token)
+                setProperty("pid", node.cockroach.pid.toString())
+                setProperty(
+                    "processStartedAtMillis",
+                    node.cockroach.startedAt.toEpochMilli().toString(),
+                )
+                setProperty("processGroupId", node.processGroupId.toString())
+                setProperty("daemonPid", node.daemon.pid.toString())
+                setProperty(
+                    "daemonStartedAtMillis",
+                    node.daemon.startedAt.toEpochMilli().toString(),
+                )
+                setProperty("jdbcUrl", node.jdbcUrl)
+                setProperty("workDirectory", node.workDirectory.absolutePath)
+            },
+        )
     }
 
     private fun readHeartbeat(): SharedCockroachHeartbeat? {

@@ -37,6 +37,11 @@ directory and its never-replaced lock file remain available for later runs. Dire
 uniquely named databases only until that disposable node stops; a caller-supplied longer-lived
 fixture drops each logical database when its test closes.
 
+The daemon atomically records a versioned warmup attestation immediately before readiness. A
+claimant may use that daemon-authored attestation to repair a malformed readiness record for the
+same live owner and process identities, but raw PID or listening-URL files never establish
+readiness and cannot bypass schema warmup.
+
 Managed state uses protocol version 2 under `java.io.tmpdir`, scoped by the first 16 hexadecimal
 characters of SHA-256 over the canonical workspace root. Kompile gives every child test JVM in one
 run the same workspace working directory, so those children rendezvous while independent checkouts

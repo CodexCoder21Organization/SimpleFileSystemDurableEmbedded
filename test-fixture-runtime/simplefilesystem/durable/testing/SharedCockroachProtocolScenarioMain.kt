@@ -274,6 +274,9 @@ private class ScenarioHarness(
         check(!File(failureState, "node.properties").exists()) {
             "Node readiness remained after forced production warmup failure."
         }
+        check(!File(failureState, "node-warmup.properties").exists()) {
+            "Warmup proof remained after forced production warmup failure."
+        }
         check(!File(failureState, "leases").exists()) {
             "Lease directory remained after forced production warmup failure."
         }

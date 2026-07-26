@@ -1,4 +1,4 @@
-@file:WithArtifact("simplefilesystem.durable.buildCockroachProtocolV2SingleWriterScenarioFatJar()")
+@file:WithArtifact("simplefilesystem.durable.buildCockroachProtocolV2WarmupAttestedScenarioFatJar()")
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact

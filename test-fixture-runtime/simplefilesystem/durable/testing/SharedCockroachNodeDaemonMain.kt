@@ -407,24 +407,29 @@ private fun publishReadyState(
             "Shared CockroachDB daemon ${daemonIdentity.pid} completed startup for token '$token' " +
                 "without a live lease."
         }
+        val readyProperties = versionedProperties().apply {
+            setProperty("token", token)
+            setProperty("pid", cockroach.identity.pid.toString())
+            setProperty(
+                "processStartedAtMillis",
+                cockroach.identity.startedAt.toEpochMilli().toString(),
+            )
+            setProperty("processGroupId", cockroach.processGroupId.toString())
+            setProperty("daemonPid", daemonIdentity.pid.toString())
+            setProperty(
+                "daemonStartedAtMillis",
+                daemonIdentity.startedAt.toEpochMilli().toString(),
+            )
+            setProperty("jdbcUrl", cockroach.jdbcUrl)
+            setProperty("workDirectory", workDirectory.absolutePath)
+        }
+        writePropertiesAtomically(
+            File(stateDirectory, "node-warmup.properties"),
+            readyProperties,
+        )
         writePropertiesAtomically(
             File(stateDirectory, "node.properties"),
-            versionedProperties().apply {
-                setProperty("token", token)
-                setProperty("pid", cockroach.identity.pid.toString())
-                setProperty(
-                    "processStartedAtMillis",
-                    cockroach.identity.startedAt.toEpochMilli().toString(),
-                )
-                setProperty("processGroupId", cockroach.processGroupId.toString())
-                setProperty("daemonPid", daemonIdentity.pid.toString())
-                setProperty(
-                    "daemonStartedAtMillis",
-                    daemonIdentity.startedAt.toEpochMilli().toString(),
-                )
-                setProperty("jdbcUrl", cockroach.jdbcUrl)
-                setProperty("workDirectory", workDirectory.absolutePath)
-            },
+            readyProperties,
         )
         writeHeartbeat(stateDirectory, token, daemonIdentity)
     }
@@ -453,6 +458,10 @@ private fun publishStartupFailure(
         deleteIfPresent(
             File(stateDirectory, "node.properties"),
             "failed shared CockroachDB node state",
+        )
+        deleteIfPresent(
+            File(stateDirectory, "node-warmup.properties"),
+            "failed shared CockroachDB warmup proof",
         )
         deleteIfPresent(
             File(stateDirectory, "node-heartbeat.properties"),
