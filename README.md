@@ -15,7 +15,7 @@ scripts/build.bash simplefilesystem.durable.buildMaven
 The artifact coordinate is:
 
 ```kotlin
-MavenPrebuilt("simplefilesystem.durable:simplefilesystem-durable-embedded:0.1.1")
+MavenPrebuilt("simplefilesystem.durable:simplefilesystem-durable-embedded:0.1.2")
 ```
 
 Run the complete end-to-end suite, which starts one real in-memory single-node CockroachDB

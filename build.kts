@@ -26,7 +26,7 @@ val dependencies = listOf(
 
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-embedded:")
 fun buildMaven(): File = buildSimpleKotlinMavenArtifact2(
-    coordinates = "simplefilesystem.durable:simplefilesystem-durable-embedded:0.1.1",
+    coordinates = "simplefilesystem.durable:simplefilesystem-durable-embedded:0.1.2",
     src = File("src"),
     compileDependencies = dependencies,
 )
