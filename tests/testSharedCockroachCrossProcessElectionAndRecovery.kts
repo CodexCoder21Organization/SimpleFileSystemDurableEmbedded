@@ -70,6 +70,12 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             jdbcUrls.distinct().size,
             "Every independently forked JVM must receive a distinct logical database.",
         )
+        jdbcUrls.forEachIndexed { index, jdbcUrl ->
+            assertDurableSchemaReady(
+                jdbcUrl,
+                "Forked JVM $index must publish readiness only after production schema bootstrap.",
+            )
+        }
 
         val stateFile = File(
             privateTemp,
@@ -134,6 +140,10 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         DriverManager.getConnection(stateRecoveryReady.readText().trim(), "root", "").use { connection ->
             assertTrue(connection.isValid(2), "The state-recovered logical database must accept JDBC connections.")
         }
+        assertDurableSchemaReady(
+            stateRecoveryReady.readText().trim(),
+            "A second bootstrap attempt must adopt the live node and initialize its isolated schema.",
+        )
 
         releases[0].writeText("release")
         assertTrue(processes[0].waitFor(10L, TimeUnit.SECONDS), "The first lease holder did not exit.")
@@ -141,6 +151,67 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         DriverManager.getConnection(jdbcUrls[1], "root", "").use { connection ->
             assertTrue(connection.isValid(2), "Closing one JVM must not stop the node used by live JVM leases.")
         }
+
+        processes[1].destroyForcibly()
+        assertTrue(
+            processes[1].waitFor(10L, TimeUnit.SECONDS),
+            "The deliberately killed lease holder ${processes[1].pid()} did not exit.",
+        )
+        val leasesDirectory = File(stateFile.parentFile, "leases")
+        val staleLease = File(
+            leasesDirectory,
+            jdbcUrls[1].substringAfterLast('/').substringBefore('?'),
+        )
+        assertTrue(
+            staleLease.isFile,
+            "Killing lease holder ${processes[1].pid()} must leave its lease at ${staleLease.absolutePath}.",
+        )
+        val staleLeaseRecoveryReady = File(privateTemp, "ready-stale-lease-recovery")
+        val staleLeaseRecoveryRelease = File(privateTemp, "release-stale-lease-recovery")
+        releases += staleLeaseRecoveryRelease
+        val staleLeaseRecovery = ProcessBuilder(
+            javaBinary,
+            "-Djava.io.tmpdir=${privateTemp.absolutePath}",
+            "-cp",
+            fixtureJar,
+            "simplefilesystem.durable.testing.SharedCockroachLeaseProbeMainKt",
+            staleLeaseRecoveryReady.absolutePath,
+            staleLeaseRecoveryRelease.absolutePath,
+        )
+            .redirectErrorStream(true)
+            .redirectOutput(File(privateTemp, "child-stale-lease-recovery.log"))
+            .also {
+                it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+            }
+            .start()
+        processes += staleLeaseRecovery
+        val staleLeaseRecoveryDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L)
+        while ((!staleLeaseRecoveryReady.isFile || staleLeaseRecoveryReady.length() == 0L) &&
+            System.nanoTime() < staleLeaseRecoveryDeadline
+        ) {
+            Thread.sleep(20L)
+        }
+        check(staleLeaseRecoveryReady.isFile && staleLeaseRecoveryReady.length() > 0L) {
+            "A new JVM did not purge the killed holder's stale lease and adopt the live node; output:\n" +
+                File(privateTemp, "child-stale-lease-recovery.log")
+                    .takeIf(File::isFile)?.readText().orEmpty()
+        }
+        val stateAfterStaleLeaseRecovery = Properties().apply {
+            stateFile.inputStream().use(::load)
+        }
+        assertEquals(
+            originalPid,
+            requireNotNull(stateAfterStaleLeaseRecovery.getProperty("pid")).toLong(),
+            "Purging a killed holder's stale lease must preserve and adopt the healthy node.",
+        )
+        assertFalse(
+            staleLease.exists(),
+            "A new acquisition must purge stale lease ${staleLease.absolutePath}.",
+        )
+        assertDurableSchemaReady(
+            staleLeaseRecoveryReady.readText().trim(),
+            "The acquisition that purges a stale lease must initialize its isolated schema.",
+        )
 
         val originalNode = ProcessHandle.of(originalPid).orElseThrow {
             IllegalStateException("The elected CockroachDB process $originalPid was not live.")
@@ -191,11 +262,12 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             assertTrue(connection.isValid(2), "The replacement CockroachDB node must accept JDBC connections.")
         }
 
-        releases.drop(1).forEach { it.writeText("release") }
-        processes.drop(1).forEachIndexed { index, process ->
+        releases.drop(2).forEach { it.writeText("release") }
+        processes.drop(2).forEachIndexed { index, process ->
             val logSuffix = when (index) {
-                0, 1, 2 -> (index + 1).toString()
-                3 -> "state-recovery"
+                0, 1 -> (index + 2).toString()
+                2 -> "state-recovery"
+                3 -> "stale-lease-recovery"
                 else -> "recovery"
             }
             assertTrue(
@@ -212,6 +284,25 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         assertFalse(
             ProcessHandle.of(recoveredPid).map(ProcessHandle::isAlive).orElse(false),
             "The replacement CockroachDB node must stop after its final live JVM lease exits.",
+        )
+        assertFalse(
+            stateFile.exists(),
+            "Final lease release must remove shared node state at ${stateFile.absolutePath}.",
+        )
+        assertFalse(
+            File(stateFile.parentFile, "node-starting.properties").exists(),
+            "Final lease release must remove in-progress node state.",
+        )
+        assertTrue(
+            leasesDirectory.listFiles().orEmpty().none { it.isFile },
+            "Final lease release must remove every lease from ${leasesDirectory.absolutePath}.",
+        )
+        assertTrue(
+            stateFile.parentFile.listFiles().orEmpty().none {
+                it.isDirectory && it.name.startsWith("node-")
+            },
+            "Final lease release must remove every node-* work directory from " +
+                "${stateFile.parentFile.absolutePath}.",
         )
     } catch (failure: Throwable) {
         testFailure = failure
@@ -270,6 +361,20 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             )
             cleanupFailures.forEach(cleanupFailure::addSuppressed)
             throw cleanupFailure
+        }
+    }
+}
+
+fun assertDurableSchemaReady(jdbcUrl: String, message: String) {
+    DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery(
+                "SELECT schema_version FROM simple_filesystem_schema_version WHERE singleton = true",
+            ).use { rows ->
+                assertTrue(rows.next(), "$message No singleton schema-version row existed at $jdbcUrl.")
+                assertEquals(2, rows.getInt("schema_version"), "$message JDBC URL: $jdbcUrl.")
+                assertFalse(rows.next(), "$message More than one singleton row existed at $jdbcUrl.")
+            }
         }
     }
 }
