@@ -19,12 +19,12 @@ fun main(args: Array<String>) {
     val initializeDurableSchema = args.size != 6
     val readyFile = File(args[0])
     val releaseFile = File(args[1])
-    val control = if (args.size == 5 && args[4] != "-") {
+    val control = if (args.size >= 5 && args[4] != "-") {
         SharedCockroachFixtureControl(File(args[4]).canonicalFile)
     } else {
         null
     }
-    if (args.size == 5) {
+    if (args.size >= 5) {
         val armedFile = File(args[2])
         writePropertiesAtomically(
             armedFile,
