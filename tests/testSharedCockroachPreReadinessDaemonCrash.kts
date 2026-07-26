@@ -2,8 +2,8 @@
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
-import simplefilesystem.durable.testing.runSharedCockroachProtocolScenarioTest
+import simplefilesystem.durable.testing.SharedCockroachProtocolScenario
 
 fun testSharedCockroachPreReadinessDaemonCrash() {
-    runSharedCockroachProtocolScenarioTest("pre-readiness-daemon-crash")
+    SharedCockroachProtocolScenario.run("pre-readiness-daemon-crash")
 }

@@ -7,8 +7,12 @@ import java.util.Properties
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
-/** Marker used to locate the fixture jar containing the canonical protocol scenario executable. */
-object SharedCockroachProtocolScenario
+/** Entry point and marker for the canonical protocol scenario executable in the fixture jar. */
+object SharedCockroachProtocolScenario {
+    fun run(scenario: String) {
+        runSharedCockroachProtocolScenarioTest(scenario)
+    }
+}
 
 /**
  * Runs one end-to-end shared-CockroachDB protocol scenario in a clean child process.

@@ -2,8 +2,8 @@
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
-import simplefilesystem.durable.testing.runSharedCockroachProtocolScenarioTest
+import simplefilesystem.durable.testing.SharedCockroachProtocolScenario
 
 fun testSharedCockroachLeaseAndPidReuseRecovery() {
-    runSharedCockroachProtocolScenarioTest("lease-and-pid-reuse-recovery")
+    SharedCockroachProtocolScenario.run("lease-and-pid-reuse-recovery")
 }

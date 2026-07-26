@@ -70,7 +70,7 @@ private class ScenarioHarness(
     fun preAttachOwnerCrash() = protect {
         marker("pause-daemon-before-attach")
         val winner = startProbe("winner")
-        val arrival = waitForPrefix(control, "daemon-before-attach-arrived-")
+        waitForPrefix(control, "daemon-before-attach-arrived-")
         val stateDirectory = onlyStateDirectory()
         val claim = properties(File(stateDirectory, "node-owner.properties"))
         val token = required(claim, "token", File(stateDirectory, "node-owner.properties"))

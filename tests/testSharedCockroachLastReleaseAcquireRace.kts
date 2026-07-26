@@ -2,8 +2,8 @@
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
-import simplefilesystem.durable.testing.runSharedCockroachProtocolScenarioTest
+import simplefilesystem.durable.testing.SharedCockroachProtocolScenario
 
 fun testSharedCockroachLastReleaseAcquireRace() {
-    runSharedCockroachProtocolScenarioTest("last-release-acquire-race")
+    SharedCockroachProtocolScenario.run("last-release-acquire-race")
 }
