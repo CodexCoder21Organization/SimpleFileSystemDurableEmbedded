@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.Path
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.Properties
@@ -161,28 +162,50 @@ internal fun versionedProperties(): Properties = Properties().apply {
 }
 
 internal fun writePropertiesAtomically(file: File, properties: Properties) {
+    writePropertiesAtomically(
+        file.toPath(),
+        properties,
+        file.parentFile.toPath(),
+    )
+}
+
+internal fun writePropertiesAtomically(
+    file: Path,
+    properties: Properties,
+    stagingDirectory: Path,
+) {
     require(
         properties.getProperty("protocolVersion") == SHARED_COCKROACH_PROTOCOL_VERSION,
     ) {
-        "Cannot write shared CockroachDB record ${file.absolutePath}: protocolVersion was " +
+        "Cannot write shared CockroachDB record ${file.toAbsolutePath()}: protocolVersion was " +
             "'${properties.getProperty("protocolVersion")}', but expected " +
             "'$SHARED_COCKROACH_PROTOCOL_VERSION'."
     }
-    val stagingFile = File(file.parentFile, "${file.name}.${ProcessHandle.current().pid()}.part")
-    stagingFile.outputStream().use { properties.store(it, null) }
+    val stagingFile = stagingDirectory.resolve(
+        "${file.fileName}.${ProcessHandle.current().pid()}.part",
+    )
+    Files.newOutputStream(stagingFile).use { properties.store(it, null) }
     try {
         Files.move(
-            stagingFile.toPath(),
-            file.toPath(),
+            stagingFile,
+            file,
             StandardCopyOption.ATOMIC_MOVE,
             StandardCopyOption.REPLACE_EXISTING,
         )
-    } catch (_: AtomicMoveNotSupportedException) {
-        Files.move(
-            stagingFile.toPath(),
-            file.toPath(),
-            StandardCopyOption.REPLACE_EXISTING,
+    } catch (failure: AtomicMoveNotSupportedException) {
+        val publicationFailure = IllegalStateException(
+            "Cannot atomically publish shared CockroachDB record ${file.toAbsolutePath()} from " +
+                "staging path ${stagingFile.toAbsolutePath()}: the filesystem does not support " +
+                "the required ATOMIC_MOVE operation. The record was not published because " +
+                "recovery depends on atomic ownership records.",
+            failure,
         )
+        try {
+            Files.deleteIfExists(stagingFile)
+        } catch (cleanupFailure: Throwable) {
+            publicationFailure.addSuppressed(cleanupFailure)
+        }
+        throw publicationFailure
     }
 }
 

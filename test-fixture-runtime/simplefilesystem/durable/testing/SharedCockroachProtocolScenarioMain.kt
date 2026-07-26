@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.StandardWatchEventKinds
+import java.nio.file.Path
 import java.nio.file.attribute.BasicFileAttributes
 import java.sql.DriverManager
 import java.time.Instant
@@ -31,6 +32,7 @@ fun main(args: Array<String>) {
             "pre-readiness-daemon-crash" -> harness.preReadinessDaemonCrash()
             "expired-attached-startup" -> harness.expiredAttachedStartup()
             "missing-local-process-evidence" -> harness.missingLocalProcessEvidence()
+            "atomic-publication-required" -> harness.atomicPublicationRequired()
             "deterministic-contention" -> harness.deterministicContention()
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
             "warmup-publication" -> harness.warmupPublication()
@@ -315,6 +317,94 @@ private class ScenarioHarness(
         replacement.releaseAndAwait()
         third.releaseAndAwait()
         assertAllObservedDead()
+    }
+
+    fun atomicPublicationRequired() = protect {
+        val target = File(root, "atomic-publication.properties").toPath()
+        val sharedMemoryRoot = Path.of("/dev/shm")
+        check(Files.isDirectory(sharedMemoryRoot)) {
+            "Atomic-publication scenario requires the real tmpfs directory " +
+                "${sharedMemoryRoot.toAbsolutePath()}, but it was unavailable."
+        }
+        val stagingDirectory = Files.createTempDirectory(
+            sharedMemoryRoot,
+            "shared-cockroach-atomic-staging-",
+        )
+        var scenarioFailure: Throwable? = null
+        try {
+            check(Files.getFileStore(target.parent) != Files.getFileStore(stagingDirectory)) {
+                "Atomic-publication scenario requires distinct real filesystems, but target " +
+                    "${target.parent} and staging $stagingDirectory used the same file store."
+            }
+            val failure = try {
+                writePropertiesAtomically(
+                    target,
+                    versionedProperties().apply {
+                        setProperty("sentinel", "must-not-publish")
+                    },
+                    stagingDirectory,
+                )
+                null
+            } catch (caught: IllegalStateException) {
+                caught
+            }
+            check(failure != null) {
+                "Atomic publication unexpectedly degraded to a non-atomic move from " +
+                    "$stagingDirectory to ${target.toAbsolutePath()}."
+            }
+            val message = failure.message.orEmpty()
+            check(target.toAbsolutePath().toString() in message && "ATOMIC_MOVE" in message) {
+                "Atomic-publication failure did not name target ${target.toAbsolutePath()} and " +
+                    "the ATOMIC_MOVE filesystem limitation: '$message'."
+            }
+            check(!Files.exists(target)) {
+                "Atomic-publication failure left a visible record at ${target.toAbsolutePath()}."
+            }
+            check(Files.list(stagingDirectory).use { entries -> entries.findAny().isEmpty }) {
+                "Atomic-publication failure left staging evidence under $stagingDirectory."
+            }
+        } catch (failure: Throwable) {
+            scenarioFailure = failure
+            throw failure
+        } finally {
+            val cleanupFailures = mutableListOf<Throwable>()
+            try {
+                if (Files.exists(target) && !Files.deleteIfExists(target)) {
+                    cleanupFailures += IllegalStateException(
+                        "Could not delete test-owned atomic publication target " +
+                            target.toAbsolutePath(),
+                    )
+                }
+            } catch (failure: Throwable) {
+                cleanupFailures += failure
+            }
+            try {
+                stagingDirectory.toFile().listFiles().orEmpty().forEach { staging ->
+                    if (!staging.delete()) {
+                        cleanupFailures += IllegalStateException(
+                            "Could not delete test-owned atomic staging file " +
+                                staging.absolutePath,
+                        )
+                    }
+                }
+                if (Files.exists(stagingDirectory) &&
+                    !Files.deleteIfExists(stagingDirectory)
+                ) {
+                    cleanupFailures += IllegalStateException(
+                        "Could not delete test-owned atomic staging directory $stagingDirectory.",
+                    )
+                }
+            } catch (failure: Throwable) {
+                cleanupFailures += failure
+            }
+            if (cleanupFailures.isNotEmpty()) {
+                val cleanupFailure = IllegalStateException(
+                    "Atomic-publication scenario cleanup failed ${cleanupFailures.size} time(s).",
+                )
+                cleanupFailures.forEach(cleanupFailure::addSuppressed)
+                scenarioFailure?.addSuppressed(cleanupFailure) ?: throw cleanupFailure
+            }
+        }
     }
 
     fun deterministicContention() = protect {
