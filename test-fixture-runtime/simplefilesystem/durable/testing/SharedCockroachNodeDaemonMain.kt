@@ -35,8 +35,24 @@ fun main(args: Array<String>) {
     }
 
     val daemonIdentity = processIdentity(ProcessHandle.current(), "shared CockroachDB daemon")
-    writeIdentity(File(workDirectory, "daemon.properties"), daemonIdentity, token)
-    recordObservedIdentity(controlDirectory, "daemon", token, daemonIdentity, null)
+    val daemonProcessGroupId = processGroupId(daemonIdentity, "shared CockroachDB daemon")
+    check(daemonProcessGroupId == daemonIdentity.pid) {
+        "Shared CockroachDB daemon ${daemonIdentity.pid} must lead its durable process group, but " +
+            "Linux reported processGroupId=$daemonProcessGroupId."
+    }
+    writeIdentity(
+        File(workDirectory, "daemon.properties"),
+        daemonIdentity,
+        token,
+        daemonProcessGroupId,
+    )
+    recordObservedIdentity(
+        controlDirectory,
+        "daemon",
+        token,
+        daemonIdentity,
+        daemonProcessGroupId,
+    )
     val preSpawnClaim = readOwnerClaim(stateDirectory)
         ?: throw IllegalStateException(
             "Shared CockroachDB daemon ${daemonIdentity.pid} received token '$token', but owner " +
@@ -57,7 +73,13 @@ fun main(args: Array<String>) {
             )
         verifyPreAttachOwnership(claim, token, workDirectory)
     }
-    attachDaemon(stateDirectory, workDirectory, token, daemonIdentity)
+    attachDaemon(
+        stateDirectory,
+        workDirectory,
+        token,
+        daemonIdentity,
+        daemonProcessGroupId,
+    )
 
     try {
         var cockroach: ManagedCockroachProcess? = null
@@ -113,7 +135,14 @@ fun main(args: Array<String>) {
         )
         try {
             requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
-            cockroach = startCockroach(workDirectory, token)
+            cockroach = startCockroach(
+                stateDirectory,
+                workDirectory,
+                token,
+                daemonIdentity,
+                daemonProcessGroupId,
+                controlDirectory,
+            )
             val cockroachExit = cockroach.onExit {
                 cockroachExitObserved.set(true)
                 try {
@@ -216,6 +245,7 @@ private fun attachDaemon(
     workDirectory: File,
     token: String,
     daemonIdentity: SharedProcessIdentity,
+    daemonProcessGroupId: Long,
 ) {
     withStateLock(stateDirectory) {
         val claim = readOwnerClaim(stateDirectory)
@@ -224,7 +254,10 @@ private fun attachDaemon(
                     "because the owner claim is missing.",
             )
         verifyPreAttachOwnership(claim, token, workDirectory)
-        val attached = claim.copy(daemon = daemonIdentity)
+        val attached = claim.copy(
+            daemon = daemonIdentity,
+            daemonProcessGroupId = daemonProcessGroupId,
+        )
         writeOwnerClaim(stateDirectory, attached)
         writeHeartbeat(stateDirectory, token, daemonIdentity)
     }
@@ -257,6 +290,10 @@ private fun verifyPreAttachOwnership(
     check(claim.daemon == null) {
         "Shared CockroachDB daemon token '$token' was already attached to daemon " +
             "${claim.daemon?.pid}."
+    }
+    check(claim.daemonProcessGroupId == null) {
+        "Shared CockroachDB daemon token '$token' was already attached to process group " +
+            "${claim.daemonProcessGroupId}."
     }
     check(claim.electionOwner.liveHandle() != null) {
         "Shared CockroachDB daemon token '$token' belongs to dead election owner " +
@@ -291,9 +328,20 @@ private fun requireAttachedOwnership(
             "${claim.daemon?.pid} started at ${claim.daemon?.startedAt}, but this daemon is " +
             "${daemonIdentity.pid} started at ${daemonIdentity.startedAt}."
     }
+    check(claim.daemonProcessGroupId == daemonIdentity.pid) {
+        "Shared CockroachDB daemon token '$token' owner claim recorded process group " +
+            "${claim.daemonProcessGroupId}, but daemon ${daemonIdentity.pid} must lead its group."
+    }
 }
 
-private fun startCockroach(workDirectory: File, token: String): ManagedCockroachProcess {
+private fun startCockroach(
+    stateDirectory: File,
+    workDirectory: File,
+    token: String,
+    daemonIdentity: SharedProcessIdentity,
+    daemonProcessGroupId: Long,
+    controlDirectory: File?,
+): ManagedCockroachProcess {
     listOf("listening-url", "cockroach.pid", "cockroach.properties").forEach { name ->
         deleteIfPresent(File(workDirectory, name), "stale shared CockroachDB startup file")
     }
@@ -313,7 +361,6 @@ private fun startCockroach(workDirectory: File, token: String): ManagedCockroach
         StandardWatchEventKinds.ENTRY_MODIFY,
     )
     val process = ProcessBuilder(
-        "/usr/bin/setsid",
         binary.absolutePath,
         "start-single-node",
         "--insecure",
@@ -333,14 +380,35 @@ private fun startCockroach(workDirectory: File, token: String): ManagedCockroach
         .redirectErrorStream(true)
         .start()
     val identity = processIdentity(process.toHandle(), "shared CockroachDB process-group leader")
+    val childProcessGroupId = processGroupId(identity, "shared CockroachDB process")
+    check(childProcessGroupId == daemonProcessGroupId) {
+        "Shared CockroachDB child ${identity.pid} escaped durable daemon process group " +
+            "$daemonProcessGroupId into processGroupId=$childProcessGroupId."
+    }
+    waitAtDaemonBarrier(
+        controlDirectory = controlDirectory,
+        barrierName = "cockroach-after-start-before-identity",
+        token = token,
+        stateDirectory = stateDirectory,
+        deadlineMillis = null,
+        arrivalIdentity = identity,
+        arrivalProcessGroupId = childProcessGroupId,
+    ) {
+        requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+    }
     val managed = ManagedCockroachProcess(
         handle = process.toHandle(),
         identity = identity,
-        processGroupId = identity.pid,
+        processGroupId = childProcessGroupId,
         jdbcUrl = "",
         logFile = logFile,
     )
-    writeIdentity(File(workDirectory, "cockroach.properties"), identity, token)
+    writeIdentity(
+        File(workDirectory, "cockroach.properties"),
+        identity,
+        token,
+        childProcessGroupId,
+    )
     process.onExit().thenRun { watcher.close() }
     try {
         val deadlineNanos = System.nanoTime() +
@@ -496,10 +564,12 @@ private fun readOwnerClaim(stateDirectory: File): SharedCockroachOwnerClaim? {
     )
     val daemonPid = properties.getProperty("daemonPid")
     val daemonStartedAt = properties.getProperty("daemonStartedAtMillis")
-    check((daemonPid == null) == (daemonStartedAt == null)) {
-        "Shared CockroachDB owner claim ${ownerFile.absolutePath} must contain both daemonPid and " +
-            "daemonStartedAtMillis, but daemonPid='$daemonPid' and " +
-            "daemonStartedAtMillis='$daemonStartedAt'."
+    val daemonProcessGroupId = properties.getProperty("daemonProcessGroupId")
+    check(setOf(daemonPid, daemonStartedAt, daemonProcessGroupId).map { it == null }.distinct().size == 1) {
+        "Shared CockroachDB owner claim ${ownerFile.absolutePath} must contain daemonPid, " +
+            "daemonStartedAtMillis and daemonProcessGroupId together, but daemonPid='$daemonPid', " +
+            "daemonStartedAtMillis='$daemonStartedAt' and daemonProcessGroupId=" +
+            "'$daemonProcessGroupId'."
     }
     return SharedCockroachOwnerClaim(
         token = token,
@@ -532,6 +602,9 @@ private fun readOwnerClaim(stateDirectory: File): SharedCockroachOwnerClaim? {
                 ownerFile,
             )
         },
+        daemonProcessGroupId = daemonProcessGroupId?.let {
+            requiredLong(properties, "daemonProcessGroupId", ownerFile)
+        },
     )
 }
 
@@ -556,6 +629,10 @@ private fun writeOwnerClaim(
                 setProperty(
                     "daemonStartedAtMillis",
                     daemon.startedAt.toEpochMilli().toString(),
+                )
+                setProperty(
+                    "daemonProcessGroupId",
+                    requireNotNull(claim.daemonProcessGroupId).toString(),
                 )
             }
         },
@@ -587,6 +664,8 @@ private fun waitAtDaemonBarrier(
     token: String,
     stateDirectory: File,
     deadlineMillis: Long?,
+    arrivalIdentity: SharedProcessIdentity? = null,
+    arrivalProcessGroupId: Long? = null,
     verifyOwnership: () -> Unit,
 ) {
     if (controlDirectory == null || !File(controlDirectory, "pause-$barrierName").isFile) return
@@ -598,7 +677,16 @@ private fun waitAtDaemonBarrier(
         File(controlDirectory, "$barrierName-arrived-$token.properties"),
         versionedProperties().apply {
             setProperty("token", token)
-            setProperty("pid", ProcessHandle.current().pid().toString())
+            setProperty(
+                "pid",
+                (arrivalIdentity?.pid ?: ProcessHandle.current().pid()).toString(),
+            )
+            arrivalIdentity?.let {
+                setProperty("startedAtMillis", it.startedAt.toEpochMilli().toString())
+            }
+            arrivalProcessGroupId?.let {
+                setProperty("processGroupId", it.toString())
+            }
         },
     )
     val releaseFile = File(controlDirectory, "$barrierName-release-$token")
@@ -736,16 +824,7 @@ private data class ManagedCockroachProcess(
 
     fun stop() {
         val liveHandle = identity.liveHandle() ?: return
-        check(processGroupId == identity.pid) {
-            "Cannot stop shared CockroachDB process group $processGroupId because its verified " +
-                "leader PID was ${identity.pid}."
-        }
-        val kill = ProcessBuilder("/bin/kill", "-KILL", "--", "-$processGroupId").start()
-        val exitCode = kill.waitFor()
-        check(exitCode == 0 || !liveHandle.isAlive) {
-            "Could not signal shared CockroachDB process group $processGroupId; /bin/kill exited " +
-                "with code $exitCode and process ${identity.pid} remained alive."
-        }
+        liveHandle.destroyForcibly()
         if (liveHandle.isAlive) {
             try {
                 liveHandle.onExit().get(
@@ -754,7 +833,8 @@ private data class ManagedCockroachProcess(
                 )
             } catch (failure: TimeoutException) {
                 throw IllegalStateException(
-                    "Shared CockroachDB process group $processGroupId remained alive after forcible " +
+                    "Shared CockroachDB process ${identity.pid} in durable process group " +
+                        "$processGroupId remained alive after forcible " +
                         "shutdown; output:\n${logFile.takeIf(File::isFile)?.readText().orEmpty()}",
                     failure,
                 )
@@ -768,7 +848,8 @@ private data class ManagedCockroachProcess(
             }
         }
         check(!liveHandle.isAlive) {
-            "Shared CockroachDB process group $processGroupId remained alive after forcible " +
+            "Shared CockroachDB process ${identity.pid} in durable process group $processGroupId " +
+                "remained alive after forcible " +
                 "shutdown; output:\n${logFile.takeIf(File::isFile)?.readText().orEmpty()}"
         }
     }

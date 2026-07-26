@@ -62,6 +62,7 @@ internal data class SharedCockroachOwnerClaim(
     val attachDeadlineMillis: Long,
     val workDirectory: File,
     val daemon: SharedProcessIdentity?,
+    val daemonProcessGroupId: Long?,
 )
 
 internal data class SharedCockroachNodeRecord(
@@ -90,6 +91,35 @@ internal fun processIdentity(handle: ProcessHandle, description: String): Shared
         "The $description ${handle.pid()} did not expose its process start time."
     }
     return SharedProcessIdentity(handle.pid(), startedAt)
+}
+
+internal fun processGroupId(identity: SharedProcessIdentity, description: String): Long {
+    check(identity.liveHandle() != null) {
+        "Cannot inspect the $description process group because PID ${identity.pid} started at " +
+            "${identity.startedAt} is not alive."
+    }
+    val statFile = File("/proc/${identity.pid}/stat")
+    val stat = try {
+        statFile.readText()
+    } catch (failure: Exception) {
+        throw IllegalStateException(
+            "Could not read the $description process group for PID ${identity.pid} started at " +
+                "${identity.startedAt} from ${statFile.absolutePath}: ${failure.message}",
+            failure,
+        )
+    }
+    val commandEnd = stat.lastIndexOf(") ")
+    check(commandEnd >= 0) {
+        "Linux process state ${statFile.absolutePath} had an unrecognised value '$stat'."
+    }
+    val fieldsAfterCommand = stat.substring(commandEnd + 2).trim().split(Regex("\\s+"))
+    check(fieldsAfterCommand.size > 2) {
+        "Linux process state ${statFile.absolutePath} did not contain a process-group field: '$stat'."
+    }
+    return fieldsAfterCommand[2].toLongOrNull() ?: throw IllegalStateException(
+        "Linux process state ${statFile.absolutePath} contained non-numeric process group " +
+            "'${fieldsAfterCommand[2]}'.",
+    )
 }
 
 internal fun requireManagedWorkDirectory(stateDirectory: File, workDirectory: File): File {
@@ -159,13 +189,19 @@ internal fun isAtomicStagingFile(file: File): Boolean =
     file.name.endsWith(".part") &&
         file.name.substringBeforeLast(".part").substringAfterLast('.').toLongOrNull() != null
 
-internal fun writeIdentity(file: File, identity: SharedProcessIdentity, token: String) {
+internal fun writeIdentity(
+    file: File,
+    identity: SharedProcessIdentity,
+    token: String,
+    processGroupId: Long? = null,
+) {
     writePropertiesAtomically(
         file,
         versionedProperties().apply {
             setProperty("token", token)
             setProperty("pid", identity.pid.toString())
             setProperty("startedAtMillis", identity.startedAt.toEpochMilli().toString())
+            processGroupId?.let { setProperty("processGroupId", it.toString()) }
         },
     )
 }

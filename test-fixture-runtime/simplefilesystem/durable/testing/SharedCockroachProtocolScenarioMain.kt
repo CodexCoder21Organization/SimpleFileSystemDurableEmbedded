@@ -27,6 +27,7 @@ fun main(args: Array<String>) {
     ScenarioHarness(root).use { harness ->
         when (scenario) {
             "pre-attach-owner-crash" -> harness.preAttachOwnerCrash()
+            "post-spawn-identity-crash" -> harness.postSpawnIdentityCrash()
             "pre-readiness-daemon-crash" -> harness.preReadinessDaemonCrash()
             "deterministic-contention" -> harness.deterministicContention()
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
@@ -121,7 +122,7 @@ private class ScenarioHarness(
         )
         assertNoReadyState(onlyStateDirectory(), "CockroachDB-before-readiness barrier")
 
-        killIdentity(firstDaemon)
+        killProcessOnly(firstDaemon)
         releaseStateLockBarrier(waiterArrival)
         removeMarker("pause-waiter-after-readiness-check")
         removeMarker("pause-cockroach-before-readiness")
@@ -144,6 +145,60 @@ private class ScenarioHarness(
                 "${observations("daemon").map { it.pid }}, CockroachDB=" +
                 observations("cockroach").map { it.pid }
         }
+        winner.releaseAndAwait()
+        replacement.releaseAndAwait()
+        assertAllObservedDead()
+    }
+
+    fun postSpawnIdentityCrash() = protect {
+        marker("pause-cockroach-after-start-before-identity")
+        val winner = startProbe("winner")
+        val arrival = waitForPrefix(
+            control,
+            "cockroach-after-start-before-identity-arrived-",
+        )
+        val firstCockroach = identity(arrival)
+        val token = required(properties(arrival), "token", arrival)
+        val firstDaemon = observation("daemon", token)
+        val originalStateDirectory = onlyStateDirectory()
+        val originalOwnerFile = File(originalStateDirectory, "node-owner.properties")
+        val originalWorkDirectory = File(
+            required(properties(originalOwnerFile), "workDirectory", originalOwnerFile),
+        )
+        check(firstCockroach.processGroupId == firstDaemon.pid) {
+            "CockroachDB child ${firstCockroach.pid} used process group " +
+                "${firstCockroach.processGroupId}, but durable daemon ${firstDaemon.pid} must " +
+                "lead every subsequently spawned child."
+        }
+        assertNoReadyState(originalStateDirectory, "post-spawn/pre-identity barrier")
+
+        killProcessOnly(firstDaemon)
+        removeMarker("pause-cockroach-after-start-before-identity")
+        val replacement = startProbe("replacement")
+        val replacementReady = replacement.awaitReady()
+        val recoveredWinnerReady = winner.awaitReady()
+        check(required(replacementReady, "token", replacement.readyFile) != token) {
+            "Replacement retained dead daemon token '$token'."
+        }
+        check(
+            required(recoveredWinnerReady, "token", winner.readyFile) ==
+                required(replacementReady, "token", replacement.readyFile),
+        ) {
+            "Original waiter and replacement did not rendezvous on the replacement owner."
+        }
+        firstCockroach.liveHandle()?.let {
+            val actualGroup = processGroupId(
+                SharedProcessIdentity(firstCockroach.pid, firstCockroach.startedAt),
+                "unpublished CockroachDB child",
+            )
+            throw IllegalStateException(
+                "Unpublished CockroachDB child ${firstCockroach.pid} remained alive in process " +
+                    "group $actualGroup after replacement; originally recorded group was " +
+                    "${firstCockroach.processGroupId}, durable daemon was ${firstDaemon.pid}, and " +
+                    "reconciliation deletedWorkDirectory=${!originalWorkDirectory.exists()}.",
+            )
+        }
+        assertUsable(required(replacementReady, "jdbcUrl", replacement.readyFile))
         winner.releaseAndAwait()
         replacement.releaseAndAwait()
         assertAllObservedDead()
@@ -554,6 +609,13 @@ private class ScenarioHarness(
                     "$exitCode and PID ${identity.pid} remained alive."
             }
         }
+        if (handle.isAlive) handle.onExit().get(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)
+        assertDead(identity, "forcibly stopped process")
+    }
+
+    private fun killProcessOnly(identity: ScenarioIdentity) {
+        val handle = identity.liveHandle() ?: return
+        handle.destroyForcibly()
         if (handle.isAlive) handle.onExit().get(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)
         assertDead(identity, "forcibly stopped process")
     }

@@ -143,13 +143,6 @@ internal fun cleanupSharedCockroachProtocolV2ScenarioEvidence(root: File, delete
                                 "processGroupId='$groupValue'.",
                         )
                 }
-                if (cockroach && processGroupId != pid) {
-                    throw IllegalStateException(
-                        "Cleanup identity ${identityFile.absolutePath} recorded CockroachDB PID " +
-                            "$pid but processGroupId=$processGroupId; refusing to signal an " +
-                            "unverified process group.",
-                    )
-                }
                 identities.putIfAbsent(
                     Triple(pid, startedAtMillis, cockroach),
                     ScenarioProcessIdentity(
@@ -164,25 +157,10 @@ internal fun cleanupSharedCockroachProtocolV2ScenarioEvidence(root: File, delete
             }
         }
 
-    identities.values.forEach { identity ->
+    identities.values.filter { it.processGroupId == null }.forEach { identity ->
         try {
             val handle = identity.liveHandle() ?: return@forEach
-            if (identity.processGroupId == null) {
-                handle.destroyForcibly()
-            } else {
-                val signal = ProcessBuilder(
-                    "/bin/kill",
-                    "-KILL",
-                    "--",
-                    "-${identity.processGroupId}",
-                ).start()
-                val exitCode = signal.waitFor()
-                check(exitCode == 0 || !handle.isAlive) {
-                    "Could not signal cleanup process group ${identity.processGroupId} from " +
-                        "${identity.source.absolutePath}; /bin/kill exited with code $exitCode " +
-                        "and PID ${identity.pid} remained alive."
-                }
-            }
+            handle.destroyForcibly()
             if (handle.isAlive) {
                 handle.onExit().get(SHARED_COCKROACH_PROCESS_STOP_SECONDS, TimeUnit.SECONDS)
             }
@@ -202,6 +180,57 @@ internal fun cleanupSharedCockroachProtocolV2ScenarioEvidence(root: File, delete
             }
         }
     }
+
+    identities.values.filter { it.processGroupId != null }
+        .groupBy { requireNotNull(it.processGroupId) }
+        .forEach { (processGroupId, members) ->
+            try {
+                val leader = members.singleOrNull { it.pid == processGroupId }
+                    ?: throw IllegalStateException(
+                        "Cleanup process group $processGroupId did not have exactly one recorded " +
+                            "leader identity; sources=${members.map { it.source.absolutePath }}.",
+                    )
+                val liveMembers = members.mapNotNull { member ->
+                    member.liveHandle()?.let { member to it }
+                }
+                if (liveMembers.isNotEmpty()) {
+                    val signal = ProcessBuilder(
+                        "/bin/kill",
+                        "-KILL",
+                        "--",
+                        "-$processGroupId",
+                    ).start()
+                    val exitCode = signal.waitFor()
+                    check(exitCode == 0 || liveMembers.none { it.second.isAlive }) {
+                        "Could not signal cleanup process group $processGroupId from " +
+                            "${leader.source.absolutePath}; /bin/kill exited with code $exitCode " +
+                            "and recorded members remained alive."
+                    }
+                    liveMembers.forEach { (member, handle) ->
+                        if (handle.isAlive) {
+                            handle.onExit().get(
+                                SHARED_COCKROACH_PROCESS_STOP_SECONDS,
+                                TimeUnit.SECONDS,
+                            )
+                        }
+                        check(member.liveHandle() == null) {
+                            "Cleanup process-group $processGroupId member PID ${member.pid} from " +
+                                "${member.source.absolutePath} remained alive."
+                        }
+                    }
+                }
+            } catch (failure: Throwable) {
+                failures += if (failure is TimeoutException) {
+                    IllegalStateException(
+                        "Cleanup process group $processGroupId retained a recorded member after " +
+                            "$SHARED_COCKROACH_PROCESS_STOP_SECONDS seconds.",
+                        failure,
+                    )
+                } else {
+                    failure
+                }
+            }
+        }
 
     identities.values.forEach { identity ->
         try {
@@ -251,6 +280,9 @@ private fun isScenarioIdentityRecord(file: File): Boolean =
         (
             file.name == "daemon.properties" ||
                 file.name == "cockroach.properties" ||
+                file.name.startsWith(
+                    "cockroach-after-start-before-identity-arrived-",
+                ) ||
                 (file.name.startsWith("daemon-") && "-arrived-" !in file.name) ||
                 (file.name.startsWith("cockroach-") && "-arrived-" !in file.name)
             ) &&

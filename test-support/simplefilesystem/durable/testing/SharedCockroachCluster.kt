@@ -220,6 +220,7 @@ private object SharedCockroachNode {
                             createdAtMillis + SHARED_COCKROACH_STARTUP_TIMEOUT_MILLIS,
                         workDirectory = requireManagedWorkDirectory(stateDirectory, workDirectory),
                         daemon = null,
+                        daemonProcessGroupId = null,
                     )
                     writeOwnerClaim(claim)
                     writeLease(leaseName)
@@ -324,6 +325,7 @@ private object SharedCockroachNode {
         }
         val javaBinary = File(System.getProperty("java.home"), "bin/java")
         ProcessBuilder(
+            "/usr/bin/setsid",
             javaBinary.absolutePath,
             "-Xmx128m",
             "-cp",
@@ -515,7 +517,7 @@ private object SharedCockroachNode {
         return owner.daemon == node.daemon &&
             node.daemon.liveHandle() != null &&
             node.cockroach.liveHandle() != null &&
-            node.processGroupId == node.cockroach.pid &&
+            node.processGroupId == owner.daemonProcessGroupId &&
             heartbeat.token == owner.token &&
             heartbeat.daemon == node.daemon &&
             now - heartbeat.writtenAtMillis <= SHARED_COCKROACH_HEARTBEAT_STALE_MILLIS &&
@@ -565,46 +567,67 @@ private object SharedCockroachNode {
         expectedToken: String?,
     ) {
         val failures = mutableListOf<Throwable>()
-        var daemon: SharedProcessIdentity? = null
-        var cockroach: SharedProcessIdentity? = null
+        var daemon: ManagedProcessEvidence? = null
+        var cockroach: ManagedProcessEvidence? = null
         try {
-            daemon = readIdentity(
+            daemon = readProcessEvidence(
                 File(workDirectory, "daemon.properties"),
                 "shared CockroachDB daemon identity",
                 expectedToken,
+                defaultProcessGroupToPid = false,
             )
         } catch (failure: Throwable) {
             failures += failure
         }
         try {
-            cockroach = readIdentity(
+            cockroach = readProcessEvidence(
                 File(workDirectory, "cockroach.properties"),
                 "shared CockroachDB process identity",
                 expectedToken,
+                defaultProcessGroupToPid = true,
             )
         } catch (failure: Throwable) {
             failures += failure
         }
         if (daemon != null) {
             try {
-                stopProcess(daemon, File(workDirectory, "daemon.out"), "daemon")
+                val daemonGroupId = daemon.processGroupId
+                if (daemonGroupId == null) {
+                    stopProcess(daemon.identity, File(workDirectory, "daemon.out"), "daemon")
+                } else {
+                    stopRecordedProcessGroup(
+                        daemon.identity,
+                        daemonGroupId,
+                        File(workDirectory, "daemon.out"),
+                    )
+                }
             } catch (failure: Throwable) {
                 failures += failure
             }
         }
         if (cockroach != null) {
             try {
-                stopCockroachProcessGroup(
-                    cockroach,
-                    cockroach.pid,
-                    File(workDirectory, "cockroach.out"),
-                )
+                val groupId = cockroach.processGroupId
+                if (groupId == null) {
+                    stopProcess(cockroach.identity, File(workDirectory, "cockroach.out"), "process")
+                } else if (groupId == cockroach.identity.pid) {
+                    stopRecordedProcessGroup(
+                        cockroach.identity,
+                        groupId,
+                        File(workDirectory, "cockroach.out"),
+                    )
+                } else if (daemon?.processGroupId != groupId) {
+                    failures += IllegalStateException(
+                        "Shared CockroachDB identity ${cockroach.identity.pid} recorded process " +
+                            "group $groupId, but no daemon identity proved leadership of that group.",
+                    )
+                }
             } catch (failure: Throwable) {
                 failures += failure
             }
         }
         val verifiedProcessesDead =
-            daemon?.liveHandle() == null && cockroach?.liveHandle() == null
+            daemon?.identity?.liveHandle() == null && cockroach?.identity?.liveHandle() == null
         if (failures.isEmpty() && verifiedProcessesDead) {
             if (workDirectory.exists() && !workDirectory.deleteRecursively()) {
                 failures += IllegalStateException(
@@ -619,16 +642,17 @@ private object SharedCockroachNode {
         )
     }
 
-    private fun stopCockroachProcessGroup(
-        identity: SharedProcessIdentity,
+    private fun stopRecordedProcessGroup(
+        groupLeader: SharedProcessIdentity,
         processGroupId: Long,
         logFile: File,
     ) {
-        val handle = identity.liveHandle() ?: return
-        check(processGroupId == identity.pid) {
+        check(processGroupId == groupLeader.pid) {
             "Cannot stop shared CockroachDB process group $processGroupId because its verified " +
-                "leader PID was ${identity.pid}."
+                "leader PID was ${groupLeader.pid}."
         }
+        val members = liveProcessGroupMembers(processGroupId)
+        if (members.isEmpty()) return
         val kill = ProcessBuilder(
             "/bin/kill",
             "-KILL",
@@ -636,11 +660,98 @@ private object SharedCockroachNode {
             "-$processGroupId",
         ).start()
         val exitCode = kill.waitFor()
-        check(exitCode == 0 || !handle.isAlive) {
+        check(exitCode == 0 || liveProcessGroupMembers(processGroupId).isEmpty()) {
             "Could not signal shared CockroachDB process group $processGroupId; /bin/kill exited " +
-                "with code $exitCode and process ${identity.pid} remained alive."
+                "with code $exitCode and the process group remained alive."
         }
-        waitForProcessExit(identity, handle, logFile, "process group $processGroupId")
+        members.forEach { member ->
+            member.identity.liveHandle()?.let { liveHandle ->
+                waitForProcessExit(
+                    member.identity,
+                    liveHandle,
+                    logFile,
+                    "process-group $processGroupId member",
+                )
+            }
+        }
+        check(liveProcessGroupMembers(processGroupId).isEmpty()) {
+            "Shared CockroachDB process group $processGroupId still had live members after " +
+                "forcible shutdown."
+        }
+    }
+
+    private fun liveProcessGroupMembers(processGroupId: Long): List<ManagedProcessMember> =
+        File("/proc").listFiles().orEmpty().mapNotNull { processDirectory ->
+            val pid = processDirectory.name.toLongOrNull() ?: return@mapNotNull null
+            val statFile = File(processDirectory, "stat")
+            val stat = try {
+                statFile.readText()
+            } catch (failure: Exception) {
+                val handle = ProcessHandle.of(pid).orElse(null)
+                if (handle == null || !handle.isAlive) return@mapNotNull null
+                throw IllegalStateException(
+                    "Could not inspect live PID $pid while enumerating shared CockroachDB process " +
+                        "group $processGroupId from ${statFile.absolutePath}: ${failure.message}",
+                    failure,
+                )
+            }
+            val commandEnd = stat.lastIndexOf(") ")
+            check(commandEnd >= 0) {
+                "Linux process state ${statFile.absolutePath} had an unrecognised value '$stat'."
+            }
+            val fields = stat.substring(commandEnd + 2).trim().split(Regex("\\s+"))
+            check(fields.size > 2) {
+                "Linux process state ${statFile.absolutePath} did not contain a process-group " +
+                    "field: '$stat'."
+            }
+            val actualGroup = fields[2].toLongOrNull() ?: throw IllegalStateException(
+                "Linux process state ${statFile.absolutePath} contained non-numeric process group " +
+                    "'${fields[2]}'.",
+            )
+            if (actualGroup != processGroupId || fields[0] == "Z") return@mapNotNull null
+            val handle = ProcessHandle.of(pid).orElse(null) ?: return@mapNotNull null
+            if (!handle.isAlive) return@mapNotNull null
+            ManagedProcessMember(
+                try {
+                    processIdentity(handle, "process-group $processGroupId member")
+                } catch (failure: IllegalArgumentException) {
+                    if (!handle.isAlive) return@mapNotNull null
+                    throw IllegalStateException(
+                        "Live process-group $processGroupId member PID $pid did not expose its " +
+                            "start time.",
+                        failure,
+                    )
+                },
+            )
+        }
+
+    private fun readProcessEvidence(
+        file: File,
+        description: String,
+        expectedToken: String?,
+        defaultProcessGroupToPid: Boolean,
+    ): ManagedProcessEvidence? {
+        val properties = loadVersionedProperties(file, description) ?: return null
+        val token = properties.getProperty("token") ?: throw IllegalStateException(
+            "$description at ${file.absolutePath} did not contain token.",
+        )
+        if (expectedToken != null && token != expectedToken) {
+            throw IllegalStateException(
+                "$description at ${file.absolutePath} contained token '$token', but cleanup " +
+                    "expected token '$expectedToken'.",
+            )
+        }
+        val identity = parseIdentity(properties, "pid", "startedAtMillis", description, file)
+        val groupValue = properties.getProperty("processGroupId")
+        val groupId = if (groupValue == null) {
+            identity.pid.takeIf { defaultProcessGroupToPid }
+        } else {
+            groupValue.toLongOrNull() ?: throw IllegalStateException(
+                "$description at ${file.absolutePath} contained non-numeric " +
+                    "processGroupId='$groupValue'.",
+            )
+        }
+        return ManagedProcessEvidence(identity, groupId)
     }
 
     private fun stopProcess(
@@ -721,11 +832,13 @@ private object SharedCockroachNode {
         )
         val daemonPid = properties.getProperty("daemonPid")
         val daemonStartedAt = properties.getProperty("daemonStartedAtMillis")
-        if ((daemonPid == null) != (daemonStartedAt == null)) {
+        val daemonProcessGroupId = properties.getProperty("daemonProcessGroupId")
+        if (setOf(daemonPid, daemonStartedAt, daemonProcessGroupId).map { it == null }.distinct().size != 1) {
             throw IllegalStateException(
-                "Shared CockroachDB owner claim ${ownerFile.absolutePath} must contain both " +
-                    "daemonPid and daemonStartedAtMillis, but daemonPid='$daemonPid' and " +
-                    "daemonStartedAtMillis='$daemonStartedAt'.",
+                "Shared CockroachDB owner claim ${ownerFile.absolutePath} must contain daemonPid, " +
+                    "daemonStartedAtMillis and daemonProcessGroupId together, but daemonPid=" +
+                    "'$daemonPid', daemonStartedAtMillis='$daemonStartedAt' and " +
+                    "daemonProcessGroupId='$daemonProcessGroupId'.",
             )
         }
         return SharedCockroachOwnerClaim(
@@ -759,6 +872,13 @@ private object SharedCockroachNode {
                     ownerFile,
                 )
             },
+            daemonProcessGroupId = daemonProcessGroupId?.toLongOrNull()
+                ?: daemonProcessGroupId?.let {
+                    throw IllegalStateException(
+                        "Shared CockroachDB owner claim ${ownerFile.absolutePath} contained " +
+                            "non-numeric daemonProcessGroupId='$it'.",
+                    )
+                },
         )
     }
 
@@ -780,6 +900,13 @@ private object SharedCockroachNode {
                     setProperty(
                         "daemonStartedAtMillis",
                         daemon.startedAt.toEpochMilli().toString(),
+                    )
+                    setProperty(
+                        "daemonProcessGroupId",
+                        requireNotNull(claim.daemonProcessGroupId) {
+                            "Attached shared CockroachDB daemon ${daemon.pid} did not have a " +
+                                "recorded process group."
+                        }.toString(),
                     )
                 }
             },
@@ -1053,6 +1180,15 @@ private data class ManagedNodeAcquisitionRecord(
 private data class ManagedNodeAcquisition(
     val jdbcUrl: String,
     val diagnostics: SharedCockroachFixtureDiagnostics,
+)
+
+private data class ManagedProcessEvidence(
+    val identity: SharedProcessIdentity,
+    val processGroupId: Long?,
+)
+
+private data class ManagedProcessMember(
+    val identity: SharedProcessIdentity,
 )
 
 private fun jdbcUrlForDatabase(adminJdbcUrl: String, databaseName: String): String {
