@@ -251,7 +251,10 @@ internal fun cleanupSharedCockroachProtocolV2ScenarioEvidence(root: File, delete
             root.walkTopDown()
                 .filter {
                     it.isDirectory &&
-                        it.name.startsWith("simplefilesystem-durable-shared-cockroach-v2-")
+                        it.name.startsWith(
+                            "simplefilesystem-durable-shared-cockroach-" +
+                                "v$SHARED_COCKROACH_PROTOCOL_VERSION-",
+                        )
                 }
                 .toList()
         }

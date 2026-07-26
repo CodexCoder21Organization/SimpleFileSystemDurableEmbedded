@@ -545,6 +545,16 @@ private class ScenarioHarness(
         check(!blocked.readyFile.exists()) {
             "Probe readiness ${blocked.readyFile.absolutePath} appeared before production warmup."
         }
+
+        val failureWorkspace = File(root, "warmup-failure-workspace").apply(::requireDirectory)
+        val failureControl = File(root, "warmup-failure-control").apply(::requireDirectory)
+        marker(File(failureControl, "fail-warmup"))
+        val failing = startProbe(
+            name = "warmup-failure",
+            workspace = failureWorkspace,
+            controlDirectory = failureControl,
+        )
+
         releaseStateLockBarrier(waiterArrival)
         removeMarker("pause-waiter-after-readiness-check")
         val warmupArrival = waitForPrefix(control, "warmup-arrived-")
@@ -558,8 +568,6 @@ private class ScenarioHarness(
         blocked.releaseAndAwait()
         removeMarker("pause-warmup")
 
-        marker("fail-warmup")
-        val failing = startProbe("warmup-failure")
         val exitCode = failing.awaitExit()
         check(exitCode != 0) {
             "Forced production warmup failure unexpectedly exited successfully."
@@ -571,7 +579,12 @@ private class ScenarioHarness(
             "Forced warmup failure output did not name the failure control:\n" +
                 failing.logFile.readText()
         }
-        val failureState = onlyStateDirectory()
+        val failureState = stateDirectories().singleOrNull { it != stateDirectory }
+            ?: throw IllegalStateException(
+                "Expected exactly one isolated failed-warmup state directory in addition to " +
+                    "${stateDirectory.absolutePath}, but found " +
+                    stateDirectories().map(File::getName),
+            )
         check(!File(failureState, "node.properties").exists()) {
             "Node readiness remained after forced production warmup failure."
         }
@@ -813,8 +826,10 @@ private class ScenarioHarness(
         name: String,
         workspace: File? = defaultWorkspace,
         startGate: File = File(runFiles, "$name-start-gate").also(::marker),
+        controlDirectory: File = control,
     ): Probe {
         workspace?.let(::requireDirectory)
+        requireDirectory(controlDirectory)
         val ready = File(runFiles, "$name-ready.properties")
         val release = File(runFiles, "$name-release")
         val armed = File(runFiles, "$name-armed.properties")
@@ -830,7 +845,7 @@ private class ScenarioHarness(
             release.absolutePath,
             armed.absolutePath,
             startGate.absolutePath,
-            control.absolutePath,
+            controlDirectory.absolutePath,
             "lease-only",
         )
         workspace?.let(processBuilder::directory)
@@ -845,7 +860,7 @@ private class ScenarioHarness(
     }
 
     private fun observations(type: String): List<ScenarioIdentity> =
-        control.listFiles().orEmpty()
+        root.walkTopDown()
             .filter {
                 it.isFile &&
                     it.name.startsWith("$type-") &&
@@ -854,6 +869,7 @@ private class ScenarioHarness(
             }
             .map(::identity)
             .distinct()
+            .toList()
 
     private fun observation(type: String, token: String): ScenarioIdentity {
         waitForPrefix(control, "$type-$token-")
@@ -922,12 +938,18 @@ private class ScenarioHarness(
         },
     )
 
-    private fun onlyStateDirectory(): File {
-        val stateDirectories = root.listFiles().orEmpty()
+    private fun stateDirectories(): List<File> =
+        root.listFiles().orEmpty()
             .filter {
                 it.isDirectory &&
-                    it.name.startsWith("simplefilesystem-durable-shared-cockroach-v2-")
+                    it.name.startsWith(
+                        "simplefilesystem-durable-shared-cockroach-" +
+                            "v$SHARED_COCKROACH_PROTOCOL_VERSION-",
+                    )
             }
+
+    private fun onlyStateDirectory(): File {
+        val stateDirectories = stateDirectories()
         check(stateDirectories.size == 1) {
             "Expected exactly one shared CockroachDB state directory under ${root.absolutePath}, " +
                 "but found ${stateDirectories.map(File::getName)}."
