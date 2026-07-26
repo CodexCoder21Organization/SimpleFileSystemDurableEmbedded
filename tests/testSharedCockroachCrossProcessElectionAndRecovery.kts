@@ -472,14 +472,8 @@ fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
     }
 }
 
-data class CrossProcessFixtureCleanupIdentity(
-    val pid: Long,
-    val startedAtMillis: Long,
-    val cockroachProcessGroupLeader: Boolean,
-)
-
 fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
-    val identities = linkedSetOf<CrossProcessFixtureCleanupIdentity>()
+    val identities = linkedSetOf<Triple<Long, Long, Boolean>>()
     val failures = mutableListOf<Throwable>()
     fun record(
         file: File,
@@ -511,7 +505,7 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
                     "Fixture identity file ${file.absolutePath} contained non-numeric " +
                         "$startedAtKey='$startedAtValue'.",
                 )
-            identities += CrossProcessFixtureCleanupIdentity(
+            identities += Triple(
                 pid,
                 startedAt,
                 cockroachProcessGroupLeader,
@@ -547,23 +541,24 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
             )
         }
     identities.forEach { identity ->
+        val (pid, startedAtMillis, cockroachProcessGroupLeader) = identity
         try {
-            val handle = ProcessHandle.of(identity.pid).orElse(null)
+            val handle = ProcessHandle.of(pid).orElse(null)
             if (handle != null &&
                 handle.isAlive &&
                 handle.info().startInstant().orElse(null)?.toEpochMilli() ==
-                identity.startedAtMillis
+                startedAtMillis
             ) {
-                if (identity.cockroachProcessGroupLeader) {
+                if (cockroachProcessGroupLeader) {
                     val kill = ProcessBuilder(
                         "/bin/kill",
                         "-KILL",
                         "--",
-                        "-${identity.pid}",
+                        "-$pid",
                     ).start()
                     val exitCode = kill.waitFor()
                     check(exitCode == 0 || !handle.isAlive) {
-                        "Could not signal CockroachDB process group ${identity.pid}; /bin/kill " +
+                        "Could not signal CockroachDB process group $pid; /bin/kill " +
                             "exited with code $exitCode and its verified leader remained alive."
                     }
                 } else {
@@ -571,7 +566,7 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
                 }
                 handle.onExit().get(10L, TimeUnit.SECONDS)
                 check(!handle.isAlive) {
-                    "Fixture process ${identity.pid} started at ${identity.startedAtMillis} " +
+                    "Fixture process $pid started at $startedAtMillis " +
                         "remained alive after forcible cleanup."
                 }
             }
