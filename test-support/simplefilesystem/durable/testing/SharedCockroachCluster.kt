@@ -572,67 +572,118 @@ private object SharedCockroachNode {
         expectedToken: String?,
     ) {
         val failures = mutableListOf<Throwable>()
-        var daemon: ManagedProcessEvidence? = null
-        var cockroach: ManagedProcessEvidence? = null
-        try {
-            daemon = readProcessEvidence(
-                File(workDirectory, "daemon.properties"),
+        val evidence = linkedSetOf<ManagedProcessEvidence>()
+        collectProcessEvidence(
+            evidence,
+            failures,
+            File(workDirectory, "daemon.properties"),
+            "shared CockroachDB daemon identity",
+        ) { properties, file ->
+            readProcessEvidence(
+                properties,
+                file,
                 "shared CockroachDB daemon identity",
                 expectedToken,
                 defaultProcessGroupToPid = false,
             )
-        } catch (failure: Throwable) {
-            failures += failure
         }
-        try {
-            cockroach = readProcessEvidence(
-                File(workDirectory, "cockroach.properties"),
+        collectProcessEvidence(
+            evidence,
+            failures,
+            File(workDirectory, "cockroach.properties"),
+            "shared CockroachDB process identity",
+        ) { properties, file ->
+            readProcessEvidence(
+                properties,
+                file,
                 "shared CockroachDB process identity",
                 expectedToken,
                 defaultProcessGroupToPid = true,
             )
-        } catch (failure: Throwable) {
-            failures += failure
         }
-        if (daemon != null) {
+
+        if (expectedToken != null) {
+            collectOwnerProcessEvidence(
+                evidence,
+                failures,
+                expectedToken,
+                workDirectory,
+            )
+            collectNodeProcessEvidence(
+                evidence,
+                failures,
+                stateFile,
+                "shared CockroachDB node state",
+                expectedToken,
+                workDirectory,
+            )
+            collectNodeProcessEvidence(
+                evidence,
+                failures,
+                warmupProofFile,
+                "shared CockroachDB warmup proof",
+                expectedToken,
+                workDirectory,
+            )
+            collectDaemonRecordEvidence(
+                evidence,
+                failures,
+                heartbeatFile,
+                "shared CockroachDB heartbeat",
+                expectedToken,
+            )
+            collectDaemonRecordEvidence(
+                evidence,
+                failures,
+                failureFile,
+                "shared CockroachDB startup failure",
+                expectedToken,
+            )
+        }
+
+        evidence.filter { it.processGroupId == null }.forEach { process ->
             try {
-                val daemonGroupId = daemon.processGroupId
-                if (daemonGroupId == null) {
-                    stopProcess(daemon.identity, File(workDirectory, "daemon.out"), "daemon")
-                } else {
-                    stopRecordedProcessGroup(
-                        daemon.identity,
-                        daemonGroupId,
-                        File(workDirectory, "daemon.out"),
+                stopProcess(
+                    process.identity,
+                    File(workDirectory, "daemon.out"),
+                    "recorded process",
+                )
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+        }
+        evidence.filter { it.processGroupId != null }
+            .groupBy { requireNotNull(it.processGroupId) }
+            .forEach { (groupId, members) ->
+            try {
+                val leader = members.singleOrNull { it.identity.pid == groupId }
+                    ?: throw IllegalStateException(
+                        "Shared CockroachDB process evidence for group $groupId did not contain " +
+                            "exactly one verified leader; identities=" +
+                            members.map { "${it.identity.pid}@${it.identity.startedAt}" },
                     )
+                stopRecordedProcessGroup(
+                    leader.identity,
+                    groupId,
+                    File(workDirectory, "cockroach.out"),
+                )
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+        }
+
+        evidence.forEach { process ->
+            try {
+                check(process.identity.liveHandle() == null) {
+                    "Shared CockroachDB process evidence recorded PID ${process.identity.pid} " +
+                        "started at ${process.identity.startedAt}, but it remained alive; " +
+                        "preserving ${workDirectory.absolutePath}."
                 }
             } catch (failure: Throwable) {
                 failures += failure
             }
         }
-        if (cockroach != null) {
-            try {
-                val groupId = cockroach.processGroupId
-                if (groupId == null) {
-                    stopProcess(cockroach.identity, File(workDirectory, "cockroach.out"), "process")
-                } else if (groupId == cockroach.identity.pid) {
-                    stopRecordedProcessGroup(
-                        cockroach.identity,
-                        groupId,
-                        File(workDirectory, "cockroach.out"),
-                    )
-                } else if (daemon?.processGroupId != groupId) {
-                    failures += IllegalStateException(
-                        "Shared CockroachDB identity ${cockroach.identity.pid} recorded process " +
-                            "group $groupId, but no daemon identity proved leadership of that group.",
-                    )
-                }
-            } catch (failure: Throwable) {
-                failures += failure
-            }
-        }
-        val verifiedProcessesDead =
-            daemon?.identity?.liveHandle() == null && cockroach?.identity?.liveHandle() == null
+        val verifiedProcessesDead = evidence.all { it.identity.liveHandle() == null }
         if (failures.isEmpty() && verifiedProcessesDead) {
             if (workDirectory.exists() && !workDirectory.deleteRecursively()) {
                 failures += IllegalStateException(
@@ -645,6 +696,138 @@ private object SharedCockroachNode {
             "cleanup of shared CockroachDB work directory ${workDirectory.absolutePath}",
             failures,
         )
+    }
+
+    private fun collectProcessEvidence(
+        evidence: MutableSet<ManagedProcessEvidence>,
+        failures: MutableList<Throwable>,
+        file: File,
+        description: String,
+        parse: (Properties, File) -> ManagedProcessEvidence?,
+    ) {
+        try {
+            val properties = loadVersionedProperties(file, description) ?: return
+            parse(properties, file)?.let(evidence::add)
+        } catch (failure: Throwable) {
+            failures += failure
+        }
+    }
+
+    private fun collectOwnerProcessEvidence(
+        evidence: MutableSet<ManagedProcessEvidence>,
+        failures: MutableList<Throwable>,
+        expectedToken: String,
+        expectedWorkDirectory: File,
+    ) {
+        collectProcessEvidence(
+            evidence,
+            failures,
+            ownerFile,
+            "shared CockroachDB owner claim",
+        ) { properties, file ->
+            val token = requiredProperty(
+                properties,
+                "token",
+                file,
+                "shared CockroachDB owner claim",
+            )
+            parseIdentity(
+                properties,
+                "ownerPid",
+                "ownerStartedAtMillis",
+                "shared CockroachDB owner claim election owner",
+                file,
+            )
+            val recordedWorkDirectory = requireManagedWorkDirectory(
+                stateDirectory,
+                File(
+                    requiredProperty(
+                        properties,
+                        "workDirectory",
+                        file,
+                        "shared CockroachDB owner claim",
+                    ),
+                ),
+            )
+            val daemonPid = properties.getProperty("daemonPid") ?: return@collectProcessEvidence null
+            val daemon = parseIdentity(
+                properties,
+                "daemonPid",
+                "daemonStartedAtMillis",
+                "shared CockroachDB owner claim daemon",
+                file,
+            )
+            val groupId = requiredLong(properties, "daemonProcessGroupId", file)
+            if (token == expectedToken && recordedWorkDirectory == expectedWorkDirectory) {
+                ManagedProcessEvidence(daemon, groupId)
+            } else {
+                null
+            }
+        }
+    }
+
+    private fun collectNodeProcessEvidence(
+        evidence: MutableSet<ManagedProcessEvidence>,
+        failures: MutableList<Throwable>,
+        file: File,
+        description: String,
+        expectedToken: String,
+        expectedWorkDirectory: File,
+    ) {
+        collectProcessEvidence(evidence, failures, file, description) { properties, source ->
+            val token = requiredProperty(properties, "token", source, description)
+            val cockroach = parseIdentity(
+                properties,
+                "pid",
+                "processStartedAtMillis",
+                "$description CockroachDB process",
+                source,
+            )
+            val groupId = requiredLong(properties, "processGroupId", source)
+            val daemon = parseIdentity(
+                properties,
+                "daemonPid",
+                "daemonStartedAtMillis",
+                "$description daemon",
+                source,
+            )
+            val recordedWorkDirectory = requireManagedWorkDirectory(
+                stateDirectory,
+                File(requiredProperty(properties, "workDirectory", source, description)),
+            )
+            properties.getProperty("jdbcUrl")?.let { jdbcUrl ->
+                jdbcUrlForDatabase(jdbcUrl, "cleanup_validation")
+            } ?: throw IllegalStateException(
+                "$description ${source.absolutePath} did not contain jdbcUrl.",
+            )
+            if (token == expectedToken && recordedWorkDirectory == expectedWorkDirectory) {
+                evidence += ManagedProcessEvidence(daemon, groupId)
+                ManagedProcessEvidence(cockroach, groupId)
+            } else {
+                null
+            }
+        }
+    }
+
+    private fun collectDaemonRecordEvidence(
+        evidence: MutableSet<ManagedProcessEvidence>,
+        failures: MutableList<Throwable>,
+        file: File,
+        description: String,
+        expectedToken: String,
+    ) {
+        collectProcessEvidence(evidence, failures, file, description) { properties, source ->
+            val token = requiredProperty(properties, "token", source, description)
+            val daemon = parseIdentity(
+                properties,
+                "daemonPid",
+                "daemonStartedAtMillis",
+                "$description daemon",
+                source,
+            )
+            val groupId = requiredLong(properties, "daemonProcessGroupId", source)
+            if (token == expectedToken) ManagedProcessEvidence(daemon, groupId) else null
+        }
     }
 
     private fun stopRecordedProcessGroup(
@@ -731,12 +914,12 @@ private object SharedCockroachNode {
         }
 
     private fun readProcessEvidence(
+        properties: Properties,
         file: File,
         description: String,
         expectedToken: String?,
         defaultProcessGroupToPid: Boolean,
     ): ManagedProcessEvidence? {
-        val properties = loadVersionedProperties(file, description) ?: return null
         val token = properties.getProperty("token") ?: throw IllegalStateException(
             "$description at ${file.absolutePath} did not contain token.",
         )
@@ -1152,6 +1335,15 @@ private object SharedCockroachNode {
             "Shared CockroachDB record ${file.absolutePath} contained non-numeric $key='$value'.",
         )
     }
+
+    private fun requiredProperty(
+        properties: Properties,
+        key: String,
+        file: File,
+        description: String,
+    ): String = properties.getProperty(key) ?: throw IllegalStateException(
+        "$description ${file.absolutePath} did not contain $key.",
+    )
 
     private fun <T> withStateLock(block: () -> T): T = synchronized(processLocalLock) {
         if (!stateDirectory.isDirectory) stateDirectory.mkdirs()

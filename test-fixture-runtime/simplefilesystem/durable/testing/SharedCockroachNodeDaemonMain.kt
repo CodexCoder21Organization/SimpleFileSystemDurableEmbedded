@@ -567,6 +567,7 @@ private fun publishStartupFailure(
                     "daemonStartedAtMillis",
                     daemonIdentity.startedAt.toEpochMilli().toString(),
                 )
+                setProperty("daemonProcessGroupId", daemonIdentity.pid.toString())
                 setProperty(
                     "message",
                     failure.message ?: failure::class.java.name,
@@ -682,6 +683,7 @@ private fun writeHeartbeat(
                 "daemonStartedAtMillis",
                 daemonIdentity.startedAt.toEpochMilli().toString(),
             )
+            setProperty("daemonProcessGroupId", daemonIdentity.pid.toString())
             setProperty("writtenAtMillis", System.currentTimeMillis().toString())
         },
     )

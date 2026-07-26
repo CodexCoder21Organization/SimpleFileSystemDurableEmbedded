@@ -30,6 +30,7 @@ fun main(args: Array<String>) {
             "post-spawn-identity-crash" -> harness.postSpawnIdentityCrash()
             "pre-readiness-daemon-crash" -> harness.preReadinessDaemonCrash()
             "expired-attached-startup" -> harness.expiredAttachedStartup()
+            "missing-local-process-evidence" -> harness.missingLocalProcessEvidence()
             "deterministic-contention" -> harness.deterministicContention()
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
             "warmup-publication" -> harness.warmupPublication()
@@ -232,6 +233,87 @@ private class ScenarioHarness(
         assertDead(expiredCockroach, "CockroachDB child of expired startup token")
         assertUsable(required(ready, "jdbcUrl", probe.readyFile))
         probe.releaseAndAwait()
+        assertAllObservedDead()
+    }
+
+    fun missingLocalProcessEvidence() = protect {
+        val original = startProbe("original")
+        val originalReady = original.awaitReady()
+        val token = required(originalReady, "token", original.readyFile)
+        val originalDaemon = readyIdentity(originalReady, original.readyFile, "daemon")
+        val originalCockroach = readyIdentity(originalReady, original.readyFile, "cockroach")
+        val stateDirectory = File(
+            required(originalReady, "stateDirectory", original.readyFile),
+        )
+        val nodeFile = File(stateDirectory, "node.properties")
+        check(properties(nodeFile).getProperty("token") == token) {
+            "Ready node evidence ${nodeFile.absolutePath} did not retain token '$token'."
+        }
+        val workDirectory = File(
+            required(properties(nodeFile), "workDirectory", nodeFile),
+        )
+
+        killProcessOnly(originalDaemon)
+        val originalCockroachEvidence = File(workDirectory, "cockroach.properties")
+        check(originalCockroachEvidence.delete()) {
+            "Could not remove test-owned local process evidence " +
+                "${originalCockroachEvidence.absolutePath}."
+        }
+        check(nodeFile.isFile) {
+            "Global node evidence ${nodeFile.absolutePath} disappeared before reconciliation."
+        }
+
+        val replacement = startProbe("replacement")
+        val replacementReady = replacement.awaitReady()
+        val replacementToken = required(replacementReady, "token", replacement.readyFile)
+        check(replacementToken != token) {
+            "Replacement retained dead daemon token '$token'."
+        }
+        assertDead(originalDaemon, "killed daemon with missing local process evidence")
+        assertDead(
+            originalCockroach,
+            "CockroachDB process with missing cockroach.properties",
+        )
+        assertUsable(required(replacementReady, "jdbcUrl", replacement.readyFile))
+
+        val replacementDaemon = readyIdentity(replacementReady, replacement.readyFile, "daemon")
+        val replacementCockroach = readyIdentity(
+            replacementReady,
+            replacement.readyFile,
+            "cockroach",
+        )
+        val replacementNodeFile = File(
+            required(replacementReady, "stateDirectory", replacement.readyFile),
+            "node.properties",
+        )
+        val replacementWorkDirectory = File(
+            required(
+                properties(replacementNodeFile),
+                "workDirectory",
+                replacementNodeFile,
+            ),
+        )
+        killProcessOnly(replacementDaemon)
+        listOf("cockroach.properties", "daemon.properties").forEach { name ->
+            val evidence = File(replacementWorkDirectory, name)
+            check(evidence.delete()) {
+                "Could not remove test-owned local process evidence ${evidence.absolutePath}."
+            }
+        }
+        val third = startProbe("global-evidence-only")
+        val thirdReady = third.awaitReady()
+        check(required(thirdReady, "token", third.readyFile) != replacementToken) {
+            "Global-evidence-only recovery retained dead token '$replacementToken'."
+        }
+        assertDead(
+            replacementCockroach,
+            "CockroachDB process recoverable only from global node evidence",
+        )
+        assertUsable(required(thirdReady, "jdbcUrl", third.readyFile))
+
+        original.releaseAndAwait()
+        replacement.releaseAndAwait()
+        third.releaseAndAwait()
         assertAllObservedDead()
     }
 
