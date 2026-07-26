@@ -31,10 +31,26 @@ instead of through `scripts/test.bash`. A cross-process lock elects a detached f
 forked test JVMs wait on its atomic readiness state without holding the lock through CockroachDB
 startup. Before publishing readiness, both launch paths run the production schema bootstrap in a
 throwaway database so concurrent test databases reach a warm SQL layer. Per-test leases keep the
-memory-bounded process alive until every isolated logical database is finished, and the final
-lease removes the daemon, node, state, and work directory. Direct dispatch retains uniquely named
-databases only until that disposable node stops; a caller-supplied longer-lived fixture drops each
-logical database when its test closes.
+memory-bounded process alive until every isolated logical database is finished. The final lease
+removes the daemon, node records, lease directory, and managed work directories; the state
+directory and its never-replaced lock file remain available for later runs. Direct dispatch retains
+uniquely named databases only until that disposable node stops; a caller-supplied longer-lived
+fixture drops each logical database when its test closes.
+
+Managed state uses protocol version 2 under `java.io.tmpdir`, scoped by the first 16 hexadecimal
+characters of SHA-256 over the canonical workspace root. Kompile gives every child test JVM in one
+run the same workspace working directory, so those children rendezvous while independent checkouts
+cannot share fixture records. Every durable record carries the protocol version; encountering any
+other version fails without adopting, overwriting, or tearing down that record.
+
+The daemon ownership handshake prevents CockroachDB from starting until the daemon has atomically
+attached its PID and process-start time to the still-live pre-spawn election claim. Cooperative
+daemon shutdown kills the dedicated CockroachDB process group. An uncatchable daemon `SIGKILL`
+cannot run cleanup code, so immediate child cleanup is not promised in that case; a subsequent
+acquire or release recovers by detecting the dead owner or stale heartbeat, verifying PID plus
+start time, and reaping the recorded process group before replacement. This orphan mechanism also
+existed when the node was a direct child of a test JVM, although the detached daemon adds another
+process whose abrupt death must be recovered.
 
 ## Programmatic example
 

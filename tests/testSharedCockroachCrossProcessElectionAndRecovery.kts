@@ -87,9 +87,9 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "Every independently forked JVM must receive a distinct logical database.",
         )
         jdbcUrls.forEachIndexed { index, jdbcUrl ->
-            assertDurableSchemaInitialized(
+            assertProbeDatabaseSchemaInitialized(
                 jdbcUrl,
-                "Forked JVM $index must publish readiness only after production schema bootstrap.",
+                "Forked JVM $index must initialize its isolated database through the public manager.",
             )
         }
 
@@ -174,9 +174,9 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         ).use { connection ->
             assertTrue(connection.isValid(2), "The state-recovered logical database must accept JDBC connections.")
         }
-        assertDurableSchemaInitialized(
+        assertProbeDatabaseSchemaInitialized(
             requireNotNull(stateRecoveryProperties.getProperty("jdbcUrl")),
-            "A second bootstrap attempt must adopt the live node and initialize its isolated schema.",
+            "A second acquisition must adopt the live node and initialize its isolated database.",
         )
 
         releases[0].writeText("release")
@@ -249,9 +249,9 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
         observedIdentities +=
             requireNotNull(staleLeaseRecoveryProperties.getProperty("cockroachPid")).toLong() to
             requireNotNull(staleLeaseRecoveryProperties.getProperty("cockroachStartedAtMillis")).toLong()
-        assertDurableSchemaInitialized(
+        assertProbeDatabaseSchemaInitialized(
             requireNotNull(staleLeaseRecoveryProperties.getProperty("jdbcUrl")),
-            "The acquisition that purges a stale lease must initialize its isolated schema.",
+            "The acquisition that purges a stale lease must initialize its isolated database.",
         )
 
         val originalNode = ProcessHandle.of(originalPid).orElseThrow {
@@ -407,8 +407,15 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             }
         }
         var fixtureProcessesConfirmedDead = processes.none(Process::isAlive)
-        val stateDirectory = managedStateDirectory
-        if (stateDirectory != null && stateDirectory.isDirectory) {
+        val stateDirectories = linkedSetOf<File>()
+        managedStateDirectory?.takeIf(File::isDirectory)?.let(stateDirectories::add)
+        cleanupRoot?.listFiles().orEmpty()
+            .filter {
+                it.isDirectory &&
+                    it.name.startsWith("simplefilesystem-durable-shared-cockroach-v2-")
+            }
+            .forEach(stateDirectories::add)
+        stateDirectories.forEach { stateDirectory ->
             try {
                 cleanupCrossProcessFixtureProcesses(stateDirectory)
             } catch (failure: Throwable) {
@@ -465,10 +472,21 @@ fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
     }
 }
 
+data class CrossProcessFixtureCleanupIdentity(
+    val pid: Long,
+    val startedAtMillis: Long,
+    val cockroachProcessGroupLeader: Boolean,
+)
+
 fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
-    val identities = linkedSetOf<Pair<Long, Long>>()
+    val identities = linkedSetOf<CrossProcessFixtureCleanupIdentity>()
     val failures = mutableListOf<Throwable>()
-    fun record(file: File, pidKey: String, startedAtKey: String) {
+    fun record(
+        file: File,
+        pidKey: String,
+        startedAtKey: String,
+        cockroachProcessGroupLeader: Boolean,
+    ) {
         if (!file.isFile) return
         try {
             val properties = Properties().apply {
@@ -493,38 +511,68 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
                     "Fixture identity file ${file.absolutePath} contained non-numeric " +
                         "$startedAtKey='$startedAtValue'.",
                 )
-            identities += pid to startedAt
+            identities += CrossProcessFixtureCleanupIdentity(
+                pid,
+                startedAt,
+                cockroachProcessGroupLeader,
+            )
         } catch (failure: Throwable) {
             failures += failure
         }
     }
 
     val nodeState = File(stateDirectory, "node.properties")
-    record(nodeState, "daemonPid", "daemonStartedAtMillis")
-    record(nodeState, "pid", "processStartedAtMillis")
+    record(nodeState, "daemonPid", "daemonStartedAtMillis", false)
+    record(nodeState, "pid", "processStartedAtMillis", true)
     record(
         File(stateDirectory, "node-owner.properties"),
         "daemonPid",
         "daemonStartedAtMillis",
+        false,
     )
     stateDirectory.listFiles().orEmpty()
         .filter { it.isDirectory && it.name.startsWith("node-") }
         .forEach { workDirectory ->
-            record(File(workDirectory, "daemon.properties"), "pid", "startedAtMillis")
-            record(File(workDirectory, "cockroach.properties"), "pid", "startedAtMillis")
+            record(
+                File(workDirectory, "daemon.properties"),
+                "pid",
+                "startedAtMillis",
+                false,
+            )
+            record(
+                File(workDirectory, "cockroach.properties"),
+                "pid",
+                "startedAtMillis",
+                true,
+            )
         }
-    identities.forEach { (pid, startedAtMillis) ->
+    identities.forEach { identity ->
         try {
-            val handle = ProcessHandle.of(pid).orElse(null)
+            val handle = ProcessHandle.of(identity.pid).orElse(null)
             if (handle != null &&
                 handle.isAlive &&
-                handle.info().startInstant().orElse(null)?.toEpochMilli() == startedAtMillis
+                handle.info().startInstant().orElse(null)?.toEpochMilli() ==
+                identity.startedAtMillis
             ) {
-                handle.destroyForcibly()
+                if (identity.cockroachProcessGroupLeader) {
+                    val kill = ProcessBuilder(
+                        "/bin/kill",
+                        "-KILL",
+                        "--",
+                        "-${identity.pid}",
+                    ).start()
+                    val exitCode = kill.waitFor()
+                    check(exitCode == 0 || !handle.isAlive) {
+                        "Could not signal CockroachDB process group ${identity.pid}; /bin/kill " +
+                            "exited with code $exitCode and its verified leader remained alive."
+                    }
+                } else {
+                    handle.destroyForcibly()
+                }
                 handle.onExit().get(10L, TimeUnit.SECONDS)
                 check(!handle.isAlive) {
-                    "Fixture process $pid started at $startedAtMillis remained alive after " +
-                        "forcible cleanup."
+                    "Fixture process ${identity.pid} started at ${identity.startedAtMillis} " +
+                        "remained alive after forcible cleanup."
                 }
             }
         } catch (failure: Throwable) {
@@ -541,7 +589,7 @@ fun cleanupCrossProcessFixtureProcesses(stateDirectory: File) {
     }
 }
 
-fun assertDurableSchemaInitialized(jdbcUrl: String, message: String) {
+fun assertProbeDatabaseSchemaInitialized(jdbcUrl: String, message: String) {
     DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
         connection.createStatement().use { statement ->
             statement.executeQuery(
