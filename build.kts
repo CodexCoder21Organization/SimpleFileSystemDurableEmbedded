@@ -76,39 +76,11 @@ private fun assembleCockroachTestFixtureFatJar(): File = BuildJar(
  * dependencies. The node is therefore warm before any forked test JVM's timeout begins.
  */
 fun buildCockroachTestFixtureFatJar(): File {
-    makeFixtureRuleResultUncacheable()
     val fixtureJar = assembleCockroachTestFixtureFatJar()
     if (System.getenv("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL").isNullOrBlank()) {
         prestartCockroachForKompileSession(fixtureJar)
     }
     return fixtureJar
-}
-
-/**
- * Kompile build-rule caching is valid for pure artifact construction, but this rule also acquires
- * a process lease for its current Kompile session. A cache hit in a later session would return the
- * jar without acquiring that lease or performing prestart.
- *
- * Reading an invocation-unique input and removing it before publication makes both the local
- * result index and any snapshot copied by BuildTest deterministically stale. This does not depend
- * on asynchronously deleting the result-index file before a cache packager can copy it.
- */
-private fun makeFixtureRuleResultUncacheable() {
-    val marker = File.createTempFile("simplefilesystem-durable-fixture-invocation-", ".input")
-    val expected = "${ProcessHandle.current().pid()}:${System.nanoTime()}"
-    try {
-        marker.writeText(expected)
-        check(marker.readText() == expected) {
-            "Could not verify the transient shared CockroachDB fixture cache input at " +
-                "${marker.absolutePath}."
-        }
-    } finally {
-        check(!marker.exists() || marker.delete()) {
-            "Could not delete the transient shared CockroachDB fixture cache input at " +
-                "${marker.absolutePath}; a later Kompile session could incorrectly reuse this " +
-                "session's prestart result."
-        }
-    }
 }
 
 /**
