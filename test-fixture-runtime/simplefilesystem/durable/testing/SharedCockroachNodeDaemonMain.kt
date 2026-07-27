@@ -204,6 +204,19 @@ fun main(args: Array<String>) {
             lifecycle.await()
             if (cockroachExit.isCompletedExceptionally) cockroachExit.join()
             ownershipFailure.get()?.let { throw it }
+        } catch (failure: Throwable) {
+            try {
+                publishStartupFailure(
+                    stateDirectory,
+                    workDirectory,
+                    token,
+                    daemonIdentity,
+                    failure,
+                )
+            } catch (publicationFailure: Throwable) {
+                failure.addSuppressed(publicationFailure)
+            }
+            throw failure
         } finally {
             heartbeatExecutor.shutdownNow()
             cleanupCockroach()
