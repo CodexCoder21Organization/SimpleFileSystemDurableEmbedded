@@ -8,6 +8,7 @@ import build.kotlin.withartifact.WithArtifact
 import java.io.File
 import java.nio.file.FileSystems
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.nio.file.StandardWatchEventKinds
 import java.sql.DriverManager
 import java.util.Properties
@@ -119,7 +120,22 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "workDirectory",
             File(privateTemp, "unsafe-work-directory").absolutePath,
         )
-        stateFile.outputStream().use { originalState.store(it, null) }
+        val stagedCorruptState = Files.createTempFile(
+            stateFile.parentFile.toPath(),
+            ".node-properties-corruption-",
+            ".properties",
+        )
+        try {
+            stagedCorruptState.toFile().outputStream().use { originalState.store(it, null) }
+            Files.move(
+                stagedCorruptState,
+                stateFile.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+        } finally {
+            Files.deleteIfExists(stagedCorruptState)
+        }
 
         val stateRecoveryReady = File(privateTemp, "ready-state-recovery")
         val stateRecoveryRelease = File(privateTemp, "release-state-recovery")
