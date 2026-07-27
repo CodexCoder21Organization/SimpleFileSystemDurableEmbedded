@@ -33,16 +33,24 @@ internal fun warmUpDurableSchema(
             statement.execute("CREATE DATABASE ${fixtureQuoteIdentifier(databaseName)}")
         }
     }
-    Database("org.postgresql.Driver", databaseJdbcUrl, "root", "").use { database ->
-        DurableSimpleFileSystemManager(
-            blobstoreService = InMemoryBlobstoreService(),
-            metadataDatabase = database,
-        ).use { manager ->
-            manager.listFilesystems(null, 1)
+    try {
+        Database("org.postgresql.Driver", databaseJdbcUrl, "root", "").use { database ->
+            DurableSimpleFileSystemManager(
+                blobstoreService = InMemoryBlobstoreService(),
+                metadataDatabase = database,
+            ).use { manager ->
+                manager.listFilesystems(null, 1)
+            }
+        }
+    } finally {
+        DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.execute(
+                    "DROP DATABASE IF EXISTS ${fixtureQuoteIdentifier(databaseName)} CASCADE",
+                )
+            }
         }
     }
-    // The fixture owns an in-memory node, so retaining this database keeps the schema warm without
-    // paying for DROP DATABASE CASCADE while concurrent test JVMs share a two-CPU worker.
     verifyOwnership()
 }
 
