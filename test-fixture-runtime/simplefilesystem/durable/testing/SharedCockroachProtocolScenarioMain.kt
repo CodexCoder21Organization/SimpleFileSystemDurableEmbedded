@@ -712,11 +712,13 @@ private class ScenarioHarness(
         assertUsable(required(secondReady, "jdbcUrl", second.readyFile))
 
         val foreign = File(secondState, "leases/foreign-protocol")
-        Properties().apply {
-            setProperty("protocolVersion", "999")
-            setProperty("sentinel", "must-remain")
-        }.also { values ->
-            foreign.outputStream().use { values.store(it, null) }
+        withScenarioStateLock(secondState) {
+            Properties().apply {
+                setProperty("protocolVersion", "999")
+                setProperty("sentinel", "must-remain")
+            }.also { values ->
+                foreign.outputStream().use { values.store(it, null) }
+            }
         }
         val contender = startProbe("foreign-version", workspace = workspaceB)
         val contenderReady = contender.awaitReady()
