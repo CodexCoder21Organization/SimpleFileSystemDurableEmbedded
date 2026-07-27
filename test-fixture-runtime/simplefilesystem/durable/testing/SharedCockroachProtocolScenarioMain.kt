@@ -1056,13 +1056,15 @@ private class ScenarioHarness(
         val ready = owner.awaitReady()
         val stateDirectory = File(required(ready, "stateDirectory", owner.readyFile))
         val malformedLease = File(stateDirectory, "leases/malformed-lease")
-        writePropertiesAtomically(
-            malformedLease,
-            versionedProperties().apply {
-                setProperty("pid", "not-a-pid")
-                setProperty("startedAtMillis", "0")
-            },
-        )
+        withStateLock(stateDirectory) {
+            writePropertiesAtomically(
+                malformedLease,
+                versionedProperties().apply {
+                    setProperty("pid", "not-a-pid")
+                    setProperty("startedAtMillis", "0")
+                },
+            )
+        }
         val leaseReader = startProbe("invalid-lease-reader")
         check(leaseReader.awaitExit() != 0) {
             "A contender accepted malformed lease ${malformedLease.absolutePath}."
@@ -1079,8 +1081,10 @@ private class ScenarioHarness(
         check(malformedLease.isFile) {
             "Malformed lease ${malformedLease.absolutePath} was deleted as stale."
         }
-        check(malformedLease.delete()) {
-            "Could not remove test-owned malformed lease ${malformedLease.absolutePath}."
+        withStateLock(stateDirectory) {
+            check(malformedLease.delete()) {
+                "Could not remove test-owned malformed lease ${malformedLease.absolutePath}."
+            }
         }
 
         val nodeFile = File(stateDirectory, "node.properties")
@@ -1089,7 +1093,9 @@ private class ScenarioHarness(
             putAll(validNode)
             setProperty("pid", "not-a-node-pid")
         }
-        writePropertiesAtomically(nodeFile, malformedNode)
+        withStateLock(stateDirectory) {
+            writePropertiesAtomically(nodeFile, malformedNode)
+        }
         val nodeReader = startProbe("invalid-node-reader")
         check(nodeReader.awaitExit() != 0) {
             "A contender treated malformed node state ${nodeFile.absolutePath} as missing."
@@ -1106,7 +1112,9 @@ private class ScenarioHarness(
         check(properties(nodeFile).getProperty("pid") == "not-a-node-pid") {
             "Malformed node state ${nodeFile.absolutePath} was overwritten or deleted."
         }
-        writePropertiesAtomically(nodeFile, validNode)
+        withStateLock(stateDirectory) {
+            writePropertiesAtomically(nodeFile, validNode)
+        }
         assertUsable(required(ready, "jdbcUrl", owner.readyFile))
         owner.releaseAndAwait()
         assertAllObservedDead()
