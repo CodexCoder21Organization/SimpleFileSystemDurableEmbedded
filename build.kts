@@ -114,12 +114,16 @@ private fun currentKompileSessionOwner(): ProcessHandle {
         process.parent().orElse(null)
     }.toList()
     return ancestors.firstOrNull { process ->
-        val command = processCommandArguments(process).joinToString(" ")
-        command.contains("kompile.cli.CliKt") ||
-            command.contains("/kompile/cli/kompile-cli/")
+        val arguments = processCommandArguments(process)
+        arguments.any {
+            it == "kompile.cli.CliKt" ||
+                it == "buildtest.runner.MainKt" ||
+                it.contains("/kompile/cli/kompile-cli/")
+        }
     } ?: throw IllegalStateException(
         "Cannot prestart the shared CockroachDB fixture because the build-rule process " +
-            "${ProcessHandle.current().pid()} has no live Kompile CLI ancestor. Ancestors were " +
+            "${ProcessHandle.current().pid()} has no live Kompile CLI or BuildTestRunner " +
+            "ancestor. Ancestors were " +
             ancestors.map { process ->
                 "${process.pid()}:${processCommandArguments(process).joinToString(" ")}"
             },
@@ -130,9 +134,13 @@ private fun fixtureBuildRuleCacheEntries(sessionOwner: ProcessHandle): List<File
     val arguments = processCommandArguments(sessionOwner)
     val cacheArgument = arguments.indices.firstNotNullOfOrNull { index ->
         when {
-            arguments[index] == "--cache-location" || arguments[index] == "-c" ->
+            arguments[index] == "--cache-location" ||
+                arguments[index] == "--cache" ||
+                arguments[index] == "-c" ->
                 arguments.getOrNull(index + 1)
             arguments[index].startsWith("--cache-location=") ->
+                arguments[index].substringAfter('=')
+            arguments[index].startsWith("--cache=") ->
                 arguments[index].substringAfter('=')
             else -> null
         }
