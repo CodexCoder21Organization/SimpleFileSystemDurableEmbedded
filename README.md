@@ -42,6 +42,12 @@ directory and its never-replaced lock file remain available for later runs. Dire
 retains uniquely named databases only until that disposable node stops; a caller-supplied
 longer-lived fixture drops each logical database when its test closes.
 
+kotlin.build prepares shared modules in a `BuildTestRunner --build-only` session before packaging
+its cache for test runners. That lease invalidates the same two allow-listed result indexes while
+the build-only owner is still alive, so the packaged cache cannot contain a process-local prestart
+hit after its fixture process has stopped. Direct test sessions retain their result indexes until
+their owner exits, avoiding duplicate prestart resolution within one test run.
+
 The daemon atomically records a versioned warmup attestation immediately before readiness. Node,
 warmup, lease, heartbeat, failure, owner, and work-directory records are parsed independently:
 malformed evidence is preserved and reported rather than treated as missing or stale. Raw PID or

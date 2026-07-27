@@ -206,6 +206,19 @@ internal fun invalidateFixtureBuildRuleCacheEntry(properties: Properties, leaseF
     }
 }
 
+internal fun shouldInvalidateFixtureBuildRuleCacheEntriesWhileOwnerLive(
+    properties: Properties,
+    leaseFile: File,
+): Boolean {
+    val configured = properties.getProperty(
+        "invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive",
+    ) ?: return false
+    return configured.toBooleanStrictOrNull() ?: throw IllegalStateException(
+        "Shared CockroachDB lease ${leaseFile.absolutePath} contained invalid live-owner cache " +
+            "invalidation flag '$configured'; expected 'true' or 'false'.",
+    )
+}
+
 internal fun writePropertiesAtomically(file: File, properties: Properties) {
     writePropertiesAtomically(
         file.toPath(),

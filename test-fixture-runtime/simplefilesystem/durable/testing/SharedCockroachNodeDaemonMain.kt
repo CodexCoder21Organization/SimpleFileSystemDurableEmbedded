@@ -326,6 +326,13 @@ private fun purgeStaleLeasesAndCheckLive(stateDirectory: File): Boolean {
                     invalidateFixtureBuildRuleCacheEntry(properties, lease)
                     deleteIfPresent(lease, "stale shared CockroachDB lease")
                 } else {
+                    if (shouldInvalidateFixtureBuildRuleCacheEntriesWhileOwnerLive(
+                            properties,
+                            lease,
+                        )
+                    ) {
+                        invalidateFixtureBuildRuleCacheEntry(properties, lease)
+                    }
                     liveLeaseRemains = true
                 }
             } catch (failure: Throwable) {
