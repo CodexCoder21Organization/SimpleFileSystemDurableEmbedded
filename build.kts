@@ -173,6 +173,8 @@ private fun fixtureBuildRuleCacheEntries(sessionOwner: ProcessHandle): List<File
 private fun prestartCockroachForKompileSession(fixtureJar: File) {
     val workspace = File(".").canonicalFile
     val sessionOwner = currentKompileSessionOwner()
+    val invalidateCacheWhileOwnerLive =
+        processCommandArguments(sessionOwner).any { it == "--build-only" }
     val sessionStartedAt = requireNotNull(sessionOwner.info().startInstant().orElse(null)) {
         "The Kompile CLI session process ${sessionOwner.pid()} did not expose its start time."
     }
@@ -188,6 +190,7 @@ private fun prestartCockroachForKompileSession(fixtureJar: File) {
         "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",
         sessionOwner.pid().toString(),
         sessionStartedAt.toEpochMilli().toString(),
+        invalidateCacheWhileOwnerLive.toString(),
         *cacheEntries.map(File::getAbsolutePath).toTypedArray(),
     )
         .directory(workspace)

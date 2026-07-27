@@ -184,6 +184,7 @@ private object SharedCockroachNode {
         fixtureControl: SharedCockroachFixtureControl?,
         leaseOwner: SharedProcessIdentity? = null,
         fixtureBuildRuleCacheEntries: List<File> = emptyList(),
+        invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive: Boolean = false,
     ): ManagedNodeAcquisition {
         var leaseWritten = false
         try {
@@ -204,13 +205,23 @@ private object SharedCockroachNode {
                         readReadyNode(owner, daemon)
                     }
                     if (node != null && isLiveNode(owner, node)) {
-                        writeLease(leaseName, leaseOwner, fixtureBuildRuleCacheEntries)
+                        writeLease(
+                            leaseName,
+                            leaseOwner,
+                            fixtureBuildRuleCacheEntries,
+                            invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive,
+                        )
                         leaseWritten = true
                         waitAtStateLockBarrier(fixtureControl, "acquire-after-lease")
                         return@withStateLock Acquisition.Ready(node)
                     }
                     if (owner != null) {
-                        writeLease(leaseName, leaseOwner, fixtureBuildRuleCacheEntries)
+                        writeLease(
+                            leaseName,
+                            leaseOwner,
+                            fixtureBuildRuleCacheEntries,
+                            invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive,
+                        )
                         leaseWritten = true
                         waitAtStateLockBarrier(fixtureControl, "acquire-after-lease")
                         return@withStateLock Acquisition.Starting(owner.token, owner.workDirectory)
@@ -243,7 +254,12 @@ private object SharedCockroachNode {
                         daemonProcessGroupId = null,
                     )
                     writeOwnerClaim(claim)
-                    writeLease(leaseName, leaseOwner, fixtureBuildRuleCacheEntries)
+                    writeLease(
+                        leaseName,
+                        leaseOwner,
+                        fixtureBuildRuleCacheEntries,
+                        invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive,
+                    )
                     leaseWritten = true
                     try {
                         launchDaemon(claim, fixtureControl)
@@ -1426,6 +1442,7 @@ private object SharedCockroachNode {
         leaseName: String,
         leaseOwner: SharedProcessIdentity?,
         fixtureBuildRuleCacheEntries: List<File>,
+        invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive: Boolean,
     ) {
         check(leasesDirectory.isDirectory || leasesDirectory.mkdirs()) {
             "Could not create shared CockroachDB lease directory ${leasesDirectory.absolutePath}."
@@ -1444,6 +1461,10 @@ private object SharedCockroachNode {
                 fixtureBuildRuleCacheEntries.forEachIndexed { index, cacheEntry ->
                     setProperty("fixtureBuildRuleCacheEntry.$index", cacheEntry.canonicalPath)
                 }
+                setProperty(
+                    "invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive",
+                    invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive.toString(),
+                )
             },
         )
     }
@@ -1675,6 +1696,7 @@ private fun quoteIdentifier(identifier: String): String =
 internal fun prestartSharedCockroachForSession(
     sessionOwner: SharedProcessIdentity,
     fixtureBuildRuleCacheEntries: List<File>,
+    invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive: Boolean = false,
 ) {
     val leaseName = "kompile-session-${sessionOwner.pid}-${sessionOwner.startedAt.toEpochMilli()}"
     SharedCockroachNode.acquire(
@@ -1683,5 +1705,7 @@ internal fun prestartSharedCockroachForSession(
         fixtureControl = null,
         leaseOwner = sessionOwner,
         fixtureBuildRuleCacheEntries = fixtureBuildRuleCacheEntries,
+        invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive =
+            invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive,
     )
 }

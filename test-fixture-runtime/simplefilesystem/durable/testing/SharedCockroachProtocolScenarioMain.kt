@@ -44,6 +44,7 @@ internal fun runSharedCockroachProtocolScenario(scenario: String, root: File) {
             "warmup-publication" -> harness.warmupPublication()
             "workspace-isolation" -> harness.workspaceIsolation()
             "prestart-session-owner-exit" -> harness.prestartSessionOwnerExit()
+            "build-only-cache-invalidation" -> harness.buildOnlyCacheInvalidation()
             "lease-and-pid-reuse-recovery" -> harness.leaseAndPidReuseRecovery()
             "malformed-record-diagnostics" -> harness.malformedRecordDiagnostics()
             else -> throw IllegalArgumentException(
@@ -739,6 +740,7 @@ private class ScenarioHarness(
             "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",
             sessionIdentity.pid.toString(),
             sessionIdentity.startedAt.toEpochMilli().toString(),
+            "false",
             *fixtureCacheEntries.map(File::getAbsolutePath).toTypedArray(),
         )
             .directory(defaultWorkspace)
@@ -816,6 +818,109 @@ private class ScenarioHarness(
             "Fixture shutdown discarded malformed lease evidence " +
                 "${malformedLease.absolutePath} instead of preserving it."
         }
+    }
+
+    fun buildOnlyCacheInvalidation() = protect {
+        val sessionOwner = ProcessBuilder("/bin/sleep", "120")
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+            .also(unrelatedProcesses::add)
+        val sessionIdentity = processIdentity(
+            sessionOwner.toHandle(),
+            "synthetic BuildTestRunner build-only session owner",
+        )
+        val cacheIndex = File(runFiles, "synthetic-cache/buildRuleResultIndex")
+        check(cacheIndex.mkdirs()) {
+            "Could not create synthetic BuildTestRunner build-rule cache index " +
+                "${cacheIndex.absolutePath}."
+        }
+        val fixtureCacheEntries = SHARED_COCKROACH_FIXTURE_BUILD_RULE_CACHE_KEYS.map { cacheKey ->
+            File(cacheIndex, "$cacheKey.json")
+        }
+        val unrelatedCacheEntry = File(cacheIndex, "unrelated-rule.json").apply {
+            writeText("must remain")
+        }
+        val prestartLog = File(runFiles, "build-only-prestart.log")
+        val prestart = ProcessBuilder(
+            javaBinary.absolutePath,
+            *SHARED_COCKROACH_CHILD_JVM_ARGUMENTS.toTypedArray(),
+            "-Djava.io.tmpdir=${root.absolutePath}",
+            "-cp",
+            fixtureJar.absolutePath,
+            "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",
+            sessionIdentity.pid.toString(),
+            sessionIdentity.startedAt.toEpochMilli().toString(),
+            "true",
+            *fixtureCacheEntries.map(File::getAbsolutePath).toTypedArray(),
+        )
+            .directory(defaultWorkspace)
+            .redirectErrorStream(true)
+            .redirectOutput(prestartLog)
+            .also {
+                it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+            }
+            .start()
+        check(prestart.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
+            prestart.destroyForcibly()
+            "Build-only prestart helper PID ${prestart.pid()} did not finish within " +
+                "$PROCESS_EXIT_SECONDS seconds; output:\n" +
+                prestartLog.takeIf(File::isFile)?.readText().orEmpty()
+        }
+        check(prestart.exitValue() == 0) {
+            "Build-only prestart helper PID ${prestart.pid()} exited with code " +
+                "${prestart.exitValue()}; output:\n" +
+                prestartLog.takeIf(File::isFile)?.readText().orEmpty()
+        }
+
+        val stateDirectory = onlyStateDirectory()
+        val nodeFile = File(stateDirectory, "node.properties")
+        val node = properties(nodeFile)
+        val daemon = ScenarioIdentity(
+            requiredLong(node, "daemonPid", nodeFile),
+            Instant.ofEpochMilli(requiredLong(node, "daemonStartedAtMillis", nodeFile)),
+            null,
+        )
+        val cockroach = ScenarioIdentity(
+            requiredLong(node, "pid", nodeFile),
+            Instant.ofEpochMilli(requiredLong(node, "processStartedAtMillis", nodeFile)),
+            requiredLong(node, "processGroupId", nodeFile),
+        )
+        assertUsable(required(node, "jdbcUrl", nodeFile))
+        fixtureCacheEntries.forEach { cacheEntry ->
+            cacheEntry.writeText("would be archived")
+        }
+
+        val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L)
+        while (fixtureCacheEntries.any(File::exists) && System.nanoTime() < deadlineNanos) {
+            check(sessionIdentity.liveHandle() != null) {
+                "Synthetic BuildTestRunner owner ${sessionIdentity.pid} exited before live-owner " +
+                    "cache invalidation could be verified."
+            }
+            Thread.sleep(50L)
+        }
+        check(fixtureCacheEntries.none(File::exists)) {
+            "A live BuildTestRunner --build-only session left fixture result indexes " +
+                "${fixtureCacheEntries.filter(File::exists).map(File::getAbsolutePath)}, so " +
+                "shared-cache packaging could archive a prestart cache hit without its process."
+        }
+        check(sessionIdentity.liveHandle() != null) {
+            "Fixture cache invalidation waited for BuildTestRunner owner ${sessionIdentity.pid} " +
+                "to exit instead of completing before shared-cache packaging."
+        }
+        check(unrelatedCacheEntry.readText() == "must remain") {
+            "Live-owner fixture cache invalidation modified unrelated cache entry " +
+                "${unrelatedCacheEntry.absolutePath}."
+        }
+
+        sessionOwner.destroyForcibly()
+        check(sessionOwner.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
+            "Synthetic BuildTestRunner owner PID ${sessionOwner.pid()} survived forcible shutdown."
+        }
+        daemon.liveHandle()?.onExit()?.get(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)
+        cockroach.liveHandle()?.onExit()?.get(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)
+        assertDead(daemon, "build-only daemon after its BuildTestRunner session exited")
+        assertDead(cockroach, "build-only CockroachDB after its BuildTestRunner session exited")
     }
 
     fun leaseAndPidReuseRecovery() = protect {
