@@ -810,6 +810,7 @@ private class ScenarioHarness(
             .redirectOutput(prestartLog)
             .also {
                 it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+                it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
             }
             .start()
         check(prestart.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
@@ -921,6 +922,7 @@ private class ScenarioHarness(
             .redirectOutput(prestartLog)
             .also {
                 it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+                it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
             }
             .start()
         check(prestart.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
@@ -1165,6 +1167,7 @@ private class ScenarioHarness(
             .redirectOutput(log)
             .also {
                 it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+                it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
             }
             .start()
         return Probe(name, process, ready, release, armed, log).also(probes::add)

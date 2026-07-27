@@ -55,6 +55,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
                 .redirectOutput(File(privateTemp, "child-$index.log"))
                 .also {
                     it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+                    it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
                 }
                 .start()
             processes += process
@@ -158,6 +159,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             .redirectOutput(File(privateTemp, "child-state-recovery.log"))
             .also {
                 it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+                it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
             }
             .start()
         processes += stateRecovery
@@ -267,6 +269,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             .redirectOutput(File(privateTemp, "child-stale-lease-recovery.log"))
             .also {
                 it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+                it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
             }
             .start()
         processes += staleLeaseRecovery
@@ -336,6 +339,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             .redirectOutput(File(privateTemp, "child-recovery.log"))
             .also {
                 it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+                it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
             }
             .start()
         processes += recovery

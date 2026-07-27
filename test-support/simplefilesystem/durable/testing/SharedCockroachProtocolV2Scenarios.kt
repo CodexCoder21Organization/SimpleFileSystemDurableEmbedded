@@ -11,6 +11,9 @@ import java.util.concurrent.TimeoutException
 
 /** Entry point and marker for the protocol-v2 scenario executable in the fixture jar. */
 object SharedCockroachProtocolV2Scenarios {
+    const val HOST_ADMISSION_HELD_ENV =
+        "SIMPLE_FILESYSTEM_DURABLE_HOST_COCKROACH_ADMISSION_HELD"
+
     fun run(scenario: String) {
         withHostCockroachTestAdmission {
             runSharedCockroachProtocolV2ScenarioTest(scenario)
