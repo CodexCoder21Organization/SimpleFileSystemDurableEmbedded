@@ -794,6 +794,23 @@ private object SharedCockroachNode {
 
         evidence.forEach { process ->
             try {
+                // Process-group signalling and /proc enumeration are separate observations. Under
+                // concurrent process churn a verified leader can still be alive when this final
+                // durable-identity pass begins, so reap that exact PID/start-time identity here
+                // instead of turning the last observation into a process leak.
+                val processLog = if (
+                    process.processGroupId != null &&
+                    process.identity.pid != process.processGroupId
+                ) {
+                    File(workDirectory, "cockroach.out")
+                } else {
+                    File(workDirectory, "daemon.out")
+                }
+                stopProcess(
+                    process.identity,
+                    processLog,
+                    "durably recorded process",
+                )
                 check(process.identity.liveHandle() == null) {
                     "Shared CockroachDB process evidence recorded PID ${process.identity.pid} " +
                         "started at ${process.identity.startedAt}, but it remained alive; " +
