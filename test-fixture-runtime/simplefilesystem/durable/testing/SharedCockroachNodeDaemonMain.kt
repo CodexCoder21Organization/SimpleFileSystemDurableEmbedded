@@ -399,6 +399,9 @@ private fun startCockroach(
         "--listening-url-file=${listeningUrlFile.absolutePath}",
         "--pid-file=${pidFile.absolutePath}",
     )
+        .also { builder ->
+            builder.environment()["GOMAXPROCS"] = "1"
+        }
         .directory(workDirectory)
         .redirectOutput(logFile)
         .redirectErrorStream(true)

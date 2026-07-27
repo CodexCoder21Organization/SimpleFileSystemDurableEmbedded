@@ -476,6 +476,7 @@ private class ScenarioHarness(
             "Simultaneous contention spawned ${observations("cockroach").size} CockroachDB " +
                 "processes: ${observations("cockroach").map { it.pid }}."
         }
+        assertCockroachCpuBudget(observations("cockroach").single())
         val urls = ready.mapIndexed { index, value ->
             required(value, "jdbcUrl", contenders[index].readyFile)
         }
@@ -984,6 +985,23 @@ private class ScenarioHarness(
     private fun assertAllObservedDead() {
         observations("daemon").forEach { assertDead(it, "observed fixture daemon") }
         observations("cockroach").forEach { assertDead(it, "observed CockroachDB process") }
+    }
+
+    private fun assertCockroachCpuBudget(identity: ScenarioIdentity) {
+        val environmentFile = File("/proc/${identity.pid}/environ")
+        check(environmentFile.isFile) {
+            "Could not inspect the CPU budget of live CockroachDB PID ${identity.pid}: " +
+                "${environmentFile.absolutePath} was missing."
+        }
+        val environment = environmentFile.readBytes()
+            .toString(Charsets.UTF_8)
+            .split('\u0000')
+        check("GOMAXPROCS=1" in environment) {
+            "CockroachDB PID ${identity.pid} started without the required GOMAXPROCS=1 CPU " +
+                "budget; environment keys were " +
+                environment.filter(String::isNotEmpty).map { it.substringBefore('=') } +
+                "."
+        }
     }
 
     private fun killIdentity(identity: ScenarioIdentity) {
