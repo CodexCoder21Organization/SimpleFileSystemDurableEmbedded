@@ -20,7 +20,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
-fun testSharedCockroachCrossProcessElectionAndRecovery(): Unit =
+fun testSharedCockroachCrossProcessElectionAndRecovery() {
     SharedCockroachProtocolV2Scenarios.withHostAdmission {
     var privateTemp: File? = null
     var managedStateDirectory: File? = null
@@ -497,6 +497,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery(): Unit =
             throw cleanupFailure
         }
     }
+}
     }
 
 fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
