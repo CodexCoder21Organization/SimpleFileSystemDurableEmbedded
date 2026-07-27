@@ -1,6 +1,7 @@
 package simplefilesystem.durable.testing
 
 import java.io.File
+import java.io.RandomAccessFile
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.StandardWatchEventKinds
@@ -13,6 +14,7 @@ import java.util.concurrent.TimeUnit
 
 private const val SCENARIO_WAIT_SECONDS = 20L
 private const val PROCESS_EXIT_SECONDS = 10L
+private val scenarioProcessLocalStateLock = Any()
 
 fun main(args: Array<String>) {
     require(args.size == 2) {
@@ -1056,7 +1058,7 @@ private class ScenarioHarness(
         val ready = owner.awaitReady()
         val stateDirectory = File(required(ready, "stateDirectory", owner.readyFile))
         val malformedLease = File(stateDirectory, "leases/malformed-lease")
-        withStateLock(stateDirectory) {
+        withScenarioStateLock(stateDirectory) {
             writePropertiesAtomically(
                 malformedLease,
                 versionedProperties().apply {
@@ -1081,7 +1083,7 @@ private class ScenarioHarness(
         check(malformedLease.isFile) {
             "Malformed lease ${malformedLease.absolutePath} was deleted as stale."
         }
-        withStateLock(stateDirectory) {
+        withScenarioStateLock(stateDirectory) {
             check(malformedLease.delete()) {
                 "Could not remove test-owned malformed lease ${malformedLease.absolutePath}."
             }
@@ -1093,7 +1095,7 @@ private class ScenarioHarness(
             putAll(validNode)
             setProperty("pid", "not-a-node-pid")
         }
-        withStateLock(stateDirectory) {
+        withScenarioStateLock(stateDirectory) {
             writePropertiesAtomically(nodeFile, malformedNode)
         }
         val nodeReader = startProbe("invalid-node-reader")
@@ -1112,7 +1114,7 @@ private class ScenarioHarness(
         check(properties(nodeFile).getProperty("pid") == "not-a-node-pid") {
             "Malformed node state ${nodeFile.absolutePath} was overwritten or deleted."
         }
-        withStateLock(stateDirectory) {
+        withScenarioStateLock(stateDirectory) {
             writePropertiesAtomically(nodeFile, validNode)
         }
         assertUsable(required(ready, "jdbcUrl", owner.readyFile))
@@ -1571,6 +1573,14 @@ private class ScenarioHarness(
             check(process.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
                 "Probe '$name' PID $pid survived forcible termination."
             }
+        }
+    }
+}
+
+private fun <T> withScenarioStateLock(stateDirectory: File, block: () -> T): T {
+    return synchronized(scenarioProcessLocalStateLock) {
+        RandomAccessFile(File(stateDirectory, "state.lock"), "rw").use { lockAccess ->
+            lockAccess.channel.lock().use { block() }
         }
     }
 }
