@@ -42,6 +42,7 @@ internal fun runSharedCockroachProtocolScenario(scenario: String, root: File) {
             "atomic-publication-required" -> harness.atomicPublicationRequired()
             "launcher-rendezvous" -> harness.launcherRendezvous()
             "deterministic-contention" -> harness.deterministicContention()
+            "managed-concurrent-admission" -> harness.managedConcurrentAdmission()
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
             "warmup-publication" -> harness.warmupPublication()
             "startup-failure-publication-stress" -> harness.startupFailurePublicationStress()
@@ -487,6 +488,36 @@ private class ScenarioHarness(
         }
         check(urls.distinct().size == contenders.size) {
             "Four contenders received non-distinct logical database URLs: $urls."
+        }
+        urls.forEach(::assertUsable)
+        contenders.forEach(Probe::releaseAndAwait)
+        assertAllObservedDead()
+    }
+
+    fun managedConcurrentAdmission() = protect {
+        val gate = File(runFiles, "managed-admission-start-gate")
+        val contenders = (0 until 4).map { index ->
+            startProbe(
+                name = "managed-admission-$index",
+                startGate = gate,
+                inheritHostAdmission = false,
+            ).also { contender ->
+                waitForFile(contender.armedFile)
+            }
+        }
+        marker(gate)
+        val ready = contenders.map(Probe::awaitReady)
+        check(observations("daemon").size == 1 && observations("cockroach").size == 1) {
+            "Concurrent managed fixture admission observed daemons=" +
+                "${observations("daemon").map { it.pid }} and CockroachDB processes=" +
+                "${observations("cockroach").map { it.pid }}."
+        }
+        val urls = ready.mapIndexed { index, value ->
+            required(value, "jdbcUrl", contenders[index].readyFile)
+        }
+        check(urls.distinct().size == contenders.size) {
+            "Four concurrently admitted managed fixtures received non-distinct logical " +
+                "database URLs: $urls."
         }
         urls.forEach(::assertUsable)
         contenders.forEach(Probe::releaseAndAwait)
@@ -1140,6 +1171,7 @@ private class ScenarioHarness(
         workspace: File? = defaultWorkspace,
         startGate: File = File(runFiles, "$name-start-gate").also(::marker),
         controlDirectory: File = control,
+        inheritHostAdmission: Boolean = true,
     ): Probe {
         workspace?.let(::requireDirectory)
         requireDirectory(controlDirectory)
@@ -1167,7 +1199,15 @@ private class ScenarioHarness(
             .redirectOutput(log)
             .also {
                 it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
-                it.environment()[SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV] = "true"
+                if (inheritHostAdmission) {
+                    it.environment()[
+                        SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV
+                    ] = "true"
+                } else {
+                    it.environment().remove(
+                        SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV,
+                    )
+                }
             }
             .start()
         return Probe(name, process, ready, release, armed, log).also(probes::add)
@@ -1305,8 +1345,8 @@ private class ScenarioHarness(
         val environment = environmentFile.readBytes()
             .toString(Charsets.UTF_8)
             .split('\u0000')
-        check("GOMAXPROCS=1" in environment) {
-            "CockroachDB PID ${identity.pid} started without the required GOMAXPROCS=1 CPU " +
+        check("GOMAXPROCS=2" in environment) {
+            "CockroachDB PID ${identity.pid} started without the required GOMAXPROCS=2 CPU " +
                 "budget; environment keys were " +
                 environment.filter(String::isNotEmpty).map { it.substringBefore('=') } +
                 "."

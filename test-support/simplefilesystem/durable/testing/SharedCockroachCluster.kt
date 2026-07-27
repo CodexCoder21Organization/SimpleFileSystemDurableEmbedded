@@ -73,7 +73,7 @@ class SharedCockroachCluster(
             ?.takeIf { it.isNotBlank() }
         val inheritedHostAdmission =
             System.getenv(SharedCockroachProtocolV2Scenarios.HOST_ADMISSION_HELD_ENV) == "true"
-        if (!inheritedHostAdmission) {
+        if (configuredJdbcUrl != null && !inheritedHostAdmission) {
             hostAdmission = SharedCockroachProtocolV2Scenarios.acquireHostAdmission()
         }
         val acquired = if (configuredJdbcUrl != null) {

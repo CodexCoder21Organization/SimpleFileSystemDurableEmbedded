@@ -28,9 +28,10 @@ object SharedCockroachProtocolV2Scenarios {
 }
 
 /**
- * BuildTest starts four child JVMs on each two-CPU shard. The host lock keeps their independently
- * bounded CockroachDB workloads from starving one another while retaining every test's internal
- * thread/process concurrency. Nested fixture databases in one test JVM share one reentrant lease.
+ * BuildTest starts four child JVMs on each two-CPU shard. The host lock admits one private
+ * fault-injection scenario or externally configured suite fixture at a time while retaining each
+ * admitted test's internal thread/process concurrency. Managed tests already share one bounded
+ * CockroachDB node and must remain concurrently admissible.
  */
 private object HostCockroachTestAdmission {
     private val monitor = Any()
