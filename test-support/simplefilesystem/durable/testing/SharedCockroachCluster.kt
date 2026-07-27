@@ -58,6 +58,7 @@ class SharedCockroachCluster(
     private var testJdbcUrl: String? = null
     private var managedNodeLease = false
     private var managedDiagnostics: SharedCockroachFixtureDiagnostics? = null
+    private var fixtureReadyBeforeStart: Boolean? = null
 
     val username: String = "root"
     val password: String = ""
@@ -72,7 +73,11 @@ class SharedCockroachCluster(
         val acquired = if (configuredJdbcUrl != null) {
             null
         } else {
-            SharedCockroachNode.acquire(databaseName, clock, fixtureControl).also {
+            SharedCockroachNode.acquire(
+                leaseName = databaseName,
+                clock = clock,
+                fixtureControl = fixtureControl,
+            ).also {
                 managedNodeLease = true
             }
         }
@@ -88,6 +93,7 @@ class SharedCockroachCluster(
             adminJdbcUrl = sharedJdbcUrl
             testJdbcUrl = databaseJdbcUrl
             managedDiagnostics = acquired?.diagnostics
+            fixtureReadyBeforeStart = acquired?.fixtureReadyBeforeAcquire ?: true
             return this
         } catch (failure: Throwable) {
             if (managedNodeLease) {
@@ -114,6 +120,12 @@ class SharedCockroachCluster(
                 "not started with its workspace-scoped managed node.",
         )
 
+    fun fixtureWasReadyBeforeStart(): Boolean = fixtureReadyBeforeStart
+        ?: throw IllegalStateException(
+            "Shared fixture readiness timing is unavailable because this " +
+                "SharedCockroachCluster has not been started.",
+        )
+
     @Synchronized
     override fun close() {
         val configuredJdbcUrl = adminJdbcUrl ?: return
@@ -134,6 +146,7 @@ class SharedCockroachCluster(
             adminJdbcUrl = null
             testJdbcUrl = null
             managedDiagnostics = null
+            fixtureReadyBeforeStart = null
             if (managedNodeLease) {
                 try {
                     SharedCockroachNode.release(databaseName, fixtureControl)
@@ -169,6 +182,8 @@ private object SharedCockroachNode {
         leaseName: String,
         clock: Clock,
         fixtureControl: SharedCockroachFixtureControl?,
+        leaseOwner: SharedProcessIdentity? = null,
+        fixtureBuildRuleCacheEntries: List<File> = emptyList(),
     ): ManagedNodeAcquisition {
         var leaseWritten = false
         try {
@@ -189,13 +204,13 @@ private object SharedCockroachNode {
                         readReadyNode(owner, daemon)
                     }
                     if (node != null && isLiveNode(owner, node)) {
-                        writeLease(leaseName)
+                        writeLease(leaseName, leaseOwner, fixtureBuildRuleCacheEntries)
                         leaseWritten = true
                         waitAtStateLockBarrier(fixtureControl, "acquire-after-lease")
                         return@withStateLock Acquisition.Ready(node)
                     }
                     if (owner != null) {
-                        writeLease(leaseName)
+                        writeLease(leaseName, leaseOwner, fixtureBuildRuleCacheEntries)
                         leaseWritten = true
                         waitAtStateLockBarrier(fixtureControl, "acquire-after-lease")
                         return@withStateLock Acquisition.Starting(owner.token, owner.workDirectory)
@@ -228,7 +243,7 @@ private object SharedCockroachNode {
                         daemonProcessGroupId = null,
                     )
                     writeOwnerClaim(claim)
-                    writeLease(leaseName)
+                    writeLease(leaseName, leaseOwner, fixtureBuildRuleCacheEntries)
                     leaseWritten = true
                     try {
                         launchDaemon(claim, fixtureControl)
@@ -247,10 +262,13 @@ private object SharedCockroachNode {
                     Acquisition.Starting(claim.token, claim.workDirectory)
                 }
                 when (outcome) {
-                    is Acquisition.Ready -> return outcome.node.toAcquisition()
+                    is Acquisition.Ready ->
+                        return outcome.node.toAcquisition(fixtureReadyBeforeAcquire = true)
                     is Acquisition.Starting -> {
                         val ready = waitForReadyNode(outcome, clock, fixtureControl)
-                        if (ready != null) return ready.toAcquisition()
+                        if (ready != null) {
+                            return ready.toAcquisition(fixtureReadyBeforeAcquire = false)
+                        }
                     }
                 }
             }
@@ -293,9 +311,12 @@ private object SharedCockroachNode {
         }
     }
 
-    private fun ManagedNodeAcquisitionRecord.toAcquisition(): ManagedNodeAcquisition =
+    private fun ManagedNodeAcquisitionRecord.toAcquisition(
+        fixtureReadyBeforeAcquire: Boolean,
+    ): ManagedNodeAcquisition =
         ManagedNodeAcquisition(
             jdbcUrl = node.jdbcUrl,
+            fixtureReadyBeforeAcquire = fixtureReadyBeforeAcquire,
             diagnostics = SharedCockroachFixtureDiagnostics(
                 protocolVersion = SHARED_COCKROACH_PROTOCOL_VERSION,
                 stateDirectory = stateDirectory.canonicalFile,
@@ -309,13 +330,15 @@ private object SharedCockroachNode {
             ),
         )
 
-    private fun SharedCockroachNodeRecord.toAcquisition(): ManagedNodeAcquisition =
+    private fun SharedCockroachNodeRecord.toAcquisition(
+        fixtureReadyBeforeAcquire: Boolean,
+    ): ManagedNodeAcquisition =
         ManagedNodeAcquisitionRecord(
             owner = requireNotNull(readOwnerClaim()) {
                 "Shared CockroachDB node ${cockroach.pid} was ready without an owner claim."
             },
             node = this,
-        ).toAcquisition()
+        ).toAcquisition(fixtureReadyBeforeAcquire)
 
     private fun launchDaemon(
         claim: SharedCockroachOwnerClaim,
@@ -1399,16 +1422,28 @@ private object SharedCockroachNode {
             File(workDirectory, "daemon.out").takeIf(File::isFile)?.readText().orEmpty(),
     )
 
-    private fun writeLease(leaseName: String) {
+    private fun writeLease(
+        leaseName: String,
+        leaseOwner: SharedProcessIdentity?,
+        fixtureBuildRuleCacheEntries: List<File>,
+    ) {
         check(leasesDirectory.isDirectory || leasesDirectory.mkdirs()) {
             "Could not create shared CockroachDB lease directory ${leasesDirectory.absolutePath}."
         }
-        val current = processIdentity(ProcessHandle.current(), "current test JVM")
+        val current = leaseOwner
+            ?: processIdentity(ProcessHandle.current(), "current test JVM")
+        check(current.liveHandle() != null) {
+            "Cannot write shared CockroachDB lease '$leaseName' for PID ${current.pid} started at " +
+                "${current.startedAt} because that process is not alive."
+        }
         writePropertiesAtomically(
             File(leasesDirectory, leaseName),
             versionedProperties().apply {
                 setProperty("pid", current.pid.toString())
                 setProperty("startedAtMillis", current.startedAt.toEpochMilli().toString())
+                fixtureBuildRuleCacheEntries.forEachIndexed { index, cacheEntry ->
+                    setProperty("fixtureBuildRuleCacheEntry.$index", cacheEntry.canonicalPath)
+                }
             },
         )
     }
@@ -1427,12 +1462,13 @@ private object SharedCockroachNode {
         leasesDirectory.listFiles().orEmpty()
             .filter { it.isFile && !isAtomicStagingFile(it) }
             .forEach { lease ->
-                when (val result = readLeaseIdentity(lease)) {
+                when (val result = readLease(lease)) {
                     RecordReadResult.Missing -> Unit
                     is RecordReadResult.Invalid -> failures += result.failure
                     is RecordReadResult.Valid -> {
                         try {
-                            if (result.value.liveHandle() == null) {
+                            if (result.value.identity.liveHandle() == null) {
+                                invalidateFixtureBuildRuleCacheEntry(result.value.properties, lease)
                                 deleteIfPresent(lease, "stale shared CockroachDB lease")
                             }
                         } catch (failure: Throwable) {
@@ -1444,9 +1480,9 @@ private object SharedCockroachNode {
         throwCleanupFailures("stale shared CockroachDB lease purge", failures)
     }
 
-    private fun readLeaseIdentity(
+    private fun readLease(
         lease: File,
-    ): RecordReadResult<SharedProcessIdentity> {
+    ): RecordReadResult<SharedCockroachLease> {
         if (!lease.isFile) return RecordReadResult.Missing
         return try {
             val properties = loadVersionedProperties(
@@ -1454,12 +1490,15 @@ private object SharedCockroachNode {
                 "shared CockroachDB lease",
             ) ?: return RecordReadResult.Missing
             RecordReadResult.Valid(
-                parseIdentity(
-                    properties,
-                    "pid",
-                    "startedAtMillis",
-                    "shared CockroachDB lease",
-                    lease,
+                SharedCockroachLease(
+                    identity = parseIdentity(
+                        properties,
+                        "pid",
+                        "startedAtMillis",
+                        "shared CockroachDB lease",
+                        lease,
+                    ),
+                    properties = properties,
                 ),
             )
         } catch (failure: Exception) {
@@ -1603,6 +1642,7 @@ private fun SharedCockroachNodeRecord.recoveryIdentity() =
 
 private data class ManagedNodeAcquisition(
     val jdbcUrl: String,
+    val fixtureReadyBeforeAcquire: Boolean,
     val diagnostics: SharedCockroachFixtureDiagnostics,
 )
 
@@ -1613,6 +1653,11 @@ private data class ManagedProcessEvidence(
 
 private data class ManagedProcessMember(
     val identity: SharedProcessIdentity,
+)
+
+private data class SharedCockroachLease(
+    val identity: SharedProcessIdentity,
+    val properties: Properties,
 )
 
 private fun jdbcUrlForDatabase(adminJdbcUrl: String, databaseName: String): String {
@@ -1626,3 +1671,17 @@ private fun jdbcUrlForDatabase(adminJdbcUrl: String, databaseName: String): Stri
 
 private fun quoteIdentifier(identifier: String): String =
     "\"" + identifier.replace("\"", "\"\"") + "\""
+
+internal fun prestartSharedCockroachForSession(
+    sessionOwner: SharedProcessIdentity,
+    fixtureBuildRuleCacheEntries: List<File>,
+) {
+    val leaseName = "kompile-session-${sessionOwner.pid}-${sessionOwner.startedAt.toEpochMilli()}"
+    SharedCockroachNode.acquire(
+        leaseName = leaseName,
+        clock = SystemClock(),
+        fixtureControl = null,
+        leaseOwner = sessionOwner,
+        fixtureBuildRuleCacheEntries = fixtureBuildRuleCacheEntries,
+    )
+}

@@ -43,6 +43,7 @@ internal fun runSharedCockroachProtocolScenario(scenario: String, root: File) {
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
             "warmup-publication" -> harness.warmupPublication()
             "workspace-isolation" -> harness.workspaceIsolation()
+            "prestart-session-owner-exit" -> harness.prestartSessionOwnerExit()
             "lease-and-pid-reuse-recovery" -> harness.leaseAndPidReuseRecovery()
             "malformed-record-diagnostics" -> harness.malformedRecordDiagnostics()
             else -> throw IllegalArgumentException(
@@ -608,6 +609,13 @@ private class ScenarioHarness(
     }
 
     fun workspaceIsolation() = protect {
+        val legacyStateDirectory = File(
+            root,
+            "simplefilesystem-durable-shared-cockroach-v1",
+        ).apply(::requireDirectory)
+        val legacySentinel = File(legacyStateDirectory, "main-checkout-sentinel")
+        val legacyContents = "owned by a concurrently running main checkout".toByteArray()
+        legacySentinel.writeBytes(legacyContents)
         val workspaceA = File(root, "workspace-a").apply(::requireDirectory)
         val workspaceB = File(root, "workspace-b").apply(::requireDirectory)
         val first = startProbe("workspace-a", workspace = workspaceA)
@@ -625,6 +633,14 @@ private class ScenarioHarness(
                 "Shared state directory ${state.absolutePath} did not derive its namespace suffix " +
                     "from protocolVersion='$protocolVersion'."
             }
+            check(state.parentFile == root && state != legacyStateDirectory) {
+                "Protocol-v2 state ${state.absolutePath} overlapped the legacy main-checkout " +
+                    "namespace ${legacyStateDirectory.absolutePath}."
+            }
+        }
+        check(legacySentinel.readBytes().contentEquals(legacyContents)) {
+            "Protocol-v2 fixture activity modified legacy main-checkout evidence " +
+                "${legacySentinel.absolutePath}."
         }
         check(required(firstReady, "token", first.readyFile) !=
             required(secondReady, "token", second.readyFile)
@@ -684,7 +700,122 @@ private class ScenarioHarness(
         assertUsable(required(secondReady, "jdbcUrl", second.readyFile))
         second.releaseAndAwait()
         assertDead(secondDaemon, "workspace B daemon")
+        check(legacySentinel.readBytes().contentEquals(legacyContents)) {
+            "Protocol-v2 teardown modified legacy main-checkout evidence " +
+                "${legacySentinel.absolutePath}."
+        }
         assertAllObservedDead()
+    }
+
+    fun prestartSessionOwnerExit() = protect {
+        val sessionOwner = ProcessBuilder("/bin/sleep", "120")
+            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+            .redirectError(ProcessBuilder.Redirect.DISCARD)
+            .start()
+            .also(unrelatedProcesses::add)
+        val sessionIdentity = processIdentity(
+            sessionOwner.toHandle(),
+            "synthetic Kompile session owner",
+        )
+        val cacheIndex = File(runFiles, "synthetic-cache/buildRuleResultIndex")
+        check(cacheIndex.mkdirs()) {
+            "Could not create synthetic Kompile build-rule cache index ${cacheIndex.absolutePath}."
+        }
+        val fixtureCacheEntries = SHARED_COCKROACH_FIXTURE_BUILD_RULE_CACHE_KEYS.map { cacheKey ->
+            File(cacheIndex, "$cacheKey.json").apply {
+                writeText("stale fixture rule")
+            }
+        }
+        val unrelatedCacheEntry = File(cacheIndex, "unrelated-rule.json").apply {
+            writeText("must remain")
+        }
+        val prestartLog = File(runFiles, "prestart-session.log")
+        val prestart = ProcessBuilder(
+            javaBinary.absolutePath,
+            *SHARED_COCKROACH_CHILD_JVM_ARGUMENTS.toTypedArray(),
+            "-Djava.io.tmpdir=${root.absolutePath}",
+            "-cp",
+            fixtureJar.absolutePath,
+            "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",
+            sessionIdentity.pid.toString(),
+            sessionIdentity.startedAt.toEpochMilli().toString(),
+            *fixtureCacheEntries.map(File::getAbsolutePath).toTypedArray(),
+        )
+            .directory(defaultWorkspace)
+            .redirectErrorStream(true)
+            .redirectOutput(prestartLog)
+            .also {
+                it.environment().remove("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL")
+            }
+            .start()
+        check(prestart.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
+            prestart.destroyForcibly()
+            "Session prestart helper PID ${prestart.pid()} did not finish within " +
+                "$PROCESS_EXIT_SECONDS seconds; output:\n" +
+                prestartLog.takeIf(File::isFile)?.readText().orEmpty()
+        }
+        check(prestart.exitValue() == 0) {
+            "Session prestart helper PID ${prestart.pid()} exited with code " +
+                "${prestart.exitValue()}; output:\n" +
+                prestartLog.takeIf(File::isFile)?.readText().orEmpty()
+        }
+
+        val stateDirectory = onlyStateDirectory()
+        val nodeFile = File(stateDirectory, "node.properties")
+        val node = properties(nodeFile)
+        val daemon = ScenarioIdentity(
+            requiredLong(node, "daemonPid", nodeFile),
+            Instant.ofEpochMilli(requiredLong(node, "daemonStartedAtMillis", nodeFile)),
+            null,
+        )
+        val cockroach = ScenarioIdentity(
+            requiredLong(node, "pid", nodeFile),
+            Instant.ofEpochMilli(requiredLong(node, "processStartedAtMillis", nodeFile)),
+            requiredLong(node, "processGroupId", nodeFile),
+        )
+        assertUsable(required(node, "jdbcUrl", nodeFile))
+        val lease = File(
+            stateDirectory,
+            "leases/kompile-session-${sessionIdentity.pid}-" +
+                sessionIdentity.startedAt.toEpochMilli(),
+        )
+        check(lease.isFile) {
+            "Prestarted node did not publish its session-owned lease ${lease.absolutePath}."
+        }
+        val malformedLease = File(stateDirectory, "leases/malformed-session-sentinel")
+        writePropertiesAtomically(
+            malformedLease,
+            versionedProperties().apply {
+                setProperty("pid", "not-a-session-pid")
+                setProperty("startedAtMillis", "0")
+            },
+        )
+
+        sessionOwner.destroyForcibly()
+        check(sessionOwner.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
+            "Synthetic Kompile session owner PID ${sessionOwner.pid()} survived forcible shutdown."
+        }
+        daemon.liveHandle()?.onExit()?.get(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)
+        cockroach.liveHandle()?.onExit()?.get(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)
+        assertDead(daemon, "prestarted daemon after its Kompile session exited")
+        assertDead(cockroach, "prestarted CockroachDB after its Kompile session exited")
+        check(!lease.exists()) {
+            "Expired Kompile session lease ${lease.absolutePath} remained after fixture shutdown."
+        }
+        val remainingFixtureCacheEntries = fixtureCacheEntries.filter(File::exists)
+        check(remainingFixtureCacheEntries.isEmpty()) {
+            "Expired Kompile session left fixture build-rule cache entries " +
+                "${remainingFixtureCacheEntries.map(File::getAbsolutePath)}, so a later direct " +
+                "test dispatch could skip prestart."
+        }
+        check(unrelatedCacheEntry.readText() == "must remain") {
+            "Fixture cleanup modified unrelated Kompile cache entry " +
+                "${unrelatedCacheEntry.absolutePath}."
+        }
+        check(malformedLease.isFile) {
+            "Fixture shutdown discarded malformed lease evidence " +
+                "${malformedLease.absolutePath} instead of preserving it."
+        }
     }
 
     fun leaseAndPidReuseRecovery() = protect {

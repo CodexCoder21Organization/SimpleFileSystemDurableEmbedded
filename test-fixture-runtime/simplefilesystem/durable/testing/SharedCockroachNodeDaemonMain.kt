@@ -118,7 +118,15 @@ fun main(args: Array<String>) {
                         lifecycle.countDown()
                         return@scheduleAtFixedRate
                     }
-                    renewHeartbeat(stateDirectory, workDirectory, token, daemonIdentity)
+                    val liveLeaseRemains = renewHeartbeat(
+                        stateDirectory,
+                        workDirectory,
+                        token,
+                        daemonIdentity,
+                    )
+                    if (!liveLeaseRemains) {
+                        lifecycle.countDown()
+                    }
                 } catch (failure: Throwable) {
                     if (ownershipFailure.compareAndSet(null, failure)) {
                         try {
@@ -269,11 +277,69 @@ private fun renewHeartbeat(
     workDirectory: File,
     token: String,
     daemonIdentity: SharedProcessIdentity,
-) {
+): Boolean =
     withStateLock(stateDirectory) {
         requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+        if (!purgeStaleLeasesAndCheckLive(stateDirectory)) {
+            deleteIfPresent(
+                File(stateDirectory, "node-heartbeat.properties"),
+                "heartbeat for shared CockroachDB fixture without live leases",
+            )
+            return@withStateLock false
+        }
         writeHeartbeat(stateDirectory, token, daemonIdentity)
+        true
     }
+
+private fun purgeStaleLeasesAndCheckLive(stateDirectory: File): Boolean {
+    val leasesDirectory = File(stateDirectory, "leases")
+    val failures = mutableListOf<Throwable>()
+    var liveLeaseRemains = false
+    leasesDirectory.listFiles().orEmpty()
+        .filter { it.isFile && isAtomicStagingFile(it) }
+        .forEach { stagingFile ->
+            try {
+                deleteIfPresent(
+                    stagingFile,
+                    "abandoned shared CockroachDB lease staging file",
+                )
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+        }
+    leasesDirectory.listFiles().orEmpty()
+        .filter { it.isFile && !isAtomicStagingFile(it) }
+        .forEach { lease ->
+            try {
+                val properties = loadVersionedProperties(
+                    lease,
+                    "shared CockroachDB lease",
+                ) ?: return@forEach
+                val identity = parseIdentity(
+                    properties,
+                    "pid",
+                    "startedAtMillis",
+                    "shared CockroachDB lease",
+                    lease,
+                )
+                if (identity.liveHandle() == null) {
+                    invalidateFixtureBuildRuleCacheEntry(properties, lease)
+                    deleteIfPresent(lease, "stale shared CockroachDB lease")
+                } else {
+                    liveLeaseRemains = true
+                }
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+        }
+    if (failures.isNotEmpty()) {
+        System.err.println(
+            "Shared CockroachDB daemon could not verify ${failures.size} durable lease " +
+                "record(s); invalid evidence was preserved.",
+        )
+        failures.forEach(Throwable::printStackTrace)
+    }
+    return liveLeaseRemains
 }
 
 private fun verifyPreAttachOwnership(

@@ -26,16 +26,21 @@ Blobstore in-memory implementation:
 scripts/test.bash --test . --log test_log_file.xml
 ```
 
-The test-support library also starts that shared node lazily when tests are dispatched directly
-instead of through `scripts/test.bash`. A cross-process lock elects a detached fixture daemon, then
-forked test JVMs wait on its atomic readiness state without holding the lock through CockroachDB
-startup. Before publishing readiness, both launch paths run the production schema bootstrap in a
-throwaway database so concurrent test databases reach a warm SQL layer. Per-test leases keep the
-memory-bounded process alive until every isolated logical database is finished. The final lease
+Both dispatch paths finish starting the node before any test process begins. `scripts/test.bash`
+owns a suite fixture and exports its JDBC URL, while direct `kompile --test .` dependency
+resolution elects a detached fixture daemon and assigns its initial lease to the live Kompile
+session. Forked test JVMs therefore encounter atomic readiness state without charging CockroachDB
+bootstrap to a test's clock. Before publishing readiness, both launch paths run the production
+schema bootstrap in a throwaway database so concurrent test databases reach a warm SQL layer.
+Per-test leases keep the memory-bounded process alive until every isolated logical database is
+finished. The daemon also expires dead lease owners itself, so an interrupted Kompile session
+cannot leave its detached process group running indefinitely. Expiring that session lease also
+invalidates only the two lane-local fixture build-rule result entries, ensuring a later direct
+Kompile session executes prestart even when the assembled JARs remain cached. The final lease
 removes the daemon, node records, lease directory, and managed work directories; the state
-directory and its never-replaced lock file remain available for later runs. Direct dispatch retains
-uniquely named databases only until that disposable node stops; a caller-supplied longer-lived
-fixture drops each logical database when its test closes.
+directory and its never-replaced lock file remain available for later runs. Direct dispatch
+retains uniquely named databases only until that disposable node stops; a caller-supplied
+longer-lived fixture drops each logical database when its test closes.
 
 The daemon atomically records a versioned warmup attestation immediately before readiness. Node,
 warmup, lease, heartbeat, failure, owner, and work-directory records are parsed independently:
@@ -46,8 +51,10 @@ closed when the filesystem cannot provide `ATOMIC_MOVE`.
 Managed state uses a `v<protocolVersion>` namespace under `java.io.tmpdir`, scoped by the first 16
 hexadecimal characters of SHA-256 over the canonical workspace root. Launcher-level tests verify
 that Kompile child JVMs in one run inherit the same canonical working directory, so those children
-rendezvous while independent checkouts cannot share fixture records. Every durable record carries
-the protocol version. Foreign-version records are atomically moved unchanged into a versioned
+rendezvous while independent checkouts cannot share fixture records. The workspace-scoped v2
+namespace is disjoint from main's legacy global v1 namespace, so old and new checkouts can run
+concurrently without parsing or modifying each other's records. Every durable record carries the
+protocol version. Foreign-version records are atomically moved unchanged into a versioned
 quarantine, where they cannot poison acquisition or prevent known-version leases from releasing.
 
 The daemon ownership handshake prevents CockroachDB from starting until the daemon has atomically

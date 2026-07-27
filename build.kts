@@ -11,6 +11,9 @@ import build.kotlin.jvm.jar
 import build.kotlin.jvm.resolveDependencies2
 import build.kotlin.withartifact.WithArtifact
 import java.io.File
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 
 val dependencies = listOf(
     MavenPrebuilt2("simplefilesystem:simplefilesystem-api:0.3.0"),
@@ -62,11 +65,29 @@ fun buildCockroachTestFixtureRuntime(): File = buildSimpleKotlinMavenArtifact2(
     compileDependencies = fixtureRuntimeDependencies,
 )
 
-fun buildCockroachTestFixtureFatJar(): File = BuildJar(
+private fun assembleCockroachTestFixtureFatJar(): File = BuildJar(
     Manifest("simplefilesystem.durable.testing.CockroachSuiteFixtureMainKt"),
     resolveDependencies2(fixtureRuntimeDependencies).map { it.jar } +
         buildCockroachTestFixtureRuntime().jar,
 )
+
+/**
+ * Builds the fixture runtime and starts its managed node while Kompile is still resolving test
+ * dependencies. The node is therefore warm before any forked test JVM's timeout begins.
+ */
+fun buildCockroachTestFixtureFatJar(): File {
+    val fixtureJar = assembleCockroachTestFixtureFatJar()
+    if (System.getenv("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL").isNullOrBlank()) {
+        prestartCockroachForKompileSession(fixtureJar)
+    }
+    return fixtureJar
+}
+
+/**
+ * Builds the suite-owned fixture without also starting the direct-dispatch managed fixture.
+ * scripts/test.bash owns this process explicitly and exports its JDBC URL to every test.
+ */
+fun buildCockroachSuiteFixtureFatJar(): File = assembleCockroachTestFixtureFatJar()
 
 /**
  * Gives protocol-scenario tests their own declared build-rule dependency so additions to the
@@ -74,3 +95,105 @@ fun buildCockroachTestFixtureFatJar(): File = BuildJar(
  */
 fun buildCockroachProtocolV2ConcurrentScenarioFatJar(): File =
     buildCockroachTestFixtureFatJar()
+
+private fun processCommandArguments(process: ProcessHandle): List<String> {
+    val procCommandLine = File("/proc/${process.pid()}/cmdline")
+    if (procCommandLine.isFile) {
+        return procCommandLine.readBytes()
+            .toString(StandardCharsets.UTF_8)
+            .split('\u0000')
+            .filter(String::isNotEmpty)
+    }
+    return process.info().arguments().orElse(emptyArray()).toList()
+}
+
+private fun currentKompileSessionOwner(): ProcessHandle {
+    val ancestors = generateSequence(
+        ProcessHandle.current().parent().orElse(null),
+    ) { process ->
+        process.parent().orElse(null)
+    }.toList()
+    return ancestors.firstOrNull { process ->
+        val command = processCommandArguments(process).joinToString(" ")
+        command.contains("kompile.cli.CliKt") ||
+            command.contains("/kompile/cli/kompile-cli/")
+    } ?: throw IllegalStateException(
+        "Cannot prestart the shared CockroachDB fixture because the build-rule process " +
+            "${ProcessHandle.current().pid()} has no live Kompile CLI ancestor. Ancestors were " +
+            ancestors.map { process ->
+                "${process.pid()}:${processCommandArguments(process).joinToString(" ")}"
+            },
+    )
+}
+
+private fun fixtureBuildRuleCacheEntries(sessionOwner: ProcessHandle): List<File> {
+    val arguments = processCommandArguments(sessionOwner)
+    val cacheArgument = arguments.indices.firstNotNullOfOrNull { index ->
+        when {
+            arguments[index] == "--cache-location" || arguments[index] == "-c" ->
+                arguments.getOrNull(index + 1)
+            arguments[index].startsWith("--cache-location=") ->
+                arguments[index].substringAfter('=')
+            else -> null
+        }
+    }
+    val cacheDirectory = if (cacheArgument == null) {
+        File(System.getProperty("user.home"), ".buildcache")
+    } else {
+        val configured = File(cacheArgument)
+        if (configured.isAbsolute) {
+            configured
+        } else {
+            val sessionWorkingDirectory = File("/proc/${sessionOwner.pid()}/cwd")
+                .takeIf(File::exists)
+                ?.canonicalFile
+                ?: File(".").canonicalFile
+            File(sessionWorkingDirectory, cacheArgument)
+        }
+    }
+    return listOf(
+        "simplefilesystem.durable.buildCockroachTestFixtureFatJar()",
+        "simplefilesystem.durable.buildCockroachProtocolV2ConcurrentScenarioFatJar()",
+    ).map { invocation ->
+        val key = MessageDigest.getInstance("SHA-256")
+            .digest(invocation.toByteArray(StandardCharsets.UTF_8))
+            .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+        File(cacheDirectory.canonicalFile, "buildRuleResultIndex/$key.json")
+    }
+}
+
+private fun prestartCockroachForKompileSession(fixtureJar: File) {
+    val workspace = File(".").canonicalFile
+    val sessionOwner = currentKompileSessionOwner()
+    val sessionStartedAt = requireNotNull(sessionOwner.info().startInstant().orElse(null)) {
+        "The Kompile CLI session process ${sessionOwner.pid()} did not expose its start time."
+    }
+    val cacheEntries = fixtureBuildRuleCacheEntries(sessionOwner)
+    val javaBinary = File(System.getProperty("java.home"), "bin/java")
+    val process = ProcessBuilder(
+        javaBinary.absolutePath,
+        "-XX:+UseSerialGC",
+        "-XX:ActiveProcessorCount=1",
+        "-XX:TieredStopAtLevel=1",
+        "-cp",
+        fixtureJar.absolutePath,
+        "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",
+        sessionOwner.pid().toString(),
+        sessionStartedAt.toEpochMilli().toString(),
+        *cacheEntries.map(File::getAbsolutePath).toTypedArray(),
+    )
+        .directory(workspace)
+        .inheritIO()
+        .start()
+    if (!process.waitFor(120L, TimeUnit.SECONDS)) {
+        process.destroyForcibly()
+        process.waitFor()
+        throw IllegalStateException(
+            "Shared CockroachDB prestart process ${process.pid()} did not finish within 120 seconds.",
+        )
+    }
+    check(process.exitValue() == 0) {
+        "Shared CockroachDB prestart process ${process.pid()} exited with code " +
+            "${process.exitValue()}."
+    }
+}

@@ -11,6 +11,12 @@ import java.time.Instant
 import java.util.Properties
 
 internal const val SHARED_COCKROACH_PROTOCOL_VERSION = "2"
+// SHA-256 cache keys for buildCockroachTestFixtureFatJar() and its protocol-scenario wrapper.
+// The build script computes the same keys from their fully-qualified invocation strings.
+internal val SHARED_COCKROACH_FIXTURE_BUILD_RULE_CACHE_KEYS = setOf(
+    "6c6010b439cafd36cf71e51b5b01af46a2e46dcd791949f8853ef9463528c7d1",
+    "258e67621f998da08dde3db4ad475dc29bf45d8b85bf17451ba07ec7424b4f16",
+)
 internal const val SHARED_COCKROACH_STARTUP_TIMEOUT_MILLIS = 120_000L
 internal const val SHARED_COCKROACH_HEARTBEAT_STALE_MILLIS = 120_000L
 internal const val SHARED_COCKROACH_PROCESS_STOP_SECONDS = 5L
@@ -164,6 +170,40 @@ internal fun loadVersionedProperties(file: File, description: String): Propertie
 
 internal fun versionedProperties(): Properties = Properties().apply {
     setProperty("protocolVersion", SHARED_COCKROACH_PROTOCOL_VERSION)
+}
+
+internal fun fixtureBuildRuleCacheEntries(properties: Properties, leaseFile: File): List<File> =
+    properties.stringPropertyNames()
+        .filter { it.startsWith("fixtureBuildRuleCacheEntry.") }
+        .sorted()
+        .map { propertyName ->
+            val configuredPath = properties.getProperty(propertyName)
+            val configured = File(configuredPath)
+            require(configured.isAbsolute) {
+                "Shared CockroachDB lease ${leaseFile.absolutePath} contained relative fixture " +
+                    "build-rule cache entry '$configuredPath'."
+            }
+            val canonical = configured.canonicalFile
+            require(
+                canonical.name.endsWith(".json") &&
+                    canonical.name.removeSuffix(".json") in
+                    SHARED_COCKROACH_FIXTURE_BUILD_RULE_CACHE_KEYS &&
+                    canonical.parentFile?.name == "buildRuleResultIndex",
+            ) {
+                "Shared CockroachDB lease ${leaseFile.absolutePath} contained fixture build-rule " +
+                    "cache entry '${canonical.absolutePath}', but expected a known fixture rule " +
+                    "entry in a buildRuleResultIndex directory."
+            }
+            canonical
+        }
+
+internal fun invalidateFixtureBuildRuleCacheEntry(properties: Properties, leaseFile: File) {
+    fixtureBuildRuleCacheEntries(properties, leaseFile).forEach { cacheEntry ->
+        deleteIfPresent(
+            cacheEntry,
+            "stale Kompile session shared CockroachDB fixture build-rule cache entry",
+        )
+    }
 }
 
 internal fun writePropertiesAtomically(file: File, properties: Properties) {
