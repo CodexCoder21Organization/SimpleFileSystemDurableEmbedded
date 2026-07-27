@@ -28,25 +28,23 @@ scripts/test.bash --test . --log test_log_file.xml
 
 Both dispatch paths finish starting the node before any test process begins. `scripts/test.bash`
 owns a suite fixture and exports its JDBC URL, while direct `kompile --test .` dependency
-resolution elects a detached fixture daemon and assigns its initial lease to the live Kompile
-session. Forked test JVMs therefore encounter atomic readiness state without charging CockroachDB
-bootstrap to a test's clock. Before publishing readiness, both launch paths run the production
-schema bootstrap in a throwaway database so concurrent test databases reach a warm SQL layer.
-Per-test leases keep the memory-bounded process alive until every isolated logical database is
-finished. The daemon also expires dead lease owners itself, so an interrupted Kompile session
-cannot leave its detached process group running indefinitely. Expiring that session lease also
-invalidates only the two lane-local fixture build-rule result entries, ensuring a later direct
-Kompile session executes prestart even when the assembled JARs remain cached. The final lease
-removes the daemon, node records, lease directory, and managed work directories; the state
-directory and its never-replaced lock file remain available for later runs. Direct dispatch
-retains uniquely named databases only until that disposable node stops; a caller-supplied
-longer-lived fixture drops each logical database when its test closes.
+resolution executes the workspace-local fixture Maven artifact and assigns its initial lease to
+the live Kompile session. Forked test JVMs therefore encounter atomic readiness state without
+charging CockroachDB bootstrap to a test's clock. Before publishing readiness, both launch paths
+run the production schema bootstrap in a throwaway database so concurrent test databases reach a
+warm SQL layer. Per-test leases keep the memory-bounded process alive until every isolated logical
+database is finished. The daemon also expires dead lease owners itself, so an interrupted Kompile
+session cannot leave its detached process group running indefinitely. The final lease removes the
+daemon, node records, lease directory, and managed work directories; the state directory and its
+never-replaced lock file remain available for later runs. Direct dispatch retains uniquely named
+databases only until that disposable node stops; a caller-supplied longer-lived fixture drops each
+logical database when its test closes.
 
-kotlin.build prepares shared modules in a `BuildTestRunner --build-only` session before packaging
-its cache for test runners. That lease invalidates the same two allow-listed result indexes while
-the build-only owner is still alive, so the packaged cache cannot contain a process-local prestart
-hit after its fixture process has stopped. Direct test sessions retain their result indexes until
-their owner exits, avoiding duplicate prestart resolution within one test run.
+kotlin.build distributes prepared module caches only for direct `package.rule()` test
+dependencies. The process-owning fixture and protocol-scenario rules are exposed to tests as
+workspace-local Maven coordinates instead, so each shard executes prestart in its own live
+`BuildTestRunner` session. Artifact construction remains cached within that shard, while a cache
+snapshot can never substitute another host's already-terminated process lease.
 
 The daemon atomically records a versioned warmup attestation immediately before readiness. Node,
 warmup, lease, heartbeat, failure, owner, and work-directory records are parsed independently:
