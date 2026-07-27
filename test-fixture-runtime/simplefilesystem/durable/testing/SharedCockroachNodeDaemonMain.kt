@@ -215,6 +215,20 @@ fun main(args: Array<String>) {
         }
     } catch (failure: Throwable) {
         try {
+            waitAtDaemonBarrier(
+                controlDirectory = controlDirectory,
+                barrierName = "daemon-before-startup-failure-publication",
+                token = token,
+                stateDirectory = stateDirectory,
+                deadlineMillis = null,
+            ) {
+                requireAttachedOwnership(
+                    stateDirectory,
+                    workDirectory,
+                    token,
+                    daemonIdentity,
+                )
+            }
             publishStartupFailure(
                 stateDirectory,
                 workDirectory,

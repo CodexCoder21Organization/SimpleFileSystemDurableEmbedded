@@ -42,6 +42,7 @@ internal fun runSharedCockroachProtocolScenario(scenario: String, root: File) {
             "deterministic-contention" -> harness.deterministicContention()
             "last-release-acquire-race" -> harness.lastReleaseAcquireRace()
             "warmup-publication" -> harness.warmupPublication()
+            "startup-failure-publication-stress" -> harness.startupFailurePublicationStress()
             "workspace-isolation" -> harness.workspaceIsolation()
             "prestart-session-owner-exit" -> harness.prestartSessionOwnerExit()
             "build-only-cache-invalidation" -> harness.buildOnlyCacheInvalidation()
@@ -605,6 +606,63 @@ private class ScenarioHarness(
             it.isDirectory && it.name.startsWith("node-")
         }) {
             "Managed node work directory remained after forced production warmup failure."
+        }
+        assertAllObservedDead()
+    }
+
+    fun startupFailurePublicationStress() = protect {
+        val failureWorkspace = File(root, "failure-workspace").apply(::requireDirectory)
+        val failureControl = File(root, "failure-control").apply(::requireDirectory)
+        val publicationPause = File(
+            failureControl,
+            "pause-daemon-before-startup-failure-publication",
+        )
+        marker(File(failureControl, "fail-warmup"))
+        marker(publicationPause)
+        val failing = startProbe(
+            name = "startup-failure",
+            workspace = failureWorkspace,
+            controlDirectory = failureControl,
+        )
+
+        val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(SCENARIO_WAIT_SECONDS)
+        var daemonObservations = emptyList<File>()
+        while (failing.process.isAlive && System.nanoTime() < deadlineNanos) {
+            daemonObservations = failureControl.listFiles().orEmpty()
+                .filter {
+                    it.isFile &&
+                        it.name.startsWith("daemon-") &&
+                        "-arrived-" !in it.name &&
+                        it.name.endsWith(".properties")
+                }
+            if (daemonObservations.size > 1) break
+            Thread.sleep(25L)
+        }
+        if (publicationPause.isFile && !publicationPause.delete()) {
+            throw IllegalStateException(
+                "Could not remove startup-failure publication barrier " +
+                    "${publicationPause.absolutePath}.",
+            )
+        }
+        check(daemonObservations.size <= 1) {
+            failing.kill()
+            "One forced warmup failure elected ${daemonObservations.size} daemon generations " +
+                "${daemonObservations.map(File::getName)} before the failure became observable."
+        }
+        check(!failing.process.isAlive) {
+            failing.kill()
+            "Forced warmup failure probe ${failing.pid} did not publish its failure and exit " +
+                "within $SCENARIO_WAIT_SECONDS seconds."
+        }
+        check(failing.process.exitValue() != 0) {
+            "Forced production warmup failure unexpectedly exited successfully."
+        }
+        check(!failing.readyFile.exists()) {
+            "Probe readiness ${failing.readyFile.absolutePath} appeared after forced warmup failure."
+        }
+        check("warmup was forced to fail" in failing.logFile.readText()) {
+            "Forced warmup failure output did not name the failure control:\n" +
+                failing.logFile.readText()
         }
         assertAllObservedDead()
     }
