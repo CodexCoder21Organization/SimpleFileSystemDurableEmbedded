@@ -20,7 +20,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
-fun testSharedCockroachCrossProcessElectionAndRecovery() =
+fun testSharedCockroachCrossProcessElectionAndRecovery(): Unit =
     SharedCockroachProtocolV2Scenarios.withHostAdmission {
     var privateTemp: File? = null
     var managedStateDirectory: File? = null
