@@ -500,7 +500,7 @@ private fun startCockroach(
         "--pid-file=${pidFile.absolutePath}",
     )
         .also { builder ->
-            builder.environment()["GOMAXPROCS"] = "1"
+            builder.environment()["GOMAXPROCS"] = "2"
         }
         .directory(workDirectory)
         .redirectOutput(logFile)
