@@ -74,7 +74,13 @@ private fun assembleCockroachTestFixtureFatJar(): File = BuildJar(
 /**
  * Builds the fixture runtime and starts its managed node while Kompile is still resolving test
  * dependencies. The node is therefore warm before any forked test JVM's timeout begins.
+ *
+ * Tests resolve this rule through its workspace-local Maven coordinate instead of a direct
+ * `package.rule()` dependency. BuildTest deliberately prepares and distributes only direct rule
+ * dependencies; a process-owning prestart must execute independently in each shard's live runner
+ * session and must never be restored from another host's packaged build cache.
  */
+@MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 fun buildCockroachTestFixtureFatJar(): File {
     val fixtureJar = assembleCockroachTestFixtureFatJar()
     if (System.getenv("SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL").isNullOrBlank()) {
@@ -93,6 +99,9 @@ fun buildCockroachSuiteFixtureFatJar(): File = assembleCockroachTestFixtureFatJa
  * Gives protocol-scenario tests their own declared build-rule dependency so additions to the
  * scenario runtime cannot be hidden by a previously resolved fixture annotation.
  */
+@MavenArtifactCoordinates(
+    "simplefilesystem.durable:simplefilesystem-durable-test-fixture-protocol-v2:",
+)
 fun buildCockroachProtocolV2ConcurrentScenarioFatJar(): File =
     buildCockroachTestFixtureFatJar()
 

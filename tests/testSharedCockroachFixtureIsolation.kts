@@ -1,4 +1,4 @@
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 @file:WithArtifact("org.postgresql:postgresql:42.6.0")
 @file:WithArtifact("org.jetbrains.kotlin:kotlin-stdlib:1.9.22")
 @file:WithArtifact("org.jetbrains.kotlin:kotlin-test:1.9.22")

@@ -1,5 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 @file:WithArtifact("simplefilesystem.conformance:simplefilesystem-conformance:0.1.0")
 @file:WithArtifact("simplefilesystem:simplefilesystem-api:0.3.0")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
