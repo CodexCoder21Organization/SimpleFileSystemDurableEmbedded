@@ -59,6 +59,7 @@ class SharedCockroachCluster(
     private var managedNodeLease = false
     private var managedDiagnostics: SharedCockroachFixtureDiagnostics? = null
     private var fixtureReadyBeforeStart: Boolean? = null
+    private var hostAdmission: Closeable? = null
 
     val username: String = "root"
     val password: String = ""
@@ -70,6 +71,9 @@ class SharedCockroachCluster(
         }
         val configuredJdbcUrl = System.getenv(SHARED_COCKROACH_JDBC_URL_ENV)
             ?.takeIf { it.isNotBlank() }
+        if (configuredJdbcUrl != null) {
+            hostAdmission = SharedCockroachProtocolV2Scenarios.acquireHostAdmission()
+        }
         val acquired = if (configuredJdbcUrl != null) {
             null
         } else {
@@ -103,6 +107,13 @@ class SharedCockroachCluster(
                     failure.addSuppressed(cleanupFailure)
                 }
                 managedNodeLease = false
+            }
+            try {
+                hostAdmission?.close()
+            } catch (cleanupFailure: Throwable) {
+                failure.addSuppressed(cleanupFailure)
+            } finally {
+                hostAdmission = null
             }
             throw failure
         }
@@ -160,6 +171,18 @@ class SharedCockroachCluster(
                 } finally {
                     managedNodeLease = false
                 }
+            }
+            try {
+                hostAdmission?.close()
+            } catch (cleanupFailure: Throwable) {
+                val originalFailure = failure
+                if (originalFailure == null) {
+                    failure = cleanupFailure
+                } else {
+                    originalFailure.addSuppressed(cleanupFailure)
+                }
+            } finally {
+                hostAdmission = null
             }
         }
         failure?.let { throw it }

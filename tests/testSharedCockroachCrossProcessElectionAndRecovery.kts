@@ -14,12 +14,14 @@ import java.sql.DriverManager
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import simplefilesystem.durable.testing.SharedCockroachLeaseProbe
+import simplefilesystem.durable.testing.SharedCockroachProtocolV2Scenarios
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
-fun testSharedCockroachCrossProcessElectionAndRecovery() {
+fun testSharedCockroachCrossProcessElectionAndRecovery() =
+    SharedCockroachProtocolV2Scenarios.withHostAdmission {
     var privateTemp: File? = null
     var managedStateDirectory: File? = null
     val javaBinary = File(System.getProperty("java.home"), "bin/java").absolutePath
@@ -495,7 +497,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             throw cleanupFailure
         }
     }
-}
+    }
 
 fun waitForCrossProcessReadyFiles(readyFiles: List<File>, timeoutNanos: Long) {
     require(readyFiles.isNotEmpty()) {

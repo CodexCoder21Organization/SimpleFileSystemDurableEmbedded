@@ -1,6 +1,7 @@
 package simplefilesystem.durable.testing
 
 import java.io.File
+import java.io.Closeable
 import java.io.RandomAccessFile
 import java.nio.file.Files
 import java.time.Instant
@@ -11,29 +12,94 @@ import java.util.concurrent.TimeoutException
 /** Entry point and marker for the protocol-v2 scenario executable in the fixture jar. */
 object SharedCockroachProtocolV2Scenarios {
     fun run(scenario: String) {
-        withProtocolScenarioAdmission {
+        withHostCockroachTestAdmission {
             runSharedCockroachProtocolV2ScenarioTest(scenario)
+        }
+    }
+
+    fun <T> withHostAdmission(block: () -> T): T =
+        withHostCockroachTestAdmission(block)
+
+    fun acquireHostAdmission(): Closeable =
+        HostCockroachTestAdmission.acquire()
+}
+
+/**
+ * BuildTest starts four child JVMs on each two-CPU shard. The host lock keeps their independently
+ * bounded CockroachDB workloads from starving one another while retaining every test's internal
+ * thread/process concurrency. Nested fixture databases in one test JVM share one reentrant lease.
+ */
+private object HostCockroachTestAdmission {
+    private val monitor = Any()
+    private var referenceCount = 0
+    private var access: RandomAccessFile? = null
+    private var admissionLock: java.nio.channels.FileLock? = null
+
+    fun acquire(): Closeable {
+        synchronized(monitor) {
+            if (referenceCount == 0) {
+                val openedAccess = RandomAccessFile(
+                    File(
+                        System.getProperty("java.io.tmpdir"),
+                        "simplefilesystem-durable-cockroach-test-admission.lock",
+                    ),
+                    "rw",
+                )
+                try {
+                    admissionLock = openedAccess.channel.lock()
+                    access = openedAccess
+                } catch (failure: Throwable) {
+                    openedAccess.close()
+                    throw failure
+                }
+            }
+            referenceCount += 1
+        }
+        return HostCockroachTestAdmissionLease()
+    }
+
+    fun release() {
+        synchronized(monitor) {
+            check(referenceCount > 0) {
+                "The host CockroachDB test admission lease was released without an acquisition."
+            }
+            referenceCount -= 1
+            if (referenceCount != 0) return
+
+            var failure: Throwable? = null
+            try {
+                admissionLock?.release()
+            } catch (caught: Throwable) {
+                failure = caught
+            } finally {
+                admissionLock = null
+                try {
+                    access?.close()
+                } catch (caught: Throwable) {
+                    failure?.addSuppressed(caught) ?: run { failure = caught }
+                } finally {
+                    access = null
+                }
+            }
+            failure?.let { throw it }
         }
     }
 }
 
-/**
- * BuildTest starts four child JVMs on each two-CPU shard. A protocol scenario starts its own real
- * fault-injection node instead of using the shard's prestarted fixture, so overlapping scenarios
- * can starve each other's bounded startup observers. The host lock admits one private scenario at
- * a time while retaining every scenario's internal cross-process concurrency.
- */
-private fun <T> withProtocolScenarioAdmission(block: () -> T): T {
-    val lockFile = File(
-        System.getProperty("java.io.tmpdir"),
-        "simplefilesystem-durable-protocol-v2-scenario.lock",
-    )
-    return RandomAccessFile(lockFile, "rw").use { access ->
-        access.channel.lock().use {
-            block()
+private class HostCockroachTestAdmissionLease : Closeable {
+    private var closed = false
+
+    override fun close() {
+        synchronized(this) {
+            if (closed) return
+            closed = true
         }
+        HostCockroachTestAdmission.release()
     }
 }
+
+private fun <T> withHostCockroachTestAdmission(block: () -> T): T =
+    HostCockroachTestAdmission.acquire().use { block() }
 
 /**
  * Runs one end-to-end shared-CockroachDB protocol scenario with a private process tree.
