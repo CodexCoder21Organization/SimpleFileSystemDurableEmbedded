@@ -7,17 +7,24 @@ import java.nio.file.StandardWatchEventKinds
 import java.sql.DriverManager
 import java.util.UUID
 import simplefilesystem.durable.DurableSimpleFileSystemManager
-import sql.Database
 
 internal fun warmUpDurableSchema(
     adminJdbcUrl: String,
     controlDirectory: File? = null,
     token: String = "suite-fixture",
     ownershipDirectory: File? = null,
+    targetPoolSize: Int = FIXTURE_DATABASE_POOL_SIZE,
+    observeControlBarrier: Boolean = true,
     verifyOwnership: () -> Unit = {},
 ) {
-    waitAtWarmupBarrier(controlDirectory, token, ownershipDirectory, verifyOwnership)
-    if (controlDirectory != null && File(controlDirectory, "fail-warmup").isFile) {
+    require(targetPoolSize in 1..FIXTURE_DATABASE_POOL_SIZE) {
+        "Fixture database warmup target must be between 1 and $FIXTURE_DATABASE_POOL_SIZE, " +
+            "but was $targetPoolSize."
+    }
+    if (observeControlBarrier) {
+        waitAtWarmupBarrier(controlDirectory, token, ownershipDirectory, verifyOwnership)
+    }
+    if (observeControlBarrier && controlDirectory != null && File(controlDirectory, "fail-warmup").isFile) {
         throw IllegalStateException(
             "Shared CockroachDB warmup was forced to fail by " +
                 File(controlDirectory, "fail-warmup").absolutePath +
@@ -25,30 +32,71 @@ internal fun warmUpDurableSchema(
         )
     }
     verifyOwnership()
-    val databaseName = "durable_fixture_warmup_${UUID.randomUUID().toString().replace("-", "")}"
-    val databaseJdbcUrl = fixtureJdbcUrlForDatabase(adminJdbcUrl, databaseName)
     Class.forName("org.postgresql.Driver")
     DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
         connection.createStatement().use { statement ->
-            statement.execute("CREATE DATABASE ${fixtureQuoteIdentifier(databaseName)}")
+            statement.execute(
+                """CREATE TABLE IF NOT EXISTS $FIXTURE_DATABASE_POOL_TABLE (
+                    database_name STRING PRIMARY KEY,
+                    lease_token STRING NULL,
+                    owner_pid INT8 NULL,
+                    owner_started_at_millis INT8 NULL,
+                    needs_reset BOOL NOT NULL DEFAULT false
+                );
+                ALTER TABLE $FIXTURE_DATABASE_POOL_TABLE
+                    ADD COLUMN IF NOT EXISTS needs_reset BOOL NOT NULL DEFAULT false""".trimIndent(),
+            )
         }
     }
-    try {
-        Database("org.postgresql.Driver", databaseJdbcUrl, "root", "").use { database ->
-            DurableSimpleFileSystemManager(
-                blobstoreService = InMemoryBlobstoreService(),
-                metadataDatabase = database,
-            ).use { manager ->
-                manager.listFilesystems(null, 1)
+    val existingPoolSize = DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT count(*) FROM $FIXTURE_DATABASE_POOL_TABLE").use { rows ->
+                check(rows.next())
+                rows.getInt(1)
             }
         }
-    } finally {
+    }
+    repeat((targetPoolSize - existingPoolSize).coerceAtLeast(0)) {
+        verifyOwnership()
+        val databaseName = "durable_fixture_pool_${UUID.randomUUID().toString().replace("-", "")}"
+        val databaseJdbcUrl = fixtureJdbcUrlForDatabase(adminJdbcUrl, databaseName)
         DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
             connection.createStatement().use { statement ->
-                statement.execute(
-                    "DROP DATABASE IF EXISTS ${fixtureQuoteIdentifier(databaseName)} CASCADE",
-                )
+                statement.execute("CREATE DATABASE ${fixtureQuoteIdentifier(databaseName)}")
             }
+        }
+        try {
+            openSharedCockroachTestDatabase(databaseJdbcUrl, "root", "").use { database ->
+                DurableSimpleFileSystemManager(
+                    blobstoreService = InMemoryBlobstoreService(),
+                    metadataDatabase = database,
+                ).use { manager ->
+                    manager.listFilesystems(null, 1)
+                }
+            }
+            DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+                connection.prepareStatement(
+                    """INSERT INTO $FIXTURE_DATABASE_POOL_TABLE
+                        (database_name, lease_token, owner_pid, owner_started_at_millis, needs_reset)
+                        VALUES (?, NULL, NULL, NULL, false)""".trimIndent(),
+                ).use { statement ->
+                    statement.setString(1, databaseName)
+                    statement.executeUpdate()
+                }
+            }
+        } catch (failure: Throwable) {
+            try {
+                DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+                    connection.createStatement().use { statement ->
+                        statement.execute(
+                            "DROP DATABASE IF EXISTS ${fixtureQuoteIdentifier(databaseName)} CASCADE",
+                        )
+                    }
+                }
+            } catch (cleanupFailure: Throwable) {
+                failure.addSuppressed(cleanupFailure)
+            }
+            throw failure
         }
     }
     verifyOwnership()

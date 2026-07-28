@@ -8,6 +8,7 @@ import simplefilesystem.FileEntryPage
 import simplefilesystem.FileEntryType
 import simplefilesystem.FileSink
 import simplefilesystem.FileMetadataInfo
+import simplefilesystem.FilesystemNotFoundException
 import simplefilesystem.INLINE_PAYLOAD_MAX_BYTES
 import simplefilesystem.InvalidByteRangeException
 import simplefilesystem.InvalidPathException
@@ -36,16 +37,17 @@ class DurableSimpleFileSystem internal constructor(
     private val filesystemUuid: UUID,
 ) : SimpleFileSystem {
     override fun list(path: String, after: String?, limit: Int): FileEntryPage {
-        return manager.transactionally { transaction ->
-            val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
-            val normalized = manager.normalizePath(path)
-            val cursor = manager.validateListCursor(normalized, after, recursive = false)
-            val pageLimit = manager.validatePageLimit(limit)
+        val normalized = preserveActiveFilesystemErrorPrecedence { manager.normalizePath(path) }
+        val cursor = preserveActiveFilesystemErrorPrecedence {
+            manager.validateListCursor(normalized, after, recursive = false)
+        }
+        val pageLimit = preserveActiveFilesystemErrorPrecedence { manager.validatePageLimit(limit) }
+        val operation: (Database) -> FileEntryPage = { transaction ->
             val cursorClause = if (cursor == null) "" else "AND path > ?"
             val pageArguments = mutableListOf<Any>(filesystemUuid, normalized)
             if (cursor != null) pageArguments += cursor
             pageArguments += pageLimit + 1
-            val entries = validatedDirectoryListing(
+            val (entries, revision) = validatedDirectoryListing(
                 transaction,
                 normalized,
                 """SELECT * FROM entries
@@ -53,16 +55,22 @@ class DurableSimpleFileSystem internal constructor(
                     ORDER BY path LIMIT ?""".trimIndent(),
                 *pageArguments.toTypedArray(),
             )
-            fileEntryPage(entries, pageLimit, filesystem.namespaceRevision)
+            fileEntryPage(entries, pageLimit, revision)
+        }
+        return if (hasIntermediatePathComponents(normalized)) {
+            manager.transactionally(operation)
+        } else {
+            manager.readStatement(operation)
         }
     }
 
     override fun listRecursively(path: String, after: String?, limit: Int): FileEntryPage {
-        return manager.transactionally { transaction ->
-            val filesystem = manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
-            val normalized = manager.normalizePath(path)
-            val cursor = manager.validateListCursor(normalized, after, recursive = true)
-            val pageLimit = manager.validatePageLimit(limit)
+        val normalized = preserveActiveFilesystemErrorPrecedence { manager.normalizePath(path) }
+        val cursor = preserveActiveFilesystemErrorPrecedence {
+            manager.validateListCursor(normalized, after, recursive = true)
+        }
+        val pageLimit = preserveActiveFilesystemErrorPrecedence { manager.validatePageLimit(limit) }
+        val operation: (Database) -> FileEntryPage = { transaction ->
             val prefix = if (normalized == "/") "/" else "$normalized/"
             val prefixUpperBound = prefixUpperBound(normalized)
             val cursorClause = if (cursor == null) "" else "AND path > ?"
@@ -74,7 +82,7 @@ class DurableSimpleFileSystem internal constructor(
             )
             if (cursor != null) pageArguments += cursor
             pageArguments += pageLimit + 1
-            val entries = validatedDirectoryListing(
+            val (entries, revision) = validatedDirectoryListing(
                 transaction,
                 normalized,
                 """SELECT * FROM entries
@@ -82,7 +90,12 @@ class DurableSimpleFileSystem internal constructor(
                     ORDER BY path LIMIT ?""".trimIndent(),
                 *pageArguments.toTypedArray(),
             )
-            fileEntryPage(entries, pageLimit, filesystem.namespaceRevision)
+            fileEntryPage(entries, pageLimit, revision)
+        }
+        return if (hasIntermediatePathComponents(normalized)) {
+            manager.transactionally(operation)
+        } else {
+            manager.readStatement(operation)
         }
     }
 
@@ -99,47 +112,67 @@ class DurableSimpleFileSystem internal constructor(
     override fun readUtf8(path: String): String = decodeStrictUtf8(path, readInlineBytes(path))
 
     override fun write(path: String, data: String, ifMatches: String?): FileMetadataInfo {
-        requireActive()
-        manager.normalizePath(path)
-        val bytes = decodeBase64(path, data)
-        manager.validateExpectedHash(ifMatches)
-        return commitBytes(sink(path, ifMatches), bytes)
+        val (normalized, bytes) = try {
+            manager.normalizePath(path) to decodeBase64(path, data).also {
+                manager.validateExpectedHash(ifMatches)
+            }
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
+        return commitBytes(sink(normalized, ifMatches), bytes)
     }
 
     override fun writeUtf8(path: String, content: String, ifMatches: String?): FileMetadataInfo {
-        requireActive()
-        manager.normalizePath(path)
-        val bytes = encodeStrictUtf8(path, content)
-        manager.validateExpectedHash(ifMatches)
-        return commitBytes(sink(path, ifMatches), bytes)
+        val (normalized, bytes) = try {
+            manager.normalizePath(path) to encodeStrictUtf8(path, content).also {
+                manager.validateExpectedHash(ifMatches)
+            }
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
+        return commitBytes(sink(normalized, ifMatches), bytes)
     }
 
     override fun overwrite(path: String, data: String): FileMetadataInfo {
-        requireActive()
-        manager.normalizePath(path)
-        val bytes = decodeBase64(path, data)
-        return commitBytes(unconditionalSink(path), bytes)
+        val (normalized, bytes) = try {
+            manager.normalizePath(path) to decodeBase64(path, data)
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
+        return commitBytes(unconditionalSink(normalized), bytes)
     }
 
     override fun overwriteUtf8(path: String, content: String): FileMetadataInfo {
-        requireActive()
-        manager.normalizePath(path)
-        val bytes = encodeStrictUtf8(path, content)
-        return commitBytes(unconditionalSink(path), bytes)
+        val (normalized, bytes) = try {
+            manager.normalizePath(path) to encodeStrictUtf8(path, content)
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
+        return commitBytes(unconditionalSink(normalized), bytes)
     }
 
     override fun appendingWrite(path: String, data: String, mustExist: Boolean): FileMetadataInfo {
-        requireActive()
-        manager.normalizePath(path)
-        val bytes = decodeBase64(path, data)
-        return commitBytes(appendingSink(path, mustExist), bytes)
+        val (normalized, bytes) = try {
+            manager.normalizePath(path) to decodeBase64(path, data)
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
+        return commitBytes(appendingSink(normalized, mustExist), bytes)
     }
 
     override fun appendingWriteUtf8(path: String, content: String, mustExist: Boolean): FileMetadataInfo {
-        requireActive()
-        manager.normalizePath(path)
-        val bytes = encodeStrictUtf8(path, content)
-        return commitBytes(appendingSink(path, mustExist), bytes)
+        val (normalized, bytes) = try {
+            manager.normalizePath(path) to encodeStrictUtf8(path, content)
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
+        return commitBytes(appendingSink(normalized, mustExist), bytes)
     }
 
     override fun metadata(path: String): FileMetadataInfo {
@@ -163,8 +196,15 @@ class DurableSimpleFileSystem internal constructor(
     }
 
     override fun exists(path: String): Boolean {
-        requireActive()
-        val normalized = manager.normalizePath(path)
+        val normalized = try {
+            manager.normalizePath(path)
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
+        if (!hasIntermediatePathComponents(normalized)) {
+            return manager.findActiveRootChildEntry(filesystemUuid, normalized) != null
+        }
         return manager.transactionally { transaction ->
             manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
             manager.validateIntermediateComponents(transaction, filesystemUuid, normalized)
@@ -438,7 +478,7 @@ class DurableSimpleFileSystem internal constructor(
             val sourcePrefix = "$normalizedSource/"
             val sourcePrefixUpperBound = prefixUpperBound(normalizedSource)
             val sourceSuffixStart = normalizedSource.codePointCount(0, normalizedSource.length) + 1
-            val movedPaths = transaction.getStrings(
+            transaction.execute(
                 """UPDATE entries
                     SET path = CASE
                             WHEN path = ? THEN ?
@@ -450,8 +490,7 @@ class DurableSimpleFileSystem internal constructor(
                         END,
                         name = CASE WHEN path = ? THEN ? ELSE name END
                     WHERE filesystem_uuid = ?
-                      AND (path = ? OR (path >= ? AND path < ?))
-                    RETURNING path""".trimIndent(),
+                      AND (path = ? OR (path >= ? AND path < ?))""".trimIndent(),
                 normalizedSource,
                 normalizedTarget,
                 normalizedTarget,
@@ -467,26 +506,23 @@ class DurableSimpleFileSystem internal constructor(
                 sourcePrefix,
                 sourcePrefixUpperBound,
             )
-            val movedPathEvents = movedPaths.flatMap { newPath ->
-                val oldPath = normalizedSource + newPath.removePrefix(normalizedTarget)
-                listOf(oldPath, newPath)
-            }
             val released = replaced?.sizeBytes ?: 0L
             val attemptedUsage = manager.checkedAttemptedUsage(filesystem, normalizedTarget, released, 0L)
-            transaction.execute(
-                "UPDATE filesystems SET used_bytes = ? WHERE uuid = ?",
-                attemptedUsage,
-                filesystemUuid,
-            )
             val membershipPaths = listOf(manager.parentPath(normalizedSource)) +
                 if (replaced == null) listOf(manager.parentPath(normalizedTarget)) else emptyList()
-            manager.recordNamespaceMutation(
+            manager.recordAtomicMoveNamespaceMutation(
                 transaction,
                 filesystem,
                 attemptedUsage,
-                movedPathEvents + membershipPaths,
+                normalizedSource,
+                normalizedTarget,
+                membershipPaths,
             )
-            manager.requireEntry(transaction, filesystemUuid, normalizedTarget).toMetadata()
+            sourceEntry.copy(
+                path = normalizedTarget,
+                parentPath = manager.parentPath(normalizedTarget),
+                name = manager.name(normalizedTarget),
+            ).toMetadata()
         }
     }
 
@@ -644,37 +680,77 @@ class DurableSimpleFileSystem internal constructor(
         normalizedPath: String,
         pageQuery: String,
         vararg pageArguments: Any,
-    ): List<EntryRecord> {
-        manager.validateIntermediateComponents(transaction, filesystemUuid, normalizedPath)
+    ): Pair<List<EntryRecord>, Long> {
+        preserveActiveFilesystemErrorPrecedence(transaction) {
+            manager.validateIntermediateComponents(transaction, filesystemUuid, normalizedPath)
+        }
         val rows = transaction.getRows(
-            """WITH requested_directory AS MATERIALIZED (
+            """WITH active_filesystem AS MATERIALIZED (
+                    SELECT namespace_revision, expires_at_millis
+                    FROM filesystems
+                    WHERE uuid = ?
+                ),
+                requested_directory AS MATERIALIZED (
                     SELECT entry_kind FROM entries
                     WHERE filesystem_uuid = ? AND path = ?
                 ),
                 page AS MATERIALIZED (
                     $pageQuery
                 )
-                SELECT requested_directory.entry_kind AS requested_directory_kind, page.*
+                SELECT active_filesystem.namespace_revision AS active_namespace_revision,
+                       active_filesystem.expires_at_millis AS active_expires_at_millis,
+                       requested_directory.entry_kind AS requested_directory_kind,
+                       page.*
                 FROM (SELECT true) AS anchor
+                LEFT JOIN active_filesystem ON true
                 LEFT JOIN requested_directory ON true
                 LEFT JOIN page ON true
                 ORDER BY page.path""".trimIndent(),
             filesystemUuid,
+            filesystemUuid,
             normalizedPath,
             *pageArguments,
         )
+        val revision = (rows.first().results["active_namespace_revision"] as? Number)?.toLong()
+            ?: throw FilesystemNotFoundException(filesystemUuid.toString())
+        val expiration = (rows.first().results["active_expires_at_millis"] as? Number)?.toLong()
+        manager.ensureNotExpired(filesystemUuid, expiration)
         val directoryKind = rows.first().nullableStringValue("requested_directory_kind")
             ?: throw PathNotFoundException(normalizedPath)
         if (directoryKind != "DIRECTORY") {
             val actualType = if (directoryKind == "FILE") FileEntryType.REGULAR_FILE else FileEntryType.OTHER
             throw PathTypeMismatchException(normalizedPath, FileEntryType.DIRECTORY, actualType)
         }
-        return rows.filter { it.nullableStringValue("path") != null }.map { it.toEntryRecord() }
+        return rows.filter { it.nullableStringValue("path") != null }.map { it.toEntryRecord() } to revision
     }
 
+    private fun <T> preserveActiveFilesystemErrorPrecedence(
+        transaction: Database,
+        operation: () -> T,
+    ): T = try {
+        operation()
+    } catch (failure: RuntimeException) {
+        manager.requireActiveFilesystem(transaction, filesystemUuid, lock = false)
+        throw failure
+    }
+
+    private fun <T> preserveActiveFilesystemErrorPrecedence(operation: () -> T): T = try {
+        operation()
+    } catch (failure: RuntimeException) {
+        manager.requireActiveFilesystem(filesystemUuid)
+        throw failure
+    }
+
+    private fun hasIntermediatePathComponents(path: String): Boolean =
+        path.removePrefix("/").contains('/')
+
     private fun fileSnapshot(rawPath: String): FileGenerationSnapshot {
-        requireActive()
-        val normalized = manager.normalizePath(rawPath)
+        val normalized = try {
+            manager.normalizePath(rawPath)
+        } catch (failure: RuntimeException) {
+            requireActive()
+            throw failure
+        }
         return manager.fileGenerationSnapshot(filesystemUuid, normalized)
     }
 

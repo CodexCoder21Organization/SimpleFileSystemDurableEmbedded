@@ -5,6 +5,7 @@ import community.kotlin.clocks.simple.SystemClock
 import java.io.Closeable
 import java.io.File
 import java.io.RandomAccessFile
+import java.nio.channels.OverlappingFileLockException
 import java.nio.file.ClosedWatchServiceException
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileSystems
@@ -12,14 +13,25 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardWatchEventKinds
 import java.sql.DriverManager
+import java.sql.SQLException
 import java.time.Instant
 import java.util.Properties
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.locks.LockSupport
+import org.apache.commons.dbcp2.BasicDataSource
+import sql.Database
 
 private const val SHARED_COCKROACH_JDBC_URL_ENV =
     "SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL"
+internal const val FIXTURE_DATABASE_POOL_SIZE = 16
+// One schema-ready database is sufficient to publish a usable node. The daemon fills the rest in
+// the background, while the build-session prestart explicitly waits for the full pool before tests.
+internal const val FIXTURE_DATABASE_READY_POOL_SIZE = 1
+internal const val FIXTURE_DATABASE_POOL_TABLE = "simple_filesystem_fixture_database_pool"
+private const val WAIT_FOR_FULL_FIXTURE_POOL_PROPERTY =
+    "simplefilesystem.durable.testing.waitForFullFixturePool"
 
 /**
  * Explicit file barriers used only by child-process integration tests. Production callers leave
@@ -53,10 +65,13 @@ class SharedCockroachCluster(
     private val clock: Clock = SystemClock(),
     private val fixtureControl: SharedCockroachFixtureControl? = null,
 ) : Closeable {
-    private val databaseName = "durable_test_${UUID.randomUUID().toString().replace("-", "")}"
+    private val leaseName = "durable_test_${UUID.randomUUID().toString().replace("-", "")}"
+    private var databaseName: String? = null
+    private var pooledDatabaseLease: PooledDatabaseLease? = null
     private var adminJdbcUrl: String? = null
     private var testJdbcUrl: String? = null
     private var managedNodeLease = false
+    private var managedNodeLeaseName = leaseName
     private var managedDiagnostics: SharedCockroachFixtureDiagnostics? = null
     private var fixtureReadyBeforeStart: Boolean? = null
     private var hostAdmission: Closeable? = null
@@ -80,7 +95,7 @@ class SharedCockroachCluster(
             null
         } else {
             SharedCockroachNode.acquire(
-                leaseName = databaseName,
+                leaseName = leaseName,
                 clock = clock,
                 fixtureControl = fixtureControl,
             ).also {
@@ -89,26 +104,47 @@ class SharedCockroachCluster(
         }
         val sharedJdbcUrl = configuredJdbcUrl ?: requireNotNull(acquired).jdbcUrl
         try {
-            val databaseJdbcUrl = jdbcUrlForDatabase(sharedJdbcUrl, databaseName)
             Class.forName("org.postgresql.Driver")
-            DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
-                connection.createStatement().use { statement ->
-                    statement.execute("CREATE DATABASE ${quoteIdentifier(databaseName)}")
+            val pooled = claimPooledDatabase(sharedJdbcUrl)
+            val selectedDatabaseName = pooled?.databaseName ?: leaseName
+            if (pooled == null) {
+                DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
+                    connection.createStatement().use { statement ->
+                        statement.execute("CREATE DATABASE ${quoteIdentifier(selectedDatabaseName)}")
+                    }
                 }
             }
+            databaseName = selectedDatabaseName
+            pooledDatabaseLease = pooled
+            if (managedNodeLease && selectedDatabaseName != managedNodeLeaseName) {
+                SharedCockroachNode.renameLease(managedNodeLeaseName, selectedDatabaseName)
+                managedNodeLeaseName = selectedDatabaseName
+            }
+            val databaseJdbcUrl = jdbcUrlForDatabase(sharedJdbcUrl, selectedDatabaseName)
             adminJdbcUrl = sharedJdbcUrl
             testJdbcUrl = databaseJdbcUrl
             managedDiagnostics = acquired?.diagnostics
             fixtureReadyBeforeStart = acquired?.fixtureReadyBeforeAcquire ?: true
             return this
         } catch (failure: Throwable) {
+            pooledDatabaseLease?.let { pooled ->
+                try {
+                    releasePooledDatabase(sharedJdbcUrl, pooled)
+                } catch (cleanupFailure: Throwable) {
+                    failure.addSuppressed(cleanupFailure)
+                } finally {
+                    pooledDatabaseLease = null
+                    databaseName = null
+                }
+            }
             if (managedNodeLease) {
                 try {
-                    SharedCockroachNode.release(databaseName, fixtureControl)
+                    SharedCockroachNode.release(managedNodeLeaseName, fixtureControl)
                 } catch (cleanupFailure: Throwable) {
                     failure.addSuppressed(cleanupFailure)
                 }
                 managedNodeLease = false
+                managedNodeLeaseName = leaseName
             }
             try {
                 hostAdmission?.close()
@@ -127,6 +163,21 @@ class SharedCockroachCluster(
                 "call start() first",
         )
 
+    /**
+     * Opens a bounded, lazy connection pool tuned for this process-local test fixture.
+     *
+     * The generic SQL factory eagerly opens two connections and validates every pool borrow with
+     * an additional query. A managed CockroachDB node already has process-level liveness checks,
+     * so those duplicate round trips only consume the shared test shard's CPU budget.
+     */
+    fun openDatabase(): Database =
+        openSharedCockroachTestDatabase(
+            jdbcUrl(),
+            username,
+            password,
+            admitSharedQueries = fixtureControl == null,
+        )
+
     fun diagnostics(): SharedCockroachFixtureDiagnostics = managedDiagnostics
         ?: throw IllegalStateException(
             "Managed fixture diagnostics are unavailable because this SharedCockroachCluster is " +
@@ -142,27 +193,39 @@ class SharedCockroachCluster(
     @Synchronized
     override fun close() {
         val configuredJdbcUrl = adminJdbcUrl ?: return
+        val selectedDatabaseName = requireNotNull(databaseName)
+        val pooled = pooledDatabaseLease
         var failure: Throwable? = null
         try {
-            if (!managedNodeLease) {
+            if (pooled != null) {
+                releasePooledDatabase(configuredJdbcUrl, pooled)
+            } else if (!managedNodeLease) {
                 DriverManager.getConnection(configuredJdbcUrl, username, password).use { connection ->
                     connection.createStatement().use { statement ->
                         statement.execute(
-                            "DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} CASCADE",
+                            "DROP DATABASE IF EXISTS ${quoteIdentifier(selectedDatabaseName)} CASCADE",
                         )
                     }
                 }
             }
         } catch (dropFailure: Throwable) {
-            failure = dropFailure
+            if (managedNodeLease && !managedCockroachProcessIsAlive()) {
+                // Recovery scenarios deliberately terminate the ephemeral managed node before
+                // closing their probe. Its database and coordinator lease disappeared with that
+                // process, so there is no persistent pool state left to release.
+            } else {
+                failure = dropFailure
+            }
         } finally {
             adminJdbcUrl = null
             testJdbcUrl = null
+            databaseName = null
+            pooledDatabaseLease = null
             managedDiagnostics = null
             fixtureReadyBeforeStart = null
             if (managedNodeLease) {
                 try {
-                    SharedCockroachNode.release(databaseName, fixtureControl)
+                    SharedCockroachNode.release(managedNodeLeaseName, fixtureControl)
                 } catch (cleanupFailure: Throwable) {
                     val originalFailure = failure
                     if (originalFailure == null) {
@@ -172,6 +235,7 @@ class SharedCockroachCluster(
                     }
                 } finally {
                     managedNodeLease = false
+                    managedNodeLeaseName = leaseName
                 }
             }
             try {
@@ -188,6 +252,14 @@ class SharedCockroachCluster(
             }
         }
         failure?.let { throw it }
+    }
+
+    private fun managedCockroachProcessIsAlive(): Boolean {
+        val diagnostics = managedDiagnostics ?: return false
+        val process = ProcessHandle.of(diagnostics.cockroachPid).orElse(null) ?: return false
+        return process.isAlive &&
+            process.info().startInstant().orElse(null)?.toEpochMilli() ==
+            diagnostics.cockroachStartedAtMillis
     }
 }
 
@@ -349,6 +421,28 @@ private object SharedCockroachNode {
                         leasesDirectory.absolutePath,
                 )
             }
+        }
+    }
+
+    fun renameLease(currentName: String, claimedDatabaseName: String) = withStateLock {
+        val current = File(leasesDirectory, currentName)
+        val claimed = File(leasesDirectory, claimedDatabaseName)
+        check(current.isFile) {
+            "Cannot rename shared CockroachDB lease '${current.absolutePath}' to the claimed " +
+                "database name because the current lease does not exist."
+        }
+        check(!claimed.exists()) {
+            "Cannot rename shared CockroachDB lease '${current.absolutePath}' to " +
+                "'${claimed.absolutePath}' because that claimed-database lease already exists."
+        }
+        try {
+            Files.move(current.toPath(), claimed.toPath(), StandardCopyOption.ATOMIC_MOVE)
+        } catch (failure: AtomicMoveNotSupportedException) {
+            throw IllegalStateException(
+                "Cannot atomically rename shared CockroachDB lease '${current.absolutePath}' to " +
+                    "'${claimed.absolutePath}': the filesystem does not support ATOMIC_MOVE.",
+                failure,
+            )
         }
     }
 
@@ -1723,6 +1817,212 @@ private data class SharedCockroachLease(
     val properties: Properties,
 )
 
+private data class PooledDatabaseLease(
+    val databaseName: String,
+    val token: String,
+    val needsReset: Boolean,
+)
+
+private fun claimPooledDatabase(adminJdbcUrl: String): PooledDatabaseLease? {
+    val owner = processIdentity(ProcessHandle.current(), "fixture database-pool claimant")
+    val token = UUID.randomUUID().toString()
+    repeat(8) {
+        try {
+            DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+                connection.autoCommit = false
+                try {
+                    val candidates = connection.createStatement().use { statement ->
+                        statement.executeQuery(
+                            """SELECT database_name, lease_token, owner_pid, owner_started_at_millis,
+                                      needs_reset
+                                FROM $FIXTURE_DATABASE_POOL_TABLE
+                                ORDER BY database_name
+                                FOR UPDATE""".trimIndent(),
+                        ).use { rows ->
+                            buildList {
+                                while (rows.next()) {
+                                    add(
+                                        listOf(
+                                            rows.getString("database_name"),
+                                            rows.getString("lease_token"),
+                                            rows.getObject("owner_pid") as? Number,
+                                            rows.getObject("owner_started_at_millis") as? Number,
+                                            rows.getBoolean("needs_reset"),
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    fun isAvailable(row: List<Any?>): Boolean {
+                        if (row[1] as String? == null) return true
+                        val pid = row[2] as Number?
+                        val startedAt = row[3] as Number?
+                        return pid == null || startedAt == null ||
+                            SharedProcessIdentity(
+                                pid.toLong(),
+                                Instant.ofEpochMilli(startedAt.toLong()),
+                            ).liveHandle() == null
+                    }
+                    val available = candidates.filter(::isAvailable)
+                    val unleased = available.filter { row -> row[1] as String? == null }
+                    val preferred = unleased.ifEmpty { available }
+                    val candidate = preferred.firstOrNull { row ->
+                        !(row[4] as Boolean)
+                    } ?: preferred.firstOrNull() ?: run {
+                        connection.rollback()
+                        return null
+                    }
+                    val selectedDatabaseName = candidate[0] as String
+                    val needsReset = candidate[4] as Boolean
+                    connection.prepareStatement(
+                        """UPDATE $FIXTURE_DATABASE_POOL_TABLE
+                            SET lease_token = ?, owner_pid = ?, owner_started_at_millis = ?
+                            WHERE database_name = ?""".trimIndent(),
+                    ).use { statement ->
+                        statement.setString(1, token)
+                        statement.setLong(2, owner.pid)
+                        statement.setLong(3, owner.startedAt.toEpochMilli())
+                        statement.setString(4, selectedDatabaseName)
+                        check(statement.executeUpdate() == 1) {
+                            "Could not claim preinitialized fixture database '$selectedDatabaseName'."
+                        }
+                    }
+                    connection.commit()
+                    val lease = PooledDatabaseLease(selectedDatabaseName, token, needsReset)
+                    if (needsReset) prepareClaimedPooledDatabase(adminJdbcUrl, lease)
+                    return lease
+                } catch (failure: Throwable) {
+                    try {
+                        connection.rollback()
+                    } catch (rollbackFailure: Throwable) {
+                        failure.addSuppressed(rollbackFailure)
+                    }
+                    throw failure
+                }
+            }
+        } catch (failure: SQLException) {
+            if (failure.sqlState == "42P01") return null
+            if (failure.sqlState != "40001" || it == 7) throw failure
+        }
+    }
+    return null
+}
+
+private fun resetPooledDatabase(adminJdbcUrl: String, lease: PooledDatabaseLease) {
+    DriverManager.getConnection(
+        jdbcUrlForDatabase(adminJdbcUrl, lease.databaseName),
+        "root",
+        "",
+    ).use { connection ->
+        connection.createStatement().use { statement ->
+            statement.execute(
+                    """WITH deleted_events AS (
+                            DELETE FROM namespace_events RETURNING revision
+                        ),
+                        deleted_revisions AS (
+                            DELETE FROM namespace_event_revisions RETURNING revision
+                        ),
+                        deleted_streams AS (
+                            DELETE FROM namespace_event_streams RETURNING filesystem_uuid
+                        ),
+                        deleted_readers AS (
+                            DELETE FROM reader_sessions RETURNING reader_uuid
+                        ),
+                        deleted_blocks AS (
+                            DELETE FROM file_blocks RETURNING generation_uuid
+                        ),
+                        deleted_outbox AS (
+                            DELETE FROM blob_gc_outbox RETURNING blob_hash
+                        ),
+                        deleted_filesystems AS (
+                            DELETE FROM filesystems RETURNING uuid
+                        ),
+                        reset_manager AS (
+                            UPDATE simple_filesystem_manager_state SET descriptor_revision = 0
+                            WHERE singleton = true RETURNING singleton
+                        ),
+                        reset_maintenance AS (
+                            UPDATE simple_filesystem_maintenance_state
+                            SET orphan_inventory_high_water = NULL
+                            WHERE singleton = true RETURNING singleton
+                        )
+                        SELECT (SELECT count(*) FROM deleted_events),
+                               (SELECT count(*) FROM deleted_revisions),
+                               (SELECT count(*) FROM deleted_streams),
+                               (SELECT count(*) FROM deleted_readers),
+                               (SELECT count(*) FROM deleted_blocks),
+                               (SELECT count(*) FROM deleted_outbox),
+                               (SELECT count(*) FROM deleted_filesystems),
+                               (SELECT count(*) FROM reset_manager),
+                               (SELECT count(*) FROM reset_maintenance)""".trimIndent(),
+            )
+        }
+    }
+}
+
+private fun prepareClaimedPooledDatabase(adminJdbcUrl: String, lease: PooledDatabaseLease) {
+    try {
+        resetPooledDatabase(adminJdbcUrl, lease)
+        DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+            connection.prepareStatement(
+                """UPDATE $FIXTURE_DATABASE_POOL_TABLE
+                    SET needs_reset = false
+                    WHERE database_name = ? AND lease_token = ?""".trimIndent(),
+            ).use { statement ->
+                statement.setString(1, lease.databaseName)
+                statement.setString(2, lease.token)
+                check(statement.executeUpdate() == 1) {
+                    "Preinitialized fixture database '${lease.databaseName}' lost lease token " +
+                        "'${lease.token}' while resetting it for reuse."
+                }
+            }
+        }
+    } catch (failure: Throwable) {
+        try {
+            discardPooledDatabase(adminJdbcUrl, lease)
+        } catch (cleanupFailure: Throwable) {
+            failure.addSuppressed(cleanupFailure)
+        }
+        throw failure
+    }
+}
+
+private fun discardPooledDatabase(adminJdbcUrl: String, lease: PooledDatabaseLease) {
+    DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+        connection.prepareStatement(
+            "DELETE FROM $FIXTURE_DATABASE_POOL_TABLE WHERE database_name = ? AND lease_token = ?",
+        ).use { statement ->
+            statement.setString(1, lease.databaseName)
+            statement.setString(2, lease.token)
+            statement.executeUpdate()
+        }
+        connection.createStatement().use { statement ->
+            statement.execute(
+                "DROP DATABASE IF EXISTS ${quoteIdentifier(lease.databaseName)} CASCADE",
+            )
+        }
+    }
+}
+
+private fun releasePooledDatabase(adminJdbcUrl: String, lease: PooledDatabaseLease) {
+    DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+        connection.prepareStatement(
+            """UPDATE $FIXTURE_DATABASE_POOL_TABLE
+                SET lease_token = NULL, owner_pid = NULL, owner_started_at_millis = NULL,
+                    needs_reset = true
+                WHERE database_name = ? AND lease_token = ?""".trimIndent(),
+        ).use { statement ->
+            statement.setString(1, lease.databaseName)
+            statement.setString(2, lease.token)
+            check(statement.executeUpdate() == 1) {
+                "Preinitialized fixture database '${lease.databaseName}' was no longer leased by " +
+                    "token '${lease.token}' while releasing it."
+            }
+        }
+    }
+}
+
 private fun jdbcUrlForDatabase(adminJdbcUrl: String, databaseName: String): String {
     val match = Regex("""^(jdbc:postgresql://[^/]+)/[^?]+(\?.*)?$""").matchEntire(adminJdbcUrl)
         ?: throw IllegalArgumentException(
@@ -1735,13 +2035,180 @@ private fun jdbcUrlForDatabase(adminJdbcUrl: String, databaseName: String): Stri
 private fun quoteIdentifier(identifier: String): String =
     "\"" + identifier.replace("\"", "\"\"") + "\""
 
+internal fun openSharedCockroachTestDatabase(
+    jdbcUrl: String,
+    username: String,
+    password: String,
+    admitSharedQueries: Boolean = false,
+): Database {
+    val applicationName =
+        "simplefilesystem-durable-test-${UUID.randomUUID().toString().replace("-", "")}"
+    val connectionProperties =
+        "ApplicationName=$applicationName&preferQueryMode=extended&prepareThreshold=1" +
+            "&preparedStatementCacheQueries=256"
+    val configuredJdbcUrl = jdbcUrl + if (jdbcUrl.contains('?')) {
+        "&$connectionProperties"
+    } else {
+        "?$connectionProperties"
+    }
+    val dataSource = BasicDataSource().apply {
+        driverClassName = "org.postgresql.Driver"
+        url = configuredJdbcUrl
+        this.username = username
+        this.password = password
+        defaultAutoCommit = true
+        initialSize = 0
+        maxTotal = 20
+        maxIdle = 4
+        minIdle = 0
+        testOnBorrow = false
+        testOnReturn = false
+        testWhileIdle = false
+    }
+    val admissionLease = if (admitSharedQueries) SharedCockroachQueryAdmission.acquire() else null
+    return try {
+        SharedCockroachTestDatabase(
+            delegate = Database(dataSource),
+            dataSource = dataSource,
+            admissionLease = admissionLease,
+        )
+    } catch (failure: Throwable) {
+        admissionLease?.close()
+        dataSource.close()
+        throw failure
+    }
+}
+
+private class SharedCockroachTestDatabase(
+    private val delegate: Database,
+    private val dataSource: BasicDataSource,
+    private val admissionLease: Closeable?,
+) : Database by delegate {
+    private var closed = false
+
+    @Synchronized
+    override fun close() {
+        if (closed) return
+        closed = true
+        var failure: Throwable? = null
+        try {
+            delegate.close()
+        } catch (caught: Throwable) {
+            failure = caught
+        }
+        try {
+            dataSource.close()
+        } catch (caught: Throwable) {
+            failure?.addSuppressed(caught) ?: run { failure = caught }
+        }
+        try {
+            admissionLease?.close()
+        } catch (caught: Throwable) {
+            failure?.addSuppressed(caught) ?: run { failure = caught }
+        }
+        failure?.let { throw it }
+    }
+}
+
+/**
+ * The suite has four JVM workers but one CPU-starved CockroachDB node. Keeping at most two test
+ * JVMs active in SQL avoids spending the node's scarce run slices context switching among four
+ * independent clients. Databases in one JVM share its lifetime slot, preserving the production
+ * lock-order tests' intentional three- and four-transaction interleavings. This admits SQL work,
+ * not fixture startup: all four managed fixture clients can still start concurrently. A queue lock
+ * prevents newly dispatched short tests from repeatedly overtaking an older waiter.
+ */
+private object SharedCockroachQueryAdmission {
+    private const val SLOT_COUNT = 2
+    private const val RETRY_NANOS = 1_000_000L
+    private val directory = File(
+        System.getProperty("java.io.tmpdir"),
+        "simplefilesystem-durable-shared-cockroach-query-admission",
+    )
+    private val monitor = Any()
+    private var referenceCount = 0
+    private var access: RandomAccessFile? = null
+    private var lock: java.nio.channels.FileLock? = null
+
+    fun acquire(): Closeable = synchronized(monitor) {
+        if (referenceCount == 0) {
+            check(directory.isDirectory || directory.mkdirs()) {
+                "Could not create shared CockroachDB query-admission directory ${directory.absolutePath}."
+            }
+            RandomAccessFile(File(directory, "waiters.lock"), "rw").use { queueAccess ->
+                queueAccess.channel.lock().use {
+                    val firstSlot = Math.floorMod(
+                        ProcessHandle.current().pid(),
+                        SLOT_COUNT.toLong(),
+                    ).toInt()
+                    while (lock == null) {
+                        for (offset in 0 until SLOT_COUNT) {
+                            val slot = (firstSlot + offset) % SLOT_COUNT
+                            val candidateAccess =
+                                RandomAccessFile(File(directory, "slot-$slot.lock"), "rw")
+                            val candidateLock = try {
+                                candidateAccess.channel.tryLock()
+                            } catch (_: OverlappingFileLockException) {
+                                null
+                            }
+                            if (candidateLock != null) {
+                                access = candidateAccess
+                                lock = candidateLock
+                                break
+                            }
+                            candidateAccess.close()
+                        }
+                        if (lock == null) LockSupport.parkNanos(RETRY_NANOS)
+                    }
+                }
+            }
+        }
+        referenceCount += 1
+        SharedCockroachQueryAdmissionLease()
+    }
+
+    fun release() = synchronized(monitor) {
+        check(referenceCount > 0) {
+            "A shared CockroachDB query-admission lease was released without an acquisition."
+        }
+        referenceCount -= 1
+        if (referenceCount != 0) return@synchronized
+        var failure: Throwable? = null
+        try {
+            lock?.release()
+        } catch (caught: Throwable) {
+            failure = caught
+        } finally {
+            lock = null
+            try {
+                access?.close()
+            } catch (caught: Throwable) {
+                failure?.addSuppressed(caught) ?: run { failure = caught }
+            } finally {
+                access = null
+            }
+        }
+        failure?.let { throw it }
+    }
+}
+
+private class SharedCockroachQueryAdmissionLease : Closeable {
+    private var closed = false
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        SharedCockroachQueryAdmission.release()
+    }
+}
+
 internal fun prestartSharedCockroachForSession(
     sessionOwner: SharedProcessIdentity,
     fixtureBuildRuleCacheEntries: List<File>,
     invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive: Boolean = false,
 ) {
     val leaseName = "kompile-session-${sessionOwner.pid}-${sessionOwner.startedAt.toEpochMilli()}"
-    SharedCockroachNode.acquire(
+    val acquisition = SharedCockroachNode.acquire(
         leaseName = leaseName,
         clock = SystemClock(),
         fixtureControl = null,
@@ -1750,4 +2217,26 @@ internal fun prestartSharedCockroachForSession(
         invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive =
             invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive,
     )
+    if (java.lang.Boolean.getBoolean(WAIT_FOR_FULL_FIXTURE_POOL_PROPERTY)) {
+        waitForFullFixtureDatabasePool(acquisition.jdbcUrl)
+    }
+}
+
+private fun waitForFullFixtureDatabasePool(adminJdbcUrl: String) {
+    while (true) {
+        val poolSize = DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery(
+                    "SELECT count(*) FROM $FIXTURE_DATABASE_POOL_TABLE",
+                ).use { rows ->
+                    check(rows.next()) {
+                        "Fixture database-pool count query did not return a row."
+                    }
+                    rows.getInt(1)
+                }
+            }
+        }
+        if (poolSize >= FIXTURE_DATABASE_POOL_SIZE) return
+        TimeUnit.MILLISECONDS.sleep(10L)
+    }
 }

@@ -13,14 +13,13 @@ import build.kotlin.withartifact.WithArtifact
 import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import simplefilesystem.durable.testing.SharedCockroachCluster
-import sql.Database
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 
 fun testUnicodeTreeMovePreservesPrefixBoundary() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(
                 InMemoryBlobstoreService(),

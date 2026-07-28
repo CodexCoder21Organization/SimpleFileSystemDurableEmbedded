@@ -23,12 +23,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import okio.Buffer
-import sql.Database
 
 fun testReaperCannotCorruptWholeCommit() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(1_000L)
             val blobstore = InMemoryBlobstoreService()
@@ -44,7 +43,7 @@ fun testReaperCannotCorruptWholeCommit() {
             val sink = filesystem.sink("/whole.bin", null)
             sink.write(Buffer().write(bytes), bytes.size.toLong())
             clock.advanceBy(50L)
-            val reaperDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+            val reaperDatabase = cluster.openDatabase()
             val reaperManager = DurableSimpleFileSystemManager(
                 blobstore,
                 reaperDatabase,
@@ -60,9 +59,9 @@ fun testReaperCannotCorruptWholeCommit() {
             val releaseFilesystem = CountDownLatch(1)
             val publicationSessionLocked = CountDownLatch(1)
             val releasePublicationSession = CountDownLatch(1)
-            val sessionLockDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
-            val filesystemLockDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
-            val publicationSessionDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+            val sessionLockDatabase = cluster.openDatabase()
+            val filesystemLockDatabase = cluster.openDatabase()
+            val publicationSessionDatabase = cluster.openDatabase()
             val executor = Executors.newFixedThreadPool(5)
             try {
                 val sessionHolder = executor.submit {

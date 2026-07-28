@@ -18,12 +18,11 @@ import community.kotlin.clocks.simple.ManualClock
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
-import sql.Database
 
 fun testNamespaceWatchRestartAndRecreate() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val blobs = InMemoryBlobstoreService()
             val first = DurableSimpleFileSystemManager(blobs, database, ManualClock(200L))

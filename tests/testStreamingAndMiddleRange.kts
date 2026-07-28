@@ -26,13 +26,12 @@ import okio.buffer
 import simplefilesystem.InlinePayloadTooLargeException
 import simplefilesystem.MalformedBase64Exception
 import simplefilesystem.MalformedUtf8Exception
-import sql.Database
 import simplefilesystem.durable.testing.ControlledBlobstoreService
 
 fun testStreamingAndMiddleRange() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val failWrites = AtomicBoolean(false)
             val blobs = ControlledBlobstoreService().apply {

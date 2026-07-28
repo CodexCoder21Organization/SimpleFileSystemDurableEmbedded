@@ -41,7 +41,11 @@ val testSupportDependencies = listOf(
     MavenPrebuilt2("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3"),
     MavenPrebuilt2("community.kotlin.clocks.simple:community-kotlin-clocks-simple:0.0.7"),
     MavenPrebuilt2("cockroachdb.testharness:cockroachdb-test-harness:0.0.4"),
+    MavenPrebuilt2("org.apache.commons:commons-dbcp2:2.9.0"),
     MavenPrebuilt2("org.jetbrains.kotlin:kotlin-stdlib:1.9.22"),
+    MavenPrebuilt2("org.postgresql:postgresql:42.6.0"),
+    MavenPrebuilt2("sql:sql-api:0.0.1"),
+    MavenPrebuilt2("sql:sql:0.0.2"),
 )
 
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-support:")
@@ -51,9 +55,7 @@ fun buildTestSupportMaven(): File = buildSimpleKotlinMavenArtifact2(
     compileDependencies = testSupportDependencies,
 )
 
-val fixtureRuntimeDependencies = dependencies + testSupportDependencies + listOf(
-    MavenPrebuilt2("sql:sql:0.0.2"),
-)
+val fixtureRuntimeDependencies = dependencies + testSupportDependencies
 
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-fixture-runtime:")
 fun buildCockroachTestFixtureRuntime(): File = buildSimpleKotlinMavenArtifact2(
@@ -194,6 +196,7 @@ private fun prestartCockroachForKompileSession(fixtureJar: File) {
         "-XX:+UseSerialGC",
         "-XX:ActiveProcessorCount=1",
         "-XX:TieredStopAtLevel=1",
+        "-Dsimplefilesystem.durable.testing.waitForFullFixturePool=true",
         "-cp",
         fixtureJar.absolutePath,
         "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",

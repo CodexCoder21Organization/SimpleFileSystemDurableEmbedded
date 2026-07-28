@@ -15,12 +15,11 @@ import simplefilesystem.durable.testing.SharedCockroachCluster
 import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import kotlin.test.assertEquals
-import sql.Database
 
 fun testCopySharesGeneration() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val blobs = InMemoryBlobstoreService()
             val manager = DurableSimpleFileSystemManager(blobs, database, ManualClock(7L))

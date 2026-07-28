@@ -20,12 +20,11 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import simplefilesystem.FileEntryType
-import sql.Database
 
 fun testNamespaceWatchMutationEvents() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(100L))
             val uuid = manager.createFilesystem("watch mutations", 10_000L).uuid

@@ -22,12 +22,11 @@ import simplefilesystem.FileContentConflictException
 import simplefilesystem.FileEntryType
 import simplefilesystem.InvalidContentHashException
 import simplefilesystem.PathTypeMismatchException
-import sql.Database
 
 fun testConditionalWritesAndOverwrite() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(2L))
             val filesystem = manager.openFilesystem(manager.createFilesystem("cas", 1_000L).uuid)

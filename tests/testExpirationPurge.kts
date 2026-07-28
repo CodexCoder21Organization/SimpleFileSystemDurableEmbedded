@@ -20,12 +20,11 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import simplefilesystem.FilesystemNotFoundException
-import sql.Database
 
 fun testExpirationPurge() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(10_000L)
             val blobs = InMemoryBlobstoreService()

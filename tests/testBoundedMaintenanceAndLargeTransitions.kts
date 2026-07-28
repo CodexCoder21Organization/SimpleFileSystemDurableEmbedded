@@ -20,13 +20,12 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import simplefilesystem.FilesystemNotFoundException
-import sql.Database
 
 fun testBoundedMaintenanceAndLargeTransitions() {
     try {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(50_000L)
             val blobs = InMemoryBlobstoreService()

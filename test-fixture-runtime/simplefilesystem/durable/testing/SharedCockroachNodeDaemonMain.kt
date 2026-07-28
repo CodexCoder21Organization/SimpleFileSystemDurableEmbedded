@@ -190,6 +190,7 @@ fun main(args: Array<String>) {
                 controlDirectory = controlDirectory,
                 token = token,
                 ownershipDirectory = stateDirectory,
+                targetPoolSize = FIXTURE_DATABASE_READY_POOL_SIZE,
             ) {
                 requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
             }
@@ -201,6 +202,16 @@ fun main(args: Array<String>) {
                 daemonIdentity = daemonIdentity,
                 cockroach = cockroach,
             )
+            warmUpDurableSchema(
+                adminJdbcUrl = cockroach.jdbcUrl,
+                controlDirectory = controlDirectory,
+                token = token,
+                ownershipDirectory = stateDirectory,
+                targetPoolSize = FIXTURE_DATABASE_POOL_SIZE,
+                observeControlBarrier = false,
+            ) {
+                requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            }
             lifecycle.await()
             if (cockroachExit.isCompletedExceptionally) cockroachExit.join()
             ownershipFailure.get()?.let { throw it }
@@ -899,10 +910,24 @@ private fun recordObservedIdentity(
     )
 }
 
-private fun configureSingleNodeTestCluster(jdbcUrl: String) {
+internal fun configureSingleNodeTestCluster(jdbcUrl: String) {
     DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
         connection.createStatement().use { statement ->
-            statement.execute("SET CLUSTER SETTING kv.range_split.by_load_enabled = false")
+            listOf(
+                "kv.range_split.by_load_enabled",
+                "sql.stats.automatic_collection.enabled",
+                "sql.metrics.statement_details.enabled",
+                "sql.metrics.transaction_details.enabled",
+                "sql.metrics.index_usage_stats.enabled",
+                "sql.stats.flush.enabled",
+                "admission.kv.enabled",
+                "admission.sql_kv_response.enabled",
+                "admission.sql_sql_response.enabled",
+                "admission.elastic_cpu.enabled",
+                "admission.disk_bandwidth_tokens.elastic.enabled",
+            ).forEach { setting ->
+                statement.execute("SET CLUSTER SETTING $setting = false")
+            }
         }
     }
 }

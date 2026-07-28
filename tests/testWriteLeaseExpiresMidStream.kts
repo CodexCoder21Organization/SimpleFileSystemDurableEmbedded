@@ -14,7 +14,6 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import okio.Buffer
 import simplefilesystem.durable.testing.SharedCockroachCluster
-import sql.Database
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
@@ -22,7 +21,7 @@ import kotlin.test.assertFailsWith
 fun testWriteLeaseExpiresMidStream() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(10_000L)
             val manager = DurableSimpleFileSystemManager(

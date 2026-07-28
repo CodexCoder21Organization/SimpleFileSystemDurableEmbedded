@@ -20,12 +20,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 import simplefilesystem.durable.testing.ControlledBlobstoreService
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import sql.Database
 
 fun testAppendMustExistAtCommit() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val blockAppend = AtomicBoolean(false)
             val appendReachedBlobstore = CountDownLatch(1)

@@ -20,12 +20,11 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertSame
 import okio.Buffer
-import sql.Database
 
 fun testAbandonedSinkIsolation() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(6L))
             val uuid = manager.createFilesystem("abandoned", 10L * 1024L * 1024L).uuid

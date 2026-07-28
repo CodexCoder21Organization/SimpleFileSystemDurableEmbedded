@@ -16,13 +16,12 @@ import simplefilesystem.durable.testing.SharedCockroachCluster
 import community.kotlin.clocks.simple.ManualClock
 import kotlin.test.assertContentEquals
 import okio.Buffer
-import sql.Database
 import simplefilesystem.durable.testing.ControlledBlobstoreService
 
 fun testOpenReaderSurvivesDeleteAndGc() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(
                 ControlledBlobstoreService().apply { requirePinnedOnGet = true },

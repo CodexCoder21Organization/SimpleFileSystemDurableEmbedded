@@ -21,7 +21,6 @@ import simplefilesystem.conformance.ConformanceArea
 import simplefilesystem.conformance.SimpleFileSystemConformanceSuite
 import simplefilesystem.conformance.SimpleFileSystemManagerFactory
 import simplefilesystem.conformance.SimpleFileSystemManagerFixture
-import sql.Database
 
 private fun runDurableConformanceArea(area: ConformanceArea, expectedCount: Int) {
     val factory = object : SimpleFileSystemManagerFactory {
@@ -29,12 +28,7 @@ private fun runDurableConformanceArea(area: ConformanceArea, expectedCount: Int)
 
             override fun create(initialTimeMillis: Long): SimpleFileSystemManagerFixture {
                 val cluster = SharedCockroachCluster().start()
-                val database = Database(
-                    "org.postgresql.Driver",
-                    cluster.jdbcUrl(),
-                    cluster.username,
-                    cluster.password,
-                )
+                val database = cluster.openDatabase()
                 val manualClock = ManualClock(initialTimeMillis)
                 val backendManager = DurableSimpleFileSystemManager(
                     blobstoreService = InMemoryBlobstoreService(),

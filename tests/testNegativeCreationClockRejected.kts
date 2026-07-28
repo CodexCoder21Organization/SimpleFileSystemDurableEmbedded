@@ -16,12 +16,11 @@ import community.kotlin.clocks.simple.ManualClock
 import simplefilesystem.SimpleFileSystemException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import sql.Database
 
 fun testNegativeCreationClockRejected() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(-1L))
             val failure = assertFailsWith<SimpleFileSystemException> {

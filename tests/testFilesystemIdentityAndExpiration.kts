@@ -24,12 +24,11 @@ import simplefilesystem.InvalidFilesystemDescriptionException
 import simplefilesystem.InvalidFilesystemUuidException
 import simplefilesystem.InvalidMaxSizeBytesException
 import simplefilesystem.InvalidPageLimitException
-import sql.Database
 
 fun testFilesystemIdentityAndExpiration() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(5_000L)
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, clock)

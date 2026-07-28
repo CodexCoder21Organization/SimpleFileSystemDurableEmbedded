@@ -311,25 +311,38 @@ class DurableSimpleFileSystemManager(
         val parsed = parseUuid(uuid)
         ensureSchema()
         transactionally { transaction ->
-            val filesystem = requireFilesystem(transaction, parsed, lock = true)
-            if (filesystem.expiresAtMillis != expiresAtMillis) {
-                transaction.execute(
-                    "UPDATE filesystems SET expires_at_millis = ? WHERE uuid = ?",
-                    expiresAtMillis,
-                    parsed,
+            val filesystem = transaction.getRows(
+                """UPDATE filesystems
+                    SET expires_at_millis = ?
+                    WHERE uuid = ? AND expires_at_millis IS DISTINCT FROM ?
+                    RETURNING *""".trimIndent(),
+                expiresAtMillis,
+                parsed,
+                expiresAtMillis,
+            ).firstOrNull()?.toFilesystemRecord() ?: run {
+                val observed = requireFilesystem(transaction, parsed, lock = true)
+                if (observed.expiresAtMillis == expiresAtMillis) return@transactionally
+                throw SimpleFileSystemException(
+                    "Filesystem '$parsed' remained present but its expiration could not be changed " +
+                        "from ${observed.expiresAtMillis} to $expiresAtMillis.",
                 )
+            }
+            val stream = requireNamespaceEventStream(transaction, parsed, lock = true)
+            if (expiresAtMillis != null && expiresAtMillis <= clock.currentTimeMillis()) {
+                if (stream.terminalReason != PathWatchTerminalReason.FILESYSTEM_EXPIRED) {
+                    appendNamespaceEvents(
+                        transaction,
+                        filesystem,
+                        emptyList(),
+                        PathWatchTerminalReason.FILESYSTEM_EXPIRED,
+                        bumpManagerDescriptorRevision = true,
+                    )
+                } else {
+                    bumpManagerRevision(transaction)
+                }
+            } else {
                 bumpManagerRevision(transaction)
-                val stream = requireNamespaceEventStream(transaction, parsed, lock = true)
-                if (expiresAtMillis != null && expiresAtMillis <= clock.currentTimeMillis()) {
-                    if (stream.terminalReason != PathWatchTerminalReason.FILESYSTEM_EXPIRED) {
-                        appendNamespaceEvents(
-                            transaction,
-                            filesystem,
-                            emptyList(),
-                            PathWatchTerminalReason.FILESYSTEM_EXPIRED,
-                        )
-                    }
-                } else if (stream.terminalReason == PathWatchTerminalReason.FILESYSTEM_EXPIRED) {
+                if (stream.terminalReason == PathWatchTerminalReason.FILESYSTEM_EXPIRED) {
                     transaction.execute(
                         "UPDATE namespace_event_streams SET terminal_reason = NULL WHERE filesystem_uuid = ?",
                         parsed,
@@ -461,8 +474,15 @@ class DurableSimpleFileSystemManager(
                 else -> error("Unexpected maintenance candidate kind '$kind'.")
             }
         }
-        enqueueUnreferencedPinnedBlobs(limit)
-        val resolved = processBlobGcOutbox(limit)
+        val pinnedHashes = blobstoreService.listBlobs(BLOB_PIN_OWNER)
+        val resolved = transactionally { transaction ->
+            enqueueUnreferencedPinnedBlobs(transaction, limit, pinnedHashes)
+            val candidates = transaction.getStrings(
+                "SELECT blob_hash FROM blob_gc_outbox ORDER BY created_at_millis, blob_hash LIMIT ?",
+                limit,
+            )
+            resolveBlobGcIntents(transaction, candidates)
+        }
         return MaintenanceResult(reaped, purged, resolved)
     }
 
@@ -557,6 +577,8 @@ class DurableSimpleFileSystemManager(
         }
     }
 
+    internal fun <T> readStatement(operation: (Database) -> T): T = operation(metadataDatabase)
+
     private fun SQLException.hasSqlState(expected: String): Boolean {
         var current: Throwable? = this
         while (current != null) {
@@ -620,9 +642,13 @@ class DurableSimpleFileSystemManager(
     }
 
     private fun ensureNotExpired(filesystem: FilesystemRecord) {
-        val expiration = filesystem.expiresAtMillis ?: return
+        ensureNotExpired(filesystem.uuid, filesystem.expiresAtMillis)
+    }
+
+    internal fun ensureNotExpired(filesystemUuid: UUID, expiration: Long?) {
+        expiration ?: return
         val now = clock.currentTimeMillis()
-        if (now >= expiration) throw FilesystemExpiredException(filesystem.uuid.toString(), expiration, now)
+        if (now >= expiration) throw FilesystemExpiredException(filesystemUuid.toString(), expiration, now)
     }
 
     internal fun normalizePath(path: String): String {
@@ -721,6 +747,21 @@ class DurableSimpleFileSystemManager(
         ).firstOrNull()?.toEntryRecord()
     }
 
+    internal fun findActiveRootChildEntry(filesystemUuid: UUID, path: String): EntryRecord? {
+        ensureSchema()
+        val row = metadataDatabase.getRows(
+            """SELECT filesystem.expires_at_millis AS active_expires_at_millis, entry.*
+                FROM filesystems AS filesystem
+                LEFT JOIN entries AS entry
+                  ON entry.filesystem_uuid = filesystem.uuid AND entry.path = ?
+                WHERE filesystem.uuid = ?""".trimIndent(),
+            path,
+            filesystemUuid,
+        ).firstOrNull() ?: throw FilesystemNotFoundException(filesystemUuid.toString())
+        ensureNotExpired(filesystemUuid, row.nullableLongValue("active_expires_at_millis"))
+        return if (row.nullableStringValue("path") == null) null else row.toEntryRecord()
+    }
+
     internal fun requireEntry(database: Database, filesystemUuid: UUID, path: String, lock: Boolean = false): EntryRecord =
         findEntry(database, filesystemUuid, path, lock) ?: throw PathNotFoundException(path)
 
@@ -732,32 +773,78 @@ class DurableSimpleFileSystemManager(
         return entry
     }
 
-    internal fun block(generationUuid: UUID, ordinal: Int): BlockRecord? = metadataDatabase.getRows(
-        "SELECT * FROM file_blocks WHERE generation_uuid = ? AND ordinal = ? LIMIT 1",
+    internal fun blockPage(
+        generationUuid: UUID,
+        firstOrdinal: Int,
+        lastOrdinal: Int,
+    ): List<BlockRecord> = metadataDatabase.getRows(
+        """SELECT * FROM file_blocks
+            WHERE generation_uuid = ? AND ordinal >= ? AND ordinal <= ?
+            ORDER BY ordinal LIMIT ?""".trimIndent(),
         generationUuid,
-        ordinal,
-    ).firstOrNull()?.toBlockRecord()
+        firstOrdinal,
+        lastOrdinal,
+        GENERATION_READ_BATCH_SIZE,
+    ).map { it.toBlockRecord() }
 
     internal fun fileGenerationSnapshot(filesystemUuid: UUID, path: String): FileGenerationSnapshot {
         ensureSchema()
         return transactionally { transaction ->
-            requireActiveFilesystem(transaction, filesystemUuid, lock = false)
-            validateIntermediateComponents(transaction, filesystemUuid, path)
-            val entry = requireEntry(transaction, filesystemUuid, path)
-            if (!entry.isFile) {
-                throw PathTypeMismatchException(path, FileEntryType.REGULAR_FILE, entry.entryType)
+            val readerUuid = UUID.randomUUID()
+            val now = clock.currentTimeMillis()
+            val entry = transaction.getRows(
+                """WITH active_entry AS MATERIALIZED (
+                        SELECT entry.*
+                        FROM entries AS entry
+                        JOIN filesystems AS filesystem ON filesystem.uuid = entry.filesystem_uuid
+                        WHERE entry.filesystem_uuid = ?
+                          AND entry.path = ?
+                          AND entry.entry_kind = 'FILE'
+                          AND (filesystem.expires_at_millis IS NULL OR filesystem.expires_at_millis > ?)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM entries AS ancestor
+                              WHERE ancestor.filesystem_uuid = entry.filesystem_uuid
+                                AND ancestor.entry_kind != 'DIRECTORY'
+                                AND substring(entry.path FROM 1 FOR length(ancestor.path) + 1) =
+                                    ancestor.path || '/'
+                          )
+                    ),
+                    retained_blocks AS (
+                        UPDATE file_blocks
+                        SET reference_count = reference_count + 1
+                        WHERE generation_uuid = (SELECT generation_uuid FROM active_entry)
+                        RETURNING ordinal
+                    ),
+                    inserted_reader AS (
+                        INSERT INTO reader_sessions
+                            (reader_uuid, generation_uuid, lease_expires_at_millis, state)
+                        SELECT ?, generation_uuid, ?, 'OPEN'
+                        FROM active_entry
+                        WHERE (SELECT count(*) FROM retained_blocks) >= 0
+                        RETURNING reader_uuid
+                    )
+                    SELECT active_entry.*
+                    FROM active_entry
+                    WHERE EXISTS (SELECT 1 FROM inserted_reader)""".trimIndent(),
+                filesystemUuid,
+                path,
+                now,
+                readerUuid,
+                leaseDeadline(now),
+            ).firstOrNull()?.toEntryRecord()
+            if (entry == null) {
+                requireActiveFilesystem(transaction, filesystemUuid, lock = false)
+                validateIntermediateComponents(transaction, filesystemUuid, path)
+                val observed = requireEntry(transaction, filesystemUuid, path)
+                if (!observed.isFile) {
+                    throw PathTypeMismatchException(path, FileEntryType.REGULAR_FILE, observed.entryType)
+                }
+                throw SimpleFileSystemException(
+                    "Could not retain readable generation '${observed.generationUuid}' for file '$path' " +
+                        "in active filesystem '$filesystemUuid'.",
+                )
             }
             val generation = requireNotNull(entry.generationUuid)
-            retainGeneration(transaction, generation)
-            val readerUuid = UUID.randomUUID()
-            transaction.execute(
-                """INSERT INTO reader_sessions
-                    (reader_uuid, generation_uuid, lease_expires_at_millis, state)
-                    VALUES (?, ?, ?, 'OPEN')""".trimIndent(),
-                readerUuid,
-                generation,
-                leaseDeadline(clock.currentTimeMillis()),
-            )
             FileGenerationSnapshot(entry, generation, readerUuid)
         }
     }
@@ -773,7 +860,53 @@ class DurableSimpleFileSystemManager(
         }
     }
 
+    internal fun renewReaderSessionIfDue(readerUuid: UUID, renewAtMillis: Long): Long {
+        val now = clock.currentTimeMillis()
+        if (now < renewAtMillis) return renewAtMillis
+        renewReaderSession(readerUuid)
+        return leaseRenewalThreshold(now)
+    }
+
     internal fun releaseReaderSession(readerUuid: UUID) {
+        val release = metadataDatabase.getRows(
+            """WITH locked_reader AS MATERIALIZED (
+                    SELECT generation_uuid
+                    FROM reader_sessions
+                    WHERE reader_uuid = ? AND state = 'OPEN'
+                    FOR UPDATE
+                ),
+                first_reference AS MATERIALIZED (
+                    SELECT reference_count
+                    FROM file_blocks
+                    WHERE generation_uuid = (SELECT generation_uuid FROM locked_reader)
+                    ORDER BY ordinal
+                    LIMIT 1
+                ),
+                decremented_blocks AS (
+                    UPDATE file_blocks
+                    SET reference_count = reference_count - 1
+                    WHERE generation_uuid = (SELECT generation_uuid FROM locked_reader)
+                      AND (SELECT reference_count FROM first_reference) > 1
+                    RETURNING ordinal
+                ),
+                released_reader AS (
+                    UPDATE reader_sessions
+                    SET state = 'RELEASED'
+                    WHERE reader_uuid = ?
+                      AND state = 'OPEN'
+                      AND COALESCE((SELECT reference_count FROM first_reference), 2) > 1
+                      AND (SELECT count(*) FROM decremented_blocks) >= 0
+                    RETURNING generation_uuid
+                )
+                SELECT generation_uuid,
+                       (SELECT reference_count FROM first_reference) AS reference_count
+                FROM locked_reader
+                WHERE EXISTS (SELECT 1 FROM released_reader)
+                   OR (SELECT reference_count FROM first_reference) = 1""".trimIndent(),
+            readerUuid,
+            readerUuid,
+        ).firstOrNull() ?: return
+        if (release.nullableLongValue("reference_count") != 1L) return
         transactionally { transaction ->
             val reader = transaction.getRows(
                 "SELECT generation_uuid, state FROM reader_sessions WHERE reader_uuid = ? FOR UPDATE",
@@ -790,27 +923,67 @@ class DurableSimpleFileSystemManager(
 
     internal fun beginSession(filesystemUuid: UUID, rawPath: String, expectedHash: String?): Pair<UUID, String> {
         ensureSchema()
-        return transactionally { transaction ->
-            requireActiveFilesystem(transaction, filesystemUuid, lock = false)
-            val path = normalizePath(rawPath)
+        val path = try {
+            normalizePath(rawPath)
+        } catch (failure: InvalidPathException) {
+            requireActiveFilesystem(filesystemUuid)
+            throw failure
+        }
+        try {
             validateExpectedHash(expectedHash)
-            val session = UUID.randomUUID()
-            if (path != "/") requireDirectoryPath(transaction, filesystemUuid, parentPath(path))
-            val now = clock.currentTimeMillis()
-            transaction.execute(
-                """INSERT INTO write_sessions
+        } catch (failure: InvalidContentHashException) {
+            requireActiveFilesystem(filesystemUuid)
+            throw failure
+        }
+        val session = UUID.randomUUID()
+        val now = clock.currentTimeMillis()
+        val inserted = metadataDatabase.getRows(
+            """INSERT INTO write_sessions
                     (session_uuid, filesystem_uuid, path, expected_hash, bytes_received, created_at_millis,
                      lease_expires_at_millis, state)
-                    VALUES (?, ?, ?, ?, 0, ?, ?, 'OPEN')""".trimIndent(),
-                session,
-                filesystemUuid,
-                path,
-                expectedHash,
-                now,
-                leaseDeadline(now),
-            )
-            session to path
+                SELECT ?, ?, ?, ?, 0, ?, ?, 'OPEN'
+                FROM filesystems
+                WHERE uuid = ?
+                  AND (expires_at_millis IS NULL OR expires_at_millis > ?)
+                  AND (
+                      ? = '/'
+                      OR EXISTS (
+                          SELECT 1 FROM entries
+                          WHERE filesystem_uuid = ? AND path = ? AND entry_kind = 'DIRECTORY'
+                      )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM entries
+                      WHERE filesystem_uuid = ?
+                        AND entry_kind != 'DIRECTORY'
+                        AND substring(? FROM 1 FOR length(path) + 1) = path || '/'
+                  )
+                RETURNING session_uuid""".trimIndent(),
+            session,
+            filesystemUuid,
+            path,
+            expectedHash,
+            now,
+            leaseDeadline(now),
+            filesystemUuid,
+            now,
+            path,
+            filesystemUuid,
+            parentPath(path),
+            filesystemUuid,
+            path,
+        )
+        if (inserted.isEmpty()) {
+            transactionally { transaction ->
+                requireActiveFilesystem(transaction, filesystemUuid, lock = false)
+                if (path != "/") requireDirectoryPath(transaction, filesystemUuid, parentPath(path))
+                throw SimpleFileSystemException(
+                    "Could not begin write session '$session' for active filesystem '$filesystemUuid' " +
+                        "and validated path '$path', although its directory ancestry remained valid.",
+                )
+            }
         }
+        return session to path
     }
 
     internal fun stageBlock(
@@ -845,6 +1018,16 @@ class DurableSimpleFileSystemManager(
         sizeBytes: Int,
     ): BlockRecord {
         prepareBlobReference(database, hash)
+        return publishPreparedPinnedBlock(database, generationUuid, ordinal, hash, sizeBytes)
+    }
+
+    private fun publishPreparedPinnedBlock(
+        database: Database,
+        generationUuid: UUID,
+        ordinal: Int,
+        hash: String,
+        sizeBytes: Int,
+    ): BlockRecord {
         database.execute(
             """WITH inserted_block AS (
                     INSERT INTO file_blocks
@@ -918,10 +1101,26 @@ class DurableSimpleFileSystemManager(
         )
     }
 
-    internal fun commitGeneration(stage: StagedGeneration, unconditional: Boolean): FileMetadataInfo {
+    internal fun commitGeneration(
+        stage: StagedGeneration,
+        unconditional: Boolean,
+        pendingBlock: PendingStagedBlock? = null,
+    ): FileMetadataInfo {
+        val pendingUpload = uploadPendingBlock(pendingBlock)
         return try {
             transactionally { transaction ->
-                claimAndVerifyStagedGeneration(transaction, stage)
+                if (pendingUpload == null) {
+                    claimStagedGeneration(transaction, stage, renewLease = false)
+                } else {
+                    claimStagedGenerationAndPublishPendingBlock(
+                        transaction,
+                        stage,
+                        pendingUpload,
+                    )
+                }
+                if (!pendingUploadIsCompleteGeneration(stage, pendingUpload)) {
+                    verifyStagedGenerationBlocks(transaction, stage, pendingUpload)
+                }
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 if (stage.path != "/") {
                     requireDirectoryPath(
@@ -968,32 +1167,33 @@ class DurableSimpleFileSystemManager(
                         stage.path,
                     )
                 }
-                transaction.execute(
-                    "UPDATE file_blocks SET reference_count = 1 WHERE generation_uuid = ?",
+                finalizePublishedGeneration(
+                    transaction,
+                    stage,
                     stage.sessionUuid,
+                    attemptedUsage,
+                    filesystem,
+                    "commit write session '${stage.sessionUuid}'",
+                    pendingUpload?.hash,
                 )
                 current?.generationUuid?.let { releaseGeneration(transaction, it) }
-                transaction.execute(
-                    "UPDATE filesystems SET used_bytes = ? WHERE uuid = ?",
-                    attemptedUsage,
-                    stage.filesystemUuid,
-                )
-                recordNamespaceMutation(
+                appendNamespaceEvents(
                     transaction,
                     filesystem,
-                    attemptedUsage,
                     listOf(stage.path) + if (current == null) listOf(parentPath(stage.path)) else emptyList(),
+                    terminalReason = null,
                 )
-                val committed = transaction.execute(
-                    """UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ?
-                        WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
-                    stage.sizeBytes,
+                committedEntry(
+                    stage,
                     stage.sessionUuid,
-                )
-                checkUpdateCount(committed, 1, "commit write session '${stage.sessionUuid}'")
-                requireEntry(transaction, stage.filesystemUuid, stage.path).toMetadata()
+                    stage.sizeBytes,
+                    stage.contentHash,
+                    now,
+                    current,
+                ).toMetadata()
             }
         } catch (failure: Throwable) {
+            enqueueFailedPendingUpload(failure, pendingUpload)
             try {
                 abortSession(stage.sessionUuid)
             } catch (cleanupFailure: Throwable) {
@@ -1003,11 +1203,27 @@ class DurableSimpleFileSystemManager(
         }
     }
 
-    internal fun commitAppend(stage: StagedGeneration, mustExist: Boolean): FileMetadataInfo {
+    internal fun commitAppend(
+        stage: StagedGeneration,
+        mustExist: Boolean,
+        pendingBlock: PendingStagedBlock? = null,
+    ): FileMetadataInfo {
         val assembledGenerationUuid = UUID.randomUUID()
+        val pendingUpload = uploadPendingBlock(pendingBlock)
         return try {
             transactionally { transaction ->
-                claimAndVerifyStagedGeneration(transaction, stage)
+                if (pendingUpload == null) {
+                    claimStagedGeneration(transaction, stage, renewLease = false)
+                } else {
+                    claimStagedGenerationAndPublishPendingBlock(
+                        transaction,
+                        stage,
+                        pendingUpload,
+                    )
+                }
+                if (!pendingUploadIsCompleteGeneration(stage, pendingUpload)) {
+                    verifyStagedGenerationBlocks(transaction, stage, pendingUpload)
+                }
                 val filesystem = requireActiveFilesystem(transaction, stage.filesystemUuid, lock = true)
                 if (stage.path != "/") {
                     requireDirectoryPath(
@@ -1068,39 +1284,213 @@ class DurableSimpleFileSystemManager(
                         stage.path,
                     )
                 }
-                transaction.execute(
-                    "UPDATE file_blocks SET reference_count = 1 WHERE generation_uuid = ?",
+                finalizePublishedGeneration(
+                    transaction,
+                    stage,
                     assembledGenerationUuid,
+                    attemptedUsage,
+                    filesystem,
+                    "commit append session '${stage.sessionUuid}'",
+                    pendingUpload?.hash,
                 )
                 current?.generationUuid?.let { releaseGeneration(transaction, it) }
                 deleteGenerationBlocks(transaction, stage.sessionUuid)
-                transaction.execute(
-                    "UPDATE filesystems SET used_bytes = ? WHERE uuid = ?",
-                    attemptedUsage,
-                    stage.filesystemUuid,
-                )
-                recordNamespaceMutation(
+                appendNamespaceEvents(
                     transaction,
                     filesystem,
-                    attemptedUsage,
                     listOf(stage.path) + if (current == null) listOf(parentPath(stage.path)) else emptyList(),
+                    terminalReason = null,
                 )
-                val committed = transaction.execute(
-                    """UPDATE write_sessions SET state = 'COMMITTED', bytes_received = ?
-                        WHERE session_uuid = ? AND state = 'OPEN'""".trimIndent(),
-                    stage.sizeBytes,
-                    stage.sessionUuid,
-                )
-                checkUpdateCount(committed, 1, "commit append session '${stage.sessionUuid}'")
-                requireEntry(transaction, stage.filesystemUuid, stage.path).toMetadata()
+                committedEntry(
+                    stage,
+                    assembledGenerationUuid,
+                    final.first,
+                    final.second,
+                    now,
+                    current,
+                ).toMetadata()
             }
         } catch (failure: Throwable) {
+            enqueueFailedPendingUpload(failure, pendingUpload)
             try {
                 abortSession(stage.sessionUuid)
             } catch (cleanupFailure: Throwable) {
                 failure.addSuppressed(cleanupFailure)
             }
             throw failure
+        }
+    }
+
+    private fun committedEntry(
+        stage: StagedGeneration,
+        generationUuid: UUID,
+        sizeBytes: Long,
+        contentHash: String,
+        modifiedAtMillis: Long,
+        previous: EntryRecord?,
+    ): EntryRecord = EntryRecord(
+        filesystemUuid = stage.filesystemUuid,
+        path = stage.path,
+        parentPath = parentPath(stage.path),
+        name = name(stage.path),
+        kind = "FILE",
+        generationUuid = generationUuid,
+        sizeBytes = sizeBytes,
+        contentHash = contentHash,
+        createdAtMillis = previous?.createdAtMillis ?: modifiedAtMillis,
+        modifiedAtMillis = modifiedAtMillis,
+    )
+
+    private fun finalizePublishedGeneration(
+        database: Database,
+        stage: StagedGeneration,
+        generationUuid: UUID,
+        attemptedUsage: Long,
+        filesystem: FilesystemRecord,
+        action: String,
+        coordinationHash: String?,
+    ) {
+        val bumpManagerRevision = attemptedUsage != filesystem.usedBytes
+        val finalization = database.getRows(
+            """WITH cleared_coordination AS (
+                    DELETE FROM blob_gc_outbox
+                    WHERE blob_hash = ?
+                    RETURNING blob_hash
+                ),
+                finalized_blocks AS (
+                    UPDATE file_blocks
+                    SET reference_count = 1
+                    WHERE generation_uuid = ?
+                      AND (SELECT count(*) FROM cleared_coordination) >= 0
+                    RETURNING ordinal
+                ),
+                updated_filesystem AS (
+                    UPDATE filesystems
+                    SET used_bytes = ?
+                    WHERE uuid = ?
+                      AND (SELECT count(*) FROM finalized_blocks) >= 0
+                    RETURNING uuid
+                ),
+                committed_session AS (
+                    UPDATE write_sessions
+                    SET state = 'COMMITTED', bytes_received = ?
+                    WHERE session_uuid = ? AND state = 'OPEN'
+                      AND EXISTS (SELECT 1 FROM updated_filesystem)
+                    RETURNING session_uuid
+                ),
+                updated_manager AS (
+                    UPDATE simple_filesystem_manager_state
+                    SET descriptor_revision = descriptor_revision + 1
+                    WHERE singleton = true
+                      AND ?
+                      AND descriptor_revision < ?
+                      AND EXISTS (SELECT 1 FROM committed_session)
+                    RETURNING descriptor_revision
+                )
+                SELECT (SELECT count(*) FROM committed_session) AS committed_session_count,
+                       (SELECT count(*) FROM updated_manager) AS updated_manager_count""".trimIndent(),
+            coordinationHash,
+            generationUuid,
+            attemptedUsage,
+            stage.filesystemUuid,
+            stage.sizeBytes,
+            stage.sessionUuid,
+            bumpManagerRevision,
+            Long.MAX_VALUE,
+        ).single()
+        check(finalization.longValue("committed_session_count") == 1L) {
+            "Expected to $action by updating exactly 1 row(s), but CockroachDB reported 0 row(s)."
+        }
+        if (bumpManagerRevision && finalization.longValue("updated_manager_count") != 1L) {
+            throw SimpleFileSystemException("SimpleFileSystem manager descriptor revision overflowed.")
+        }
+    }
+
+    private fun uploadPendingBlock(pendingBlock: PendingStagedBlock?): PendingBlockUpload? =
+        pendingBlock?.let {
+            PendingBlockUpload(
+                ordinal = it.ordinal,
+                bytes = it.bytes,
+                hash = uploadAndPinBlock(it.bytes),
+            )
+        }
+
+    private fun claimStagedGenerationAndPublishPendingBlock(
+        database: Database,
+        stage: StagedGeneration,
+        pendingUpload: PendingBlockUpload,
+    ) {
+        val observedNow = clock.currentTimeMillis()
+        val session = database.getRows(
+            """WITH claimed_session AS (
+                    UPDATE write_sessions
+                    SET bytes_received = ?, lease_expires_at_millis = ?
+                    WHERE session_uuid = ? AND state = 'OPEN' AND lease_expires_at_millis > ?
+                    RETURNING filesystem_uuid, path, expected_hash, bytes_received, state
+                ),
+                coordinated_blob AS (
+                    INSERT INTO blob_gc_outbox (blob_hash, action, created_at_millis)
+                    SELECT ?, 'UNPIN_IF_UNREFERENCED', ?
+                    FROM claimed_session
+                    ON CONFLICT (blob_hash) DO UPDATE
+                    SET action = excluded.action,
+                        created_at_millis = excluded.created_at_millis
+                    RETURNING blob_hash
+                ),
+                inserted_block AS (
+                    INSERT INTO file_blocks
+                        (generation_uuid, ordinal, blob_hash, size_bytes, reference_count)
+                    SELECT ?, ?, ?, ?, 0
+                    FROM coordinated_blob
+                    WHERE ? != 0
+                       OR NOT EXISTS (
+                           SELECT 1 FROM file_blocks WHERE generation_uuid = ?
+                       )
+                    RETURNING generation_uuid
+                )
+                SELECT * FROM claimed_session
+                WHERE EXISTS (SELECT 1 FROM inserted_block)""".trimIndent(),
+            stage.sizeBytes,
+            leaseDeadline(observedNow),
+            stage.sessionUuid,
+            observedNow,
+            pendingUpload.hash,
+            observedNow,
+            stage.sessionUuid,
+            pendingUpload.ordinal,
+            pendingUpload.hash,
+            pendingUpload.bytes.size,
+            pendingUpload.ordinal,
+            stage.sessionUuid,
+        ).firstOrNull() ?: run {
+            requireActiveFilesystem(database, stage.filesystemUuid, lock = false)
+            requireRenewableSession(database, stage.sessionUuid)
+            throw IllegalStateException(
+                "Write session '${stage.sessionUuid}' remained renewable but could not coordinate " +
+                    "and publish pending block '${pendingUpload.hash}' for path '${stage.path}'.",
+            )
+        }
+        validateClaimedSession(stage, session)
+        if (!blobstoreService.pinBlob(BLOB_PIN_OWNER, pendingUpload.hash)) {
+            throw IllegalStateException(
+                "Blob '${pendingUpload.hash}' disappeared after upload while acquiring its GC " +
+                    "coordination lock; the required '$BLOB_PIN_OWNER' durability pin could not be " +
+                    "renewed before metadata commit.",
+            )
+        }
+    }
+
+    private fun enqueueFailedPendingUpload(
+        failure: Throwable,
+        pendingUpload: PendingBlockUpload?,
+    ) {
+        if (pendingUpload == null) return
+        try {
+            metadataDatabase.execute { transaction ->
+                enqueueBlobForGc(transaction, pendingUpload.hash)
+            }
+        } catch (cleanupFailure: Throwable) {
+            failure.addSuppressed(cleanupFailure)
         }
     }
 
@@ -1115,14 +1505,46 @@ class DurableSimpleFileSystemManager(
      * finally per-hash GC-outbox rows. Holding the OPEN session row through publication makes reaping and
      * committing mutually exclusive across independently connected manager instances.
      */
-    private fun claimAndVerifyStagedGeneration(database: Database, stage: StagedGeneration) {
-        val session = database.getRows(
-            """SELECT filesystem_uuid, path, expected_hash, bytes_received, state
-                FROM write_sessions WHERE session_uuid = ? FOR UPDATE""".trimIndent(),
-            stage.sessionUuid,
-        ).firstOrNull() ?: throw SimpleFileSystemException(
-            "Write session '${stage.sessionUuid}' no longer exists and cannot publish path '${stage.path}'.",
-        )
+    private fun claimStagedGeneration(
+        database: Database,
+        stage: StagedGeneration,
+        renewLease: Boolean,
+    ) {
+        val observedNow = clock.currentTimeMillis()
+        val session = if (renewLease) {
+            database.getRows(
+                """UPDATE write_sessions
+                    SET bytes_received = ?, lease_expires_at_millis = ?
+                    WHERE session_uuid = ? AND state = 'OPEN' AND lease_expires_at_millis > ?
+                    RETURNING filesystem_uuid, path, expected_hash, bytes_received, state""".trimIndent(),
+                stage.sizeBytes,
+                leaseDeadline(observedNow),
+                stage.sessionUuid,
+                observedNow,
+            ).firstOrNull() ?: run {
+                requireActiveFilesystem(database, stage.filesystemUuid, lock = false)
+                requireRenewableSession(database, stage.sessionUuid)
+                throw IllegalStateException(
+                    "Write session '${stage.sessionUuid}' remained renewable but could not be claimed " +
+                        "to publish path '${stage.path}'.",
+                )
+            }
+        } else {
+            database.getRows(
+                """SELECT filesystem_uuid, path, expected_hash, bytes_received, state
+                    FROM write_sessions WHERE session_uuid = ? FOR UPDATE""".trimIndent(),
+                stage.sessionUuid,
+            ).firstOrNull() ?: run {
+                requireActiveFilesystem(database, stage.filesystemUuid, lock = false)
+                throw SimpleFileSystemException(
+                    "Write session '${stage.sessionUuid}' no longer exists and cannot publish path '${stage.path}'.",
+                )
+            }
+        }
+        validateClaimedSession(stage, session)
+    }
+
+    private fun validateClaimedSession(stage: StagedGeneration, session: sql.DatabaseRow) {
         val state = session.stringValue("state")
         if (state != "OPEN") {
             throw SimpleFileSystemException(
@@ -1144,13 +1566,28 @@ class DurableSimpleFileSystemManager(
                     "expectedHash=$storedExpectedHash, bytes=$storedBytes.",
             )
         }
+    }
 
+    private fun pendingUploadIsCompleteGeneration(
+        stage: StagedGeneration,
+        pendingUpload: PendingBlockUpload?,
+    ): Boolean =
+        pendingUpload != null &&
+            pendingUpload.ordinal == 0 &&
+            pendingUpload.bytes.size.toLong() == stage.sizeBytes &&
+            pendingUpload.hash == stage.contentHash
+
+    private fun verifyStagedGenerationBlocks(
+        database: Database,
+        stage: StagedGeneration,
+        pendingUpload: PendingBlockUpload?,
+    ) {
         val expectedBlockCount = if (stage.sizeBytes == 0L) 0L else
             ((stage.sizeBytes - 1L) / BLOCK_SIZE_BYTES.toLong()) + 1L
         val digest = MessageDigest.getInstance("SHA-256")
         var observedTotal = 0L
         var observedBlockCount = 0L
-        forEachGenerationBlock(database, stage.sessionUuid) { block ->
+        forEachGenerationBlock(database, stage.sessionUuid, pendingUpload?.hash) { block ->
             if (block.ordinal.toLong() != observedBlockCount) {
                 throw SimpleFileSystemException(
                     "Write session '${stage.sessionUuid}' cannot publish path '${stage.path}': expected staged " +
@@ -1254,6 +1691,72 @@ class DurableSimpleFileSystemManager(
         }
     }
 
+    private fun releaseGenerations(database: Database, generationUuids: Collection<UUID>) {
+        val targets = generationUuids.toSet()
+        if (targets.isEmpty()) return
+        val values = targets.joinToString(", ") { "(?::UUID)" }
+        val references = database.getRows(
+            """SELECT generation_uuid, min(reference_count) AS reference_count
+                FROM file_blocks
+                WHERE generation_uuid IN (SELECT generation_uuid FROM (VALUES $values)
+                    AS target_generations(generation_uuid))
+                GROUP BY generation_uuid""".trimIndent(),
+            *targets.toTypedArray(),
+        ).associate { row ->
+            row.uuidValue("generation_uuid") to row.longValue("reference_count")
+        }
+        val deletions = references.filterValues { it == 1L }.keys
+        if (deletions.isNotEmpty()) {
+            val deletionValues = deletions.joinToString(", ") { "(?::UUID)" }
+            val arguments = mutableListOf<Any>()
+            arguments.addAll(deletions)
+            arguments.add(clock.currentTimeMillis())
+            database.getRows(
+                """WITH target_generations(generation_uuid) AS MATERIALIZED (
+                        VALUES $deletionValues
+                    ),
+                deletable_blocks AS MATERIALIZED (
+                    SELECT block.generation_uuid, block.ordinal, block.blob_hash
+                    FROM file_blocks AS block
+                    JOIN target_generations AS target USING (generation_uuid)
+                    WHERE block.reference_count = 1
+                ),
+                enqueued_hashes AS (
+                    INSERT INTO blob_gc_outbox (blob_hash, action, created_at_millis)
+                    SELECT DISTINCT blob_hash, 'UNPIN_IF_UNREFERENCED', ?
+                    FROM deletable_blocks
+                    ON CONFLICT (blob_hash) DO UPDATE
+                    SET action = excluded.action,
+                        created_at_millis = excluded.created_at_millis
+                    RETURNING blob_hash
+                ),
+                deleted_blocks AS (
+                    DELETE FROM file_blocks
+                    WHERE (generation_uuid, ordinal) IN (
+                        SELECT generation_uuid, ordinal FROM deletable_blocks
+                    )
+                      AND (SELECT count(*) FROM enqueued_hashes) >= 0
+                    RETURNING generation_uuid
+                )
+                    SELECT count(*) AS deleted_block_count FROM deleted_blocks""".trimIndent(),
+                *arguments.toTypedArray(),
+            ).single()
+        }
+        val decrements = references.filterValues { it > 1L }.keys
+        if (decrements.isNotEmpty()) {
+            val decrementValues = decrements.joinToString(", ") { "(?::UUID)" }
+            database.execute(
+                """UPDATE file_blocks
+                    SET reference_count = reference_count - 1
+                    WHERE generation_uuid IN (
+                        SELECT generation_uuid FROM (VALUES $decrementValues)
+                            AS target_generations(generation_uuid)
+                    )""".trimIndent(),
+                *decrements.toTypedArray(),
+            )
+        }
+    }
+
     internal fun prepareBlobReference(database: Database, hash: String) {
         // INSERT .. ON CONFLICT DO UPDATE already holds the outbox row lock until this transaction
         // completes. A following SELECT .. FOR UPDATE only repeated the same lock acquisition.
@@ -1340,49 +1843,65 @@ class DurableSimpleFileSystemManager(
     private fun enqueueUnreferencedPinnedBlobs(
         limit: Int,
         inventory: List<String> = blobstoreService.listBlobs(BLOB_PIN_OWNER),
+    ): Int = transactionally { transaction ->
+        enqueueUnreferencedPinnedBlobs(transaction, limit, inventory)
+    }
+
+    private fun enqueueUnreferencedPinnedBlobs(
+        transaction: Database,
+        limit: Int,
+        inventory: List<String>,
     ): Int {
-        return transactionally { transaction ->
-            val highWater = transaction.getRows(
-                "SELECT orphan_inventory_high_water FROM simple_filesystem_maintenance_state " +
-                    "WHERE singleton = true FOR UPDATE",
-            ).single().nullableStringValue("orphan_inventory_high_water")
-            val candidates = TreeSet<String>()
-            // BlobstoreApi currently returns a materialized List. We cannot prevent that allocation in the client,
-            // but deliberately neither copy nor sort it: only this bounded lexical window is retained locally.
-            inventory.forEach { hash ->
-                if ((highWater == null || hash > highWater) && candidates.add(hash) && candidates.size > limit) {
-                    candidates.pollLast()
-                }
+        val highWater = transaction.getRows(
+            "SELECT orphan_inventory_high_water FROM simple_filesystem_maintenance_state " +
+                "WHERE singleton = true FOR UPDATE",
+        ).single().nullableStringValue("orphan_inventory_high_water")
+        val candidates = TreeSet<String>()
+        // BlobstoreApi currently returns a materialized List. We cannot prevent that allocation in the client,
+        // but deliberately neither copy nor sort it: only this bounded lexical window is retained locally.
+        inventory.forEach { hash ->
+            if ((highWater == null || hash > highWater) && candidates.add(hash) && candidates.size > limit) {
+                candidates.pollLast()
             }
-            if (candidates.isEmpty()) {
-                if (highWater != null) transaction.execute(
-                    "UPDATE simple_filesystem_maintenance_state SET orphan_inventory_high_water = NULL " +
-                        "WHERE singleton = true",
-                )
-                return@transactionally 0
-            }
-            val candidateValues = candidates.joinToString(", ") { "(?::STRING)" }
-            val candidateArguments = candidates.toTypedArray()
-            val enqueued = transaction.getStrings(
-                """INSERT INTO blob_gc_outbox (blob_hash, action, created_at_millis)
+        }
+        if (candidates.isEmpty()) {
+            if (highWater != null) transaction.execute(
+                "UPDATE simple_filesystem_maintenance_state SET orphan_inventory_high_water = NULL " +
+                    "WHERE singleton = true",
+            )
+            return 0
+        }
+        val candidateValues = candidates.joinToString(", ") { "(?::STRING)" }
+        val arguments = mutableListOf<Any>()
+        arguments.addAll(candidates)
+        arguments += clock.currentTimeMillis()
+        arguments += candidates.last()
+        return transaction.getRows(
+            """WITH candidate_hashes(blob_hash) AS MATERIALIZED (
+                    VALUES $candidateValues
+                ),
+                enqueued_hashes AS (
+                    INSERT INTO blob_gc_outbox (blob_hash, action, created_at_millis)
                     SELECT candidate.blob_hash, 'UNPIN_IF_UNREFERENCED', ?
-                    FROM (VALUES $candidateValues) AS candidate(blob_hash)
+                    FROM candidate_hashes AS candidate
                     WHERE NOT EXISTS (
                         SELECT 1 FROM file_blocks WHERE blob_hash = candidate.blob_hash
                     )
                     ON CONFLICT (blob_hash) DO UPDATE
                     SET action = excluded.action, created_at_millis = excluded.created_at_millis
-                    RETURNING blob_hash""".trimIndent(),
-                clock.currentTimeMillis(),
-                *candidateArguments,
-            ).size
-            transaction.execute(
-                "UPDATE simple_filesystem_maintenance_state SET orphan_inventory_high_water = ? " +
-                    "WHERE singleton = true",
-                candidates.last(),
-            )
-            enqueued
-        }
+                    RETURNING blob_hash
+                ),
+                updated_inventory AS (
+                    UPDATE simple_filesystem_maintenance_state
+                    SET orphan_inventory_high_water = ?
+                    WHERE singleton = true
+                      AND (SELECT count(*) FROM enqueued_hashes) >= 0
+                    RETURNING singleton
+                )
+                SELECT (SELECT count(*) FROM enqueued_hashes) AS enqueued_count
+                FROM updated_inventory""".trimIndent(),
+            *arguments.toTypedArray(),
+        ).single().intValue("enqueued_count")
     }
 
     private fun reconciliationSnapshot(limit: Int, observedNow: Long): ReconciliationSnapshot {
@@ -1540,35 +2059,62 @@ class DurableSimpleFileSystemManager(
         terminalReason: PathWatchTerminalReason,
     ) {
         appendNamespaceEvents(database, filesystem, emptyList(), terminalReason)
-        var lastPath: String? = null
-        while (true) {
-            val rows = if (lastPath == null) {
-                database.getRows(
-                    """SELECT path, generation_uuid FROM entries
-                        WHERE filesystem_uuid = ? AND entry_kind = 'FILE'
-                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
-                    filesystem.uuid,
-                    INTERNAL_KEYSET_BATCH_SIZE,
+        if (filesystem.usedBytes != 0L) {
+            var lastPath: String? = null
+            while (true) {
+                val rows = if (lastPath == null) {
+                    database.getRows(
+                        """SELECT path, generation_uuid FROM entries
+                            WHERE filesystem_uuid = ? AND entry_kind = 'FILE'
+                            ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
+                        filesystem.uuid,
+                        INTERNAL_KEYSET_BATCH_SIZE,
+                    )
+                } else {
+                    database.getRows(
+                        """SELECT path, generation_uuid FROM entries
+                            WHERE filesystem_uuid = ? AND entry_kind = 'FILE' AND path > ?
+                            ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
+                        filesystem.uuid,
+                        lastPath,
+                        INTERNAL_KEYSET_BATCH_SIZE,
+                    )
+                }
+                if (rows.isEmpty()) break
+                releaseGenerations(
+                    database,
+                    rows.mapNotNull { row -> row.nullableUuidValue("generation_uuid") },
                 )
-            } else {
-                database.getRows(
-                    """SELECT path, generation_uuid FROM entries
-                        WHERE filesystem_uuid = ? AND entry_kind = 'FILE' AND path > ?
-                        ORDER BY path LIMIT ? FOR UPDATE""".trimIndent(),
-                    filesystem.uuid,
-                    lastPath,
-                    INTERNAL_KEYSET_BATCH_SIZE,
-                )
+                if (rows.size < INTERNAL_KEYSET_BATCH_SIZE) break
+                lastPath = rows.last().stringValue("path")
             }
-            if (rows.isEmpty()) break
-            rows.forEach { row -> row.nullableUuidValue("generation_uuid")?.let { releaseGeneration(database, it) } }
-            lastPath = rows.last().stringValue("path")
         }
-        forEachWriteSession(database, filesystem.uuid, openOrAbortedOnly = true) { generation ->
-            deleteGenerationBlocks(database, generation)
+        deleteFilesystemWriteSessionBlocks(database, filesystem.uuid)
+        val purge = database.getRows(
+            """WITH deleted_filesystem AS (
+                    DELETE FROM filesystems
+                    WHERE uuid = ?
+                    RETURNING uuid
+                ),
+                updated_manager AS (
+                    UPDATE simple_filesystem_manager_state
+                    SET descriptor_revision = descriptor_revision + 1
+                    WHERE singleton = true
+                      AND descriptor_revision < ?
+                      AND EXISTS (SELECT 1 FROM deleted_filesystem)
+                    RETURNING descriptor_revision
+                )
+                SELECT (SELECT count(*) FROM deleted_filesystem) AS deleted_filesystem_count,
+                       (SELECT count(*) FROM updated_manager) AS updated_manager_count""".trimIndent(),
+            filesystem.uuid,
+            Long.MAX_VALUE,
+        ).single()
+        check(purge.longValue("deleted_filesystem_count") == 1L) {
+            "Expected to purge filesystem '${filesystem.uuid}', but CockroachDB deleted 0 filesystem rows."
         }
-        database.execute("DELETE FROM filesystems WHERE uuid = ?", filesystem.uuid)
-        bumpManagerRevision(database)
+        if (purge.longValue("updated_manager_count") != 1L) {
+            throw SimpleFileSystemException("SimpleFileSystem manager descriptor revision overflowed.")
+        }
     }
 
     private fun lockWriteSessionsForFilesystem(database: Database, filesystemUuid: UUID) {
@@ -1599,16 +2145,40 @@ class DurableSimpleFileSystemManager(
         }
     }
 
-    private fun forEachGenerationBlock(database: Database, generationUuid: UUID, action: (BlockRecord) -> Unit) {
+    private fun forEachGenerationBlock(
+        database: Database,
+        generationUuid: UUID,
+        coordinationHash: String? = null,
+        action: (BlockRecord) -> Unit,
+    ) {
         var lastOrdinal = -1
         while (true) {
-            val rows = database.getRows(
-                """SELECT * FROM file_blocks WHERE generation_uuid = ? AND ordinal > ?
-                    ORDER BY ordinal LIMIT ?""".trimIndent(),
-                generationUuid,
-                lastOrdinal,
-                GENERATION_READ_BATCH_SIZE,
-            )
+            val rows = if (coordinationHash != null && lastOrdinal == -1) {
+                database.getRows(
+                    """WITH cleared_coordination AS (
+                            DELETE FROM blob_gc_outbox
+                            WHERE blob_hash = ?
+                            RETURNING blob_hash
+                        )
+                        SELECT block.*
+                        FROM file_blocks AS block
+                        WHERE block.generation_uuid = ? AND block.ordinal > ?
+                          AND (SELECT count(*) FROM cleared_coordination) >= 0
+                        ORDER BY block.ordinal LIMIT ?""".trimIndent(),
+                    coordinationHash,
+                    generationUuid,
+                    lastOrdinal,
+                    GENERATION_READ_BATCH_SIZE,
+                )
+            } else {
+                database.getRows(
+                    """SELECT * FROM file_blocks WHERE generation_uuid = ? AND ordinal > ?
+                        ORDER BY ordinal LIMIT ?""".trimIndent(),
+                    generationUuid,
+                    lastOrdinal,
+                    GENERATION_READ_BATCH_SIZE,
+                )
+            }
             if (rows.isEmpty()) break
             rows.map { it.toBlockRecord() }.forEach(action)
             lastOrdinal = rows.last().intValue("ordinal")
@@ -1618,11 +2188,49 @@ class DurableSimpleFileSystemManager(
 
     private fun deleteGenerationBlocks(database: Database, generationUuid: UUID) {
         while (true) {
+            val deleted = database.getRows(
+                """WITH deleted_blocks AS MATERIALIZED (
+                        DELETE FROM file_blocks
+                        WHERE generation_uuid = ?
+                          AND ordinal IN (
+                              SELECT ordinal FROM file_blocks
+                              WHERE generation_uuid = ?
+                              ORDER BY ordinal
+                              LIMIT ?
+                          )
+                        RETURNING blob_hash
+                    ),
+                    enqueued_hashes AS (
+                        INSERT INTO blob_gc_outbox (blob_hash, action, created_at_millis)
+                        SELECT DISTINCT blob_hash, 'UNPIN_IF_UNREFERENCED', ?
+                        FROM deleted_blocks
+                        ON CONFLICT (blob_hash) DO NOTHING
+                        RETURNING blob_hash
+                    )
+                    SELECT count(*) AS deleted_block_count
+                    FROM deleted_blocks
+                    WHERE (SELECT count(*) FROM enqueued_hashes) >= 0""".trimIndent(),
+                generationUuid,
+                generationUuid,
+                generationDeleteBatchSize,
+                clock.currentTimeMillis(),
+            ).single()
+            val deletedCount = deleted.longValue("deleted_block_count").toInt()
+            if (deletedCount < generationDeleteBatchSize) break
+        }
+    }
+
+    private fun deleteFilesystemWriteSessionBlocks(database: Database, filesystemUuid: UUID) {
+        while (true) {
             val deleted = database.execute(
                 """WITH block_page AS MATERIALIZED (
-                        SELECT ordinal, blob_hash FROM file_blocks
-                        WHERE generation_uuid = ?
-                        ORDER BY ordinal
+                        SELECT block.generation_uuid, block.ordinal, block.blob_hash
+                        FROM file_blocks AS block
+                        JOIN write_sessions AS session
+                          ON session.session_uuid = block.generation_uuid
+                        WHERE session.filesystem_uuid = ?
+                          AND session.state IN ('OPEN', 'ABORTED')
+                        ORDER BY block.generation_uuid, block.ordinal
                         LIMIT ?
                     ),
                     enqueued_hashes AS (
@@ -1635,15 +2243,18 @@ class DurableSimpleFileSystemManager(
                         RETURNING blob_hash
                     )
                     DELETE FROM file_blocks
-                    WHERE generation_uuid = ?
-                      AND ordinal IN (SELECT ordinal FROM block_page)
+                    WHERE (generation_uuid, ordinal) IN (
+                        SELECT generation_uuid, ordinal FROM block_page
+                    )
                       AND (SELECT count(*) FROM enqueued_hashes) >= 0""".trimIndent(),
-                generationUuid,
+                filesystemUuid,
                 generationDeleteBatchSize,
                 clock.currentTimeMillis(),
-                generationUuid,
             )
-            val deletedCount = affectedRowCount(deleted, "delete generation '$generationUuid' blocks")
+            val deletedCount = affectedRowCount(
+                deleted,
+                "delete open or aborted write-session blocks for filesystem '$filesystemUuid'",
+            )
             if (deletedCount < generationDeleteBatchSize) break
         }
     }
@@ -1750,8 +2361,203 @@ class DurableSimpleFileSystemManager(
         newUsedBytes: Long = filesystem.usedBytes,
         affectedPaths: Collection<String>,
     ) {
-        appendNamespaceEvents(database, filesystem, affectedPaths, terminalReason = null)
-        if (newUsedBytes != filesystem.usedBytes) bumpManagerRevision(database)
+        appendNamespaceEvents(
+            database,
+            filesystem,
+            affectedPaths,
+            terminalReason = null,
+            bumpManagerDescriptorRevision = newUsedBytes != filesystem.usedBytes,
+        )
+    }
+
+    internal fun recordAtomicMoveNamespaceMutation(
+        database: Database,
+        filesystem: FilesystemRecord,
+        newUsedBytes: Long,
+        sourcePath: String,
+        targetPath: String,
+        membershipPaths: Collection<String>,
+    ) {
+        val next = try {
+            Math.addExact(filesystem.namespaceRevision, 1L)
+        } catch (_: ArithmeticException) {
+            throw SimpleFileSystemException(
+                "Namespace revision overflowed for filesystem '${filesystem.uuid}'.",
+            )
+        }
+        val now = clock.currentTimeMillis()
+        val targetPrefix = "$targetPath/"
+        val targetUpperBound = "${targetPath}0"
+        val targetSuffixStart = targetPath.codePointCount(0, targetPath.length) + 1
+        val membershipValues = membershipPaths.toSortedSet()
+            .joinToString(", ") { "(?::STRING)" }
+        val arguments = mutableListOf<Any>(
+            sourcePath,
+            targetSuffixStart,
+            filesystem.uuid,
+            targetPath,
+            targetPrefix,
+            targetUpperBound,
+        )
+        arguments.addAll(membershipPaths.toSortedSet())
+        arguments.add(filesystem.uuid)
+        arguments.addAll(
+            listOf(
+                next,
+                newUsedBytes,
+                filesystem.uuid,
+                newUsedBytes != filesystem.usedBytes,
+                Long.MAX_VALUE,
+                next,
+                now,
+                now,
+                filesystem.uuid,
+                Long.MAX_VALUE,
+                filesystem.uuid,
+                next,
+                now,
+                filesystem.uuid,
+                next,
+                now,
+            ),
+        )
+        val retentionRows = database.getRows(
+            """WITH moved_entries AS MATERIALIZED (
+                    SELECT path AS target_path,
+                           ? || substring(path FROM ?) AS source_path,
+                           entry_kind, size_bytes, content_hash
+                    FROM entries
+                    WHERE filesystem_uuid = ?
+                      AND (path = ? OR (path >= ? AND path < ?))
+                ),
+                requested_events AS MATERIALIZED (
+                    SELECT target_path AS canonical_path, entry_kind, size_bytes, content_hash
+                    FROM moved_entries
+                    UNION ALL
+                    SELECT source.source_path AS canonical_path, NULL, NULL, NULL
+                    FROM moved_entries AS source
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM moved_entries AS target
+                        WHERE target.target_path = source.source_path
+                    )
+                    UNION ALL
+                    SELECT membership.canonical_path,
+                           entry.entry_kind, entry.size_bytes, entry.content_hash
+                    FROM (VALUES $membershipValues) AS membership(canonical_path)
+                    LEFT JOIN entries AS entry
+                      ON entry.filesystem_uuid = ? AND entry.path = membership.canonical_path
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM moved_entries AS moved
+                        WHERE moved.target_path = membership.canonical_path
+                           OR moved.source_path = membership.canonical_path
+                    )
+                ),
+                event_total AS MATERIALIZED (
+                    SELECT count(*) AS event_count FROM requested_events
+                ),
+                updated_filesystem AS (
+                    UPDATE filesystems
+                    SET namespace_revision = ?,
+                        used_bytes = ?
+                    WHERE uuid = ?
+                    RETURNING uuid
+                ),
+                updated_manager AS (
+                    UPDATE simple_filesystem_manager_state
+                    SET descriptor_revision = descriptor_revision + 1
+                    WHERE singleton = true
+                      AND ?
+                      AND descriptor_revision < ?
+                      AND EXISTS (SELECT 1 FROM updated_filesystem)
+                    RETURNING descriptor_revision
+                ),
+                updated_stream AS (
+                    UPDATE namespace_event_streams
+                    SET latest_revision = ?,
+                        terminal_reason = NULL,
+                        latest_event_ordinal =
+                            latest_event_ordinal + (SELECT event_count FROM event_total),
+                        retained_event_count =
+                            retained_event_count + (SELECT event_count FROM event_total),
+                        oldest_retained_revision_last_event_ordinal =
+                            CASE WHEN retained_event_count = 0
+                                 THEN latest_event_ordinal + (SELECT event_count FROM event_total)
+                                 ELSE oldest_retained_revision_last_event_ordinal END,
+                        oldest_event_at_millis =
+                            CASE WHEN retained_event_count = 0 THEN ?
+                                 ELSE LEAST(oldest_event_at_millis, ?) END
+                    WHERE filesystem_uuid = ?
+                      AND latest_event_ordinal <=
+                          ? - (SELECT event_count FROM event_total)
+                      AND EXISTS (SELECT 1 FROM updated_filesystem)
+                    RETURNING latest_event_ordinal, retained_event_count,
+                              oldest_retained_revision_last_event_ordinal, oldest_event_at_millis
+                ),
+                inserted_revision AS (
+                    INSERT INTO namespace_event_revisions
+                        (filesystem_uuid, revision, event_count, event_at_millis, last_event_ordinal)
+                    SELECT ?, ?, event_count, ?, latest_event_ordinal
+                    FROM event_total, updated_stream
+                    RETURNING revision
+                ),
+                inserted_events AS (
+                    INSERT INTO namespace_events
+                        (filesystem_uuid, revision, canonical_path, entry_type, exists, is_directory,
+                         is_regular_file, size_bytes, content_hash, terminal, terminal_reason,
+                         event_at_millis)
+                    SELECT ?, ?, requested.canonical_path,
+                           CASE requested.entry_kind
+                               WHEN 'FILE' THEN 'REGULAR_FILE'
+                               WHEN 'DIRECTORY' THEN 'DIRECTORY'
+                               ELSE NULL
+                           END,
+                           requested.entry_kind IS NOT NULL,
+                           COALESCE(requested.entry_kind = 'DIRECTORY', false),
+                           COALESCE(requested.entry_kind = 'FILE', false),
+                           requested.size_bytes,
+                           requested.content_hash,
+                           false,
+                           NULL,
+                           ?
+                    FROM requested_events AS requested
+                    RETURNING canonical_path
+                )
+                SELECT latest_event_ordinal, retained_event_count,
+                       oldest_retained_revision_last_event_ordinal, oldest_event_at_millis,
+                       (SELECT count(*) FROM inserted_events) AS inserted_event_count,
+                       (SELECT event_count FROM event_total) AS expected_event_count,
+                       (SELECT count(*) FROM updated_manager) AS updated_manager_count
+                FROM updated_stream
+                WHERE EXISTS (SELECT 1 FROM inserted_revision)""".trimIndent(),
+            *arguments.toTypedArray(),
+        )
+        if (retentionRows.isEmpty()) {
+            throw SimpleFileSystemException(
+                "Namespace event ordinal overflowed for filesystem '${filesystem.uuid}' while " +
+                    "recording the atomic move from '$sourcePath' to '$targetPath'.",
+            )
+        }
+        val retention = retentionRows.single()
+        check(retention.longValue("inserted_event_count") == retention.longValue("expected_event_count")) {
+            "Atomic move from '$sourcePath' to '$targetPath' did not persist every namespace event."
+        }
+        if (newUsedBytes != filesystem.usedBytes &&
+            retention.longValue("updated_manager_count") != 1L
+        ) {
+            throw SimpleFileSystemException("SimpleFileSystem manager descriptor revision overflowed.")
+        }
+        val ageCutoff = namespaceEventAgeCutoff(now)
+        if (
+            shouldPruneNamespaceEvents(
+                retention.longValue("latest_event_ordinal"),
+                retention.longValue("retained_event_count"),
+                retention.longValue("oldest_retained_revision_last_event_ordinal"),
+                retention.nullableLongValue("oldest_event_at_millis"),
+                ageCutoff,
+            )
+        ) {
+            pruneNamespaceEvents(database, filesystem.uuid, ageCutoff)
+        }
     }
 
     private fun appendNamespaceEvents(
@@ -1759,6 +2565,7 @@ class DurableSimpleFileSystemManager(
         filesystem: FilesystemRecord,
         affectedPaths: Collection<String>,
         terminalReason: PathWatchTerminalReason?,
+        bumpManagerDescriptorRevision: Boolean = false,
     ): Long {
         val next = try {
             Math.addExact(filesystem.namespaceRevision, 1L)
@@ -1767,11 +2574,6 @@ class DurableSimpleFileSystemManager(
                 "Namespace revision overflowed for filesystem '${filesystem.uuid}'.",
             )
         }
-        database.execute(
-            "UPDATE filesystems SET namespace_revision = ? WHERE uuid = ?",
-            next,
-            filesystem.uuid,
-        )
         val now = clock.currentTimeMillis()
         val paths = if (terminalReason == null) {
             require(affectedPaths.isNotEmpty()) {
@@ -1782,35 +2584,64 @@ class DurableSimpleFileSystemManager(
             listOf("/")
         }
         val eventCount = paths.size.toLong()
-        val retentionRows = database.getRows(
-            """WITH updated_stream AS (
-                    UPDATE namespace_event_streams
-                    SET latest_revision = ?,
-                        terminal_reason = ?,
-                        latest_event_ordinal = latest_event_ordinal + ?,
-                        retained_event_count = retained_event_count + ?,
-                        oldest_retained_revision_last_event_ordinal =
-                            CASE WHEN retained_event_count = 0
-                                 THEN latest_event_ordinal + ?
-                                 ELSE oldest_retained_revision_last_event_ordinal END,
-                        oldest_event_at_millis =
-                            CASE WHEN retained_event_count = 0 THEN ?
-                                 ELSE LEAST(oldest_event_at_millis, ?) END
-                    WHERE filesystem_uuid = ?
-                      AND latest_event_ordinal <= ? - ?
-                    RETURNING latest_event_ordinal, retained_event_count,
-                              oldest_retained_revision_last_event_ordinal, oldest_event_at_millis
-                ),
-                inserted_revision AS (
-                    INSERT INTO namespace_event_revisions
-                        (filesystem_uuid, revision, event_count, event_at_millis, last_event_ordinal)
-                    SELECT ?, ?, ?, ?, latest_event_ordinal FROM updated_stream
-                    RETURNING revision
+        val combinedEventArguments = mutableListOf<Any>()
+        val combinedEventInsert = when {
+            terminalReason != null -> {
+                combinedEventArguments.addAll(
+                    listOf(filesystem.uuid, next, terminalReason.name, now),
                 )
-                SELECT latest_event_ordinal, retained_event_count,
-                       oldest_retained_revision_last_event_ordinal, oldest_event_at_millis
-                FROM updated_stream
-                WHERE EXISTS (SELECT 1 FROM inserted_revision)""".trimIndent(),
+                """INSERT INTO namespace_events
+                    (filesystem_uuid, revision, canonical_path, entry_type, exists, is_directory,
+                     is_regular_file, size_bytes, content_hash, terminal, terminal_reason,
+                     event_at_millis)
+                    SELECT ?, ?, '/', NULL, false, false, false, NULL, NULL, true, ?, ?
+                    FROM inserted_revision
+                    RETURNING canonical_path""".trimIndent()
+            }
+            paths.size <= NAMESPACE_EVENT_BATCH_SIZE -> {
+                val values = paths.joinToString(", ") { "(?)" }
+                combinedEventArguments.addAll(listOf(filesystem.uuid, next, now))
+                combinedEventArguments.addAll(paths)
+                combinedEventArguments.add(filesystem.uuid)
+                """INSERT INTO namespace_events
+                    (filesystem_uuid, revision, canonical_path, entry_type, exists, is_directory,
+                     is_regular_file, size_bytes, content_hash, terminal, terminal_reason,
+                     event_at_millis)
+                    SELECT ?, ?, requested.path,
+                           CASE entry.entry_kind
+                               WHEN 'FILE' THEN 'REGULAR_FILE'
+                               WHEN 'DIRECTORY' THEN 'DIRECTORY'
+                               ELSE NULL
+                           END,
+                           entry.path IS NOT NULL,
+                           COALESCE(entry.entry_kind = 'DIRECTORY', false),
+                           COALESCE(entry.entry_kind = 'FILE', false),
+                           entry.size_bytes,
+                           entry.content_hash,
+                           false,
+                           NULL,
+                           ?
+                    FROM (VALUES $values) AS requested(path)
+                    LEFT JOIN entries AS entry
+                      ON entry.filesystem_uuid = ? AND entry.path = requested.path
+                    WHERE EXISTS (SELECT 1 FROM inserted_revision)
+                    RETURNING canonical_path""".trimIndent()
+            }
+            else -> null
+        }
+        val insertedEventsCte = combinedEventInsert?.let {
+            ", inserted_events AS (\n$it\n)"
+        }.orEmpty()
+        val insertedEventCountProjection = if (combinedEventInsert == null) {
+            ""
+        } else {
+            ", (SELECT count(*) FROM inserted_events) AS inserted_event_count"
+        }
+        val arguments = mutableListOf<Any?>(
+            next,
+            filesystem.uuid,
+            bumpManagerDescriptorRevision,
+            Long.MAX_VALUE,
             next,
             terminalReason?.name,
             eventCount,
@@ -1826,6 +2657,57 @@ class DurableSimpleFileSystemManager(
             eventCount,
             now,
         )
+        arguments.addAll(combinedEventArguments)
+        val retentionRows = database.getRows(
+                """WITH updated_filesystem AS (
+                    UPDATE filesystems
+                    SET namespace_revision = ?
+                    WHERE uuid = ?
+                    RETURNING uuid
+                ),
+                updated_manager AS (
+                    UPDATE simple_filesystem_manager_state
+                    SET descriptor_revision = descriptor_revision + 1
+                    WHERE singleton = true
+                      AND ?
+                      AND descriptor_revision < ?
+                      AND EXISTS (SELECT 1 FROM updated_filesystem)
+                    RETURNING descriptor_revision
+                ),
+                updated_stream AS (
+                    UPDATE namespace_event_streams
+                    SET latest_revision = ?,
+                        terminal_reason = ?,
+                        latest_event_ordinal = latest_event_ordinal + ?,
+                        retained_event_count = retained_event_count + ?,
+                        oldest_retained_revision_last_event_ordinal =
+                            CASE WHEN retained_event_count = 0
+                                 THEN latest_event_ordinal + ?
+                                 ELSE oldest_retained_revision_last_event_ordinal END,
+                        oldest_event_at_millis =
+                            CASE WHEN retained_event_count = 0 THEN ?
+                                 ELSE LEAST(oldest_event_at_millis, ?) END
+                    WHERE filesystem_uuid = ?
+                      AND latest_event_ordinal <= ? - ?
+                      AND EXISTS (SELECT 1 FROM updated_filesystem)
+                    RETURNING latest_event_ordinal, retained_event_count,
+                              oldest_retained_revision_last_event_ordinal, oldest_event_at_millis
+                ),
+                inserted_revision AS (
+                    INSERT INTO namespace_event_revisions
+                        (filesystem_uuid, revision, event_count, event_at_millis, last_event_ordinal)
+                    SELECT ?, ?, ?, ?, latest_event_ordinal FROM updated_stream
+                    RETURNING revision
+                )
+                $insertedEventsCte
+                SELECT latest_event_ordinal, retained_event_count,
+                       oldest_retained_revision_last_event_ordinal, oldest_event_at_millis,
+                       (SELECT count(*) FROM updated_manager) AS updated_manager_count
+                       $insertedEventCountProjection
+                FROM updated_stream
+                WHERE EXISTS (SELECT 1 FROM inserted_revision)""".trimIndent(),
+            *arguments.toTypedArray(),
+        )
         if (retentionRows.isEmpty()) {
             throw SimpleFileSystemException(
                 "Namespace event ordinal overflowed for filesystem '${filesystem.uuid}': " +
@@ -1833,7 +2715,16 @@ class DurableSimpleFileSystemManager(
             )
         }
         val retention = retentionRows.single()
-        if (terminalReason == null) {
+        if (bumpManagerDescriptorRevision && retention.longValue("updated_manager_count") != 1L) {
+            throw SimpleFileSystemException("SimpleFileSystem manager descriptor revision overflowed.")
+        }
+        if (combinedEventInsert != null) {
+            check(retention.longValue("inserted_event_count") == eventCount) {
+                "Namespace revision $next for filesystem '${filesystem.uuid}' expected to persist " +
+                    "$eventCount event(s), but persisted " +
+                    "${retention.longValue("inserted_event_count")}."
+            }
+        } else if (terminalReason == null) {
             paths.chunked(NAMESPACE_EVENT_BATCH_SIZE).forEach { pathBatch ->
                 val values = pathBatch.joinToString(", ") { "(?)" }
                 val arguments = mutableListOf<Any>(filesystem.uuid, next, now)
@@ -1863,17 +2754,6 @@ class DurableSimpleFileSystemManager(
                     *arguments.toTypedArray(),
                 )
             }
-        } else {
-            database.execute(
-                """INSERT INTO namespace_events
-                    (filesystem_uuid, revision, canonical_path, entry_type, exists, is_directory,
-                     is_regular_file, size_bytes, content_hash, terminal, terminal_reason, event_at_millis)
-                    VALUES (?, ?, '/', NULL, false, false, false, NULL, NULL, true, ?, ?)""".trimIndent(),
-                filesystem.uuid,
-                next,
-                terminalReason.name,
-                now,
-            )
         }
         val latestEventOrdinal = retention.longValue("latest_event_ordinal")
         val retainedEventCount = retention.longValue("retained_event_count")
@@ -2138,9 +3018,9 @@ class DurableSimpleFileSystemManager(
         const val DEFAULT_SESSION_LEASE_MILLIS = 5L * 60L * 1000L
         const val DEFAULT_MAINTENANCE_BATCH_SIZE = 1_000
         const val INTERNAL_KEYSET_BATCH_SIZE = 256
-        const val GENERATION_READ_BATCH_SIZE = 4_096
+        const val GENERATION_READ_BATCH_SIZE = 16_384
         const val DEFAULT_GENERATION_DELETE_BATCH_SIZE = 16_384
-        const val NAMESPACE_EVENT_BATCH_SIZE = 2_048
+        const val NAMESPACE_EVENT_BATCH_SIZE = 8_192
         const val DEFAULT_NAMESPACE_EVENT_RETENTION_COUNT = 10_000
         const val DEFAULT_NAMESPACE_EVENT_RETENTION_MILLIS = 7L * 24L * 60L * 60L * 1000L
         const val WRITE_MAINTENANCE_CANDIDATE = "WRITE_SESSION"

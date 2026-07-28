@@ -17,6 +17,7 @@ fun main(args: Array<String>) {
     Runtime.getRuntime().addShutdownHook(shutdownHook)
 
     try {
+        configureSingleNodeTestCluster(cluster.jdbcUrl())
         warmUpDurableSchema(cluster.jdbcUrl())
         readyFile.parentFile?.let { parent ->
             check(parent.isDirectory || parent.mkdirs()) {

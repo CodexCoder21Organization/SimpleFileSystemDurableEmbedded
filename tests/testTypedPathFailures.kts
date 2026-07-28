@@ -21,17 +21,21 @@ import simplefilesystem.InvalidPathReason
 import simplefilesystem.PathAlreadyExistsException
 import simplefilesystem.PathNotFoundException
 import simplefilesystem.PathTypeMismatchException
-import sql.Database
 
 fun testTypedPathFailures() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(1L))
-            val filesystem = manager.openFilesystem(manager.createFilesystem("errors", 100L).uuid)
+            val filesystemInfo = manager.createFilesystem("errors", 100L)
+            val filesystem = manager.openFilesystem(filesystemInfo.uuid)
             filesystem.createDirectory("/dir", true)
             filesystem.writeUtf8("/file", "abc", null)
+            filesystem.writeUtf8("/wild%", "not an ancestor", null)
+            filesystem.createDirectory("/wildcard", true)
+            filesystem.writeUtf8("/wildcard/child", "literal prefix", null)
+            assertEquals("literal prefix", filesystem.readUtf8("/wildcard/child"))
 
             val missing = runCatching { filesystem.readUtf8("/missing") }.exceptionOrNull()
             assertEquals("simplefilesystem.PathNotFoundException", missing?.javaClass?.name)
@@ -71,6 +75,20 @@ fun testTypedPathFailures() {
                 "Byte range offset=2, byteCount=2 is invalid for path '/file' with size 3 bytes; offset and " +
                     "byteCount must be non-negative, addition must not overflow, and the range must end at or before byte 3.",
                 range?.message,
+            )
+
+            manager.deleteFilesystem(filesystemInfo.uuid)
+            val deletedFilesystemExistsFailure =
+                runCatching { filesystem.exists("/root-child") }.exceptionOrNull()
+            assertEquals(
+                "simplefilesystem.FilesystemNotFoundException",
+                deletedFilesystemExistsFailure?.javaClass?.name,
+            )
+            val deletedFilesystemListFailure =
+                runCatching { filesystem.list("relative", "not-a-cursor", 0) }.exceptionOrNull()
+            assertEquals(
+                "simplefilesystem.FilesystemNotFoundException",
+                deletedFilesystemListFailure?.javaClass?.name,
             )
         } finally {
             database.close()

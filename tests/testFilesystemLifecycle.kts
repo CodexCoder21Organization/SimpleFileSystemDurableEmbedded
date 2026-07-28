@@ -21,12 +21,11 @@ import kotlin.test.assertNull
 import okio.Buffer
 import simplefilesystem.FilesystemExpiredException
 import simplefilesystem.FilesystemNotFoundException
-import sql.Database
 
 fun testFilesystemLifecycle() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(1_000L)
             val manager = DurableSimpleFileSystemManager(

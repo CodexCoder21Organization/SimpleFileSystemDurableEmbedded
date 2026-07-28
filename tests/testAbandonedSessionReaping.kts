@@ -20,12 +20,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import okio.Buffer
-import sql.Database
 
 fun testAbandonedSessionReaping() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(2_000L)
             val blobs = InMemoryBlobstoreService()

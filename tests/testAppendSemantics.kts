@@ -20,12 +20,11 @@ import okio.Buffer
 import okio.buffer
 import simplefilesystem.PathNotFoundException
 import simplefilesystem.PathTypeMismatchException
-import sql.Database
 
 fun testAppendSemantics() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(3L))
             val uuid = manager.createFilesystem("append", 1_000L).uuid

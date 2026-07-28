@@ -23,13 +23,12 @@ import kotlin.test.assertTrue
 import okio.Buffer
 import simplefilesystem.FilesystemNotFoundException
 import simplefilesystem.durable.testing.ControlledBlobstoreService
-import sql.Database
 
 fun testCockroachRetryAndGlobalLockOrder() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val primaryDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
-        val writerDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val primaryDatabase = cluster.openDatabase()
+        val writerDatabase = cluster.openDatabase()
         try {
             val clock = ManualClock(80_000L)
             val blobs = ControlledBlobstoreService()

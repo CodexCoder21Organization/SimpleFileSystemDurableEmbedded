@@ -65,6 +65,17 @@ internal data class StagedGeneration(
     val contentHash: String,
 )
 
+internal data class PendingStagedBlock(
+    val ordinal: Int,
+    val bytes: ByteArray,
+)
+
+internal data class PendingBlockUpload(
+    val ordinal: Int,
+    val bytes: ByteArray,
+    val hash: String,
+)
+
 internal data class FileGenerationSnapshot(
     val entry: EntryRecord,
     val generationUuid: UUID,

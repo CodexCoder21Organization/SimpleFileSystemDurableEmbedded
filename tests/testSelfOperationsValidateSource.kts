@@ -16,12 +16,11 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import community.kotlin.clocks.simple.ManualClock
 import kotlin.test.assertEquals
 import simplefilesystem.FileEntryType
-import sql.Database
 
 fun testSelfOperationsValidateSource() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(11L))
             val filesystem = manager.openFilesystem(manager.createFilesystem("self operations", 1_000L).uuid)

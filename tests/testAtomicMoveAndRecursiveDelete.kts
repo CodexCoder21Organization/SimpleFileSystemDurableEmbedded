@@ -22,12 +22,11 @@ import simplefilesystem.DirectoryNotEmptyException
 import simplefilesystem.FileEntryType
 import simplefilesystem.InvalidMoveException
 import simplefilesystem.PathTypeMismatchException
-import sql.Database
 
 fun testAtomicMoveAndRecursiveDelete() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(8L))
             val uuid = manager.createFilesystem("trees", 1_000L).uuid

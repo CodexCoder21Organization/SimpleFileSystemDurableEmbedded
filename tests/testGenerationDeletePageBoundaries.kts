@@ -13,7 +13,6 @@ import community.kotlin.blobstore.inmemory.InMemoryBlobstoreService
 import java.io.ByteArrayInputStream
 import java.security.MessageDigest
 import simplefilesystem.durable.testing.SharedCockroachCluster
-import sql.Database
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -21,7 +20,7 @@ import kotlin.test.assertTrue
 fun testGenerationDeletePageBoundaries() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val blobs = InMemoryBlobstoreService()
             val generationDeleteBatchSize = 64
