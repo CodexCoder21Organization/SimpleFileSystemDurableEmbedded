@@ -4,6 +4,8 @@
 package simplefilesystem.durable
 
 import build.kotlin.withartifact.WithArtifact
+import java.net.URI
+import java.sql.DriverManager
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -16,16 +18,125 @@ fun testSharedCockroachPrestartedBeforeTestBody() {
             "The shared CockroachDB fixture must be ready before this test body's per-test clock " +
                 "starts, but this test had to wait for managed-node startup.",
         )
+        val fixtureDatabaseName = DriverManager.getConnection(
+            cluster.jdbcUrl(),
+            cluster.username,
+            cluster.password,
+        ).use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery("SELECT current_database()").use { rows ->
+                    assertTrue(rows.next(), "The fixture database-name query returned no row.")
+                    rows.getString(1)
+                }
+            }.also { databaseName ->
+                connection.createStatement().use { statement ->
+                    statement.executeQuery(
+                        """SELECT schema_version
+                            FROM simple_filesystem_schema_version
+                            WHERE singleton = true""".trimIndent(),
+                    ).use { rows ->
+                        assertTrue(
+                            rows.next(),
+                            "Fixture database '$databaseName' was acquired before its durable " +
+                                "schema was initialized.",
+                        )
+                        assertEquals(
+                            2,
+                            rows.getInt("schema_version"),
+                            "Fixture database '$databaseName' did not contain the complete current " +
+                                "durable schema before acquisition.",
+                        )
+                        assertFalse(
+                            rows.next(),
+                            "Fixture database '$databaseName' contained more than one singleton " +
+                                "schema-version row.",
+                        )
+                    }
+                }
+            }
+        }
+        assertTrue(
+            fixtureDatabaseName.startsWith("durable_fixture_pool_"),
+            "The acquired database '$fixtureDatabaseName' was created cold by this test instead " +
+                "of being claimed from the schema-ready fixture pool.",
+        )
+
+        val fixtureUri = URI(cluster.jdbcUrl().removePrefix("jdbc:"))
+        check(
+            cluster.jdbcUrl().startsWith("jdbc:") &&
+                fixtureUri.scheme == "postgresql" &&
+                fixtureUri.host != null &&
+                fixtureUri.port >= 0,
+        ) {
+            "The fixture JDBC URL must have the form " +
+                "jdbc:postgresql://host:port/database?parameters, but was ${cluster.jdbcUrl()}."
+        }
+        val adminJdbcUrl = "jdbc:" + URI(
+            fixtureUri.scheme,
+            fixtureUri.userInfo,
+            fixtureUri.host,
+            fixtureUri.port,
+            "/defaultdb",
+            fixtureUri.query,
+            fixtureUri.fragment,
+        )
+        DriverManager.getConnection(adminJdbcUrl, cluster.username, cluster.password).use { connection ->
+            connection.createStatement().use { statement ->
+                statement.executeQuery(
+                    "SELECT count(*) FROM simple_filesystem_fixture_database_pool",
+                ).use { rows ->
+                    assertTrue(rows.next(), "The fixture database-pool count query returned no row.")
+                    assertTrue(
+                        rows.getInt(1) >= 5,
+                        "Build-phase prestart must publish at least five individually schema-ready " +
+                            "databases for four-way dispatch plus the fixture-isolation test's " +
+                            "nested acquisition, but published only ${rows.getInt(1)}.",
+                    )
+                }
+            }
+            connection.prepareStatement(
+                """SELECT lease_token, owner_pid, owner_started_at_millis, needs_reset
+                    FROM simple_filesystem_fixture_database_pool
+                    WHERE database_name = ?""".trimIndent(),
+            ).use { statement ->
+                statement.setString(1, fixtureDatabaseName)
+                statement.executeQuery().use { rows ->
+                    assertTrue(
+                        rows.next(),
+                        "Acquired database '$fixtureDatabaseName' had no per-database readiness " +
+                            "record in the fixture pool.",
+                    )
+                    assertTrue(
+                        !rows.getString("lease_token").isNullOrBlank(),
+                        "Acquired fixture database '$fixtureDatabaseName' did not have a live " +
+                            "lease token.",
+                    )
+                    assertEquals(
+                        ProcessHandle.current().pid(),
+                        rows.getLong("owner_pid"),
+                        "Fixture database '$fixtureDatabaseName' was not leased to this test JVM.",
+                    )
+                    assertEquals(
+                        ProcessHandle.current().info().startInstant().orElseThrow().toEpochMilli(),
+                        rows.getLong("owner_started_at_millis"),
+                        "Fixture database '$fixtureDatabaseName' lease did not identify this test " +
+                            "JVM's process generation.",
+                    )
+                    assertFalse(
+                        rows.getBoolean("needs_reset"),
+                        "Fixture database '$fixtureDatabaseName' remained dirty when acquisition " +
+                            "returned.",
+                    )
+                    assertFalse(
+                        rows.next(),
+                        "Fixture pool contained duplicate readiness records for " +
+                            "'$fixtureDatabaseName'.",
+                    )
+                }
+            }
+        }
+
         cluster.openDatabase().use { database ->
-            assertEquals(
-                16L,
-                database.getLong(
-                    """SELECT count(*) FROM [SHOW DATABASES]
-                        WHERE database_name LIKE 'durable_fixture_pool_%'""".trimIndent(),
-                ),
-                "The build-phase prestart must finish the complete fixture database pool before " +
-                    "Kompile dispatches test bodies.",
-            )
             assertEquals(
                 1L,
                 database.getLong(

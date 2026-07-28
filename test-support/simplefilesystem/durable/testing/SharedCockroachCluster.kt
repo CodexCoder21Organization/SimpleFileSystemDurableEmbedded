@@ -26,12 +26,11 @@ import sql.Database
 private const val SHARED_COCKROACH_JDBC_URL_ENV =
     "SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL"
 internal const val FIXTURE_DATABASE_POOL_SIZE = 16
-// One schema-ready database is sufficient to publish a usable node. The daemon fills the rest in
-// the background, while the build-session prestart explicitly waits for the full pool before tests.
+// Database-acquiring callers require at least one schema-ready database. Internal node-only
+// election/liveness probes use zero so they do not execute unrelated database/schema DDL.
 internal const val FIXTURE_DATABASE_READY_POOL_SIZE = 1
+internal const val FIXTURE_DATABASE_DISPATCH_POOL_SIZE = 5
 internal const val FIXTURE_DATABASE_POOL_TABLE = "simple_filesystem_fixture_database_pool"
-private const val WAIT_FOR_FULL_FIXTURE_POOL_PROPERTY =
-    "simplefilesystem.durable.testing.waitForFullFixturePool"
 
 /**
  * Explicit file barriers used only by child-process integration tests. Production callers leave
@@ -53,6 +52,12 @@ data class SharedCockroachFixtureDiagnostics(
     val cockroachProcessGroupId: Long,
 )
 
+internal enum class FixtureDatabaseMode {
+    PREINITIALIZED,
+    UNINITIALIZED,
+    NONE,
+}
+
 /**
  * Attaches one isolated logical database to a shared real CockroachDB node.
  *
@@ -61,10 +66,22 @@ data class SharedCockroachFixtureDiagnostics(
  * workspace-scoped filesystem protocol elects a detached daemon and lease files keep its node
  * alive until the last test database closes.
  */
-class SharedCockroachCluster(
-    private val clock: Clock = SystemClock(),
-    private val fixtureControl: SharedCockroachFixtureControl? = null,
+class SharedCockroachCluster internal constructor(
+    private val clock: Clock,
+    private val fixtureControl: SharedCockroachFixtureControl?,
+    private val databaseMode: FixtureDatabaseMode,
+    private val initialFixtureDatabasePoolSize: Int,
 ) : Closeable {
+    constructor(
+        clock: Clock = SystemClock(),
+        fixtureControl: SharedCockroachFixtureControl? = null,
+    ) : this(
+        clock = clock,
+        fixtureControl = fixtureControl,
+        databaseMode = FixtureDatabaseMode.PREINITIALIZED,
+        initialFixtureDatabasePoolSize = FIXTURE_DATABASE_READY_POOL_SIZE,
+    )
+
     private val leaseName = "durable_test_${UUID.randomUUID().toString().replace("-", "")}"
     private var databaseName: String? = null
     private var pooledDatabaseLease: PooledDatabaseLease? = null
@@ -98,15 +115,31 @@ class SharedCockroachCluster(
                 leaseName = leaseName,
                 clock = clock,
                 fixtureControl = fixtureControl,
+                initialFixtureDatabasePoolSize = initialFixtureDatabasePoolSize,
             ).also {
                 managedNodeLease = true
             }
         }
         val sharedJdbcUrl = configuredJdbcUrl ?: requireNotNull(acquired).jdbcUrl
         try {
+            if (databaseMode == FixtureDatabaseMode.NONE) {
+                adminJdbcUrl = sharedJdbcUrl
+                testJdbcUrl = sharedJdbcUrl
+                managedDiagnostics = acquired?.diagnostics
+                fixtureReadyBeforeStart = acquired?.fixtureReadyBeforeAcquire ?: true
+                return this
+            }
             Class.forName("org.postgresql.Driver")
             val pooled = claimPooledDatabase(sharedJdbcUrl)
-            val selectedDatabaseName = pooled?.databaseName ?: leaseName
+            val selectedDatabaseName = pooled?.databaseName ?: when (databaseMode) {
+                FixtureDatabaseMode.UNINITIALIZED -> leaseName
+                FixtureDatabaseMode.PREINITIALIZED -> throw IllegalStateException(
+                    "No schema-ready CockroachDB fixture database was available for test JVM " +
+                        "${ProcessHandle.current().pid()}; build-phase prestart must publish " +
+                        "$FIXTURE_DATABASE_DISPATCH_POOL_SIZE databases before four-way dispatch.",
+                )
+                FixtureDatabaseMode.NONE -> error("Node-only fixture mode was handled above.")
+            }
             if (pooled == null) {
                 DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
                     connection.createStatement().use { statement ->
@@ -193,13 +226,13 @@ class SharedCockroachCluster(
     @Synchronized
     override fun close() {
         val configuredJdbcUrl = adminJdbcUrl ?: return
-        val selectedDatabaseName = requireNotNull(databaseName)
+        val selectedDatabaseName = databaseName
         val pooled = pooledDatabaseLease
         var failure: Throwable? = null
         try {
             if (pooled != null) {
                 releasePooledDatabase(configuredJdbcUrl, pooled)
-            } else if (!managedNodeLease) {
+            } else if (selectedDatabaseName != null && !managedNodeLease) {
                 DriverManager.getConnection(configuredJdbcUrl, username, password).use { connection ->
                     connection.createStatement().use { statement ->
                         statement.execute(
@@ -263,6 +296,34 @@ class SharedCockroachCluster(
     }
 }
 
+internal fun sharedCockroachNodeLease(
+    fixtureControl: SharedCockroachFixtureControl?,
+): SharedCockroachCluster = SharedCockroachCluster(
+    clock = SystemClock(),
+    fixtureControl = fixtureControl,
+    databaseMode = FixtureDatabaseMode.NONE,
+    initialFixtureDatabasePoolSize = 0,
+)
+
+internal fun uninitializedSharedCockroachDatabaseLease(
+    fixtureControl: SharedCockroachFixtureControl?,
+): SharedCockroachCluster = SharedCockroachCluster(
+    clock = SystemClock(),
+    fixtureControl = fixtureControl,
+    databaseMode = FixtureDatabaseMode.UNINITIALIZED,
+    initialFixtureDatabasePoolSize = 0,
+)
+
+internal fun preinitializedSharedCockroachDatabaseLease(
+    fixtureControl: SharedCockroachFixtureControl?,
+    initialFixtureDatabasePoolSize: Int,
+): SharedCockroachCluster = SharedCockroachCluster(
+    clock = SystemClock(),
+    fixtureControl = fixtureControl,
+    databaseMode = FixtureDatabaseMode.PREINITIALIZED,
+    initialFixtureDatabasePoolSize = initialFixtureDatabasePoolSize,
+)
+
 private object SharedCockroachNode {
     private val processLocalLock = Any()
     private val stateDirectory = sharedCockroachStateDirectory()
@@ -279,10 +340,15 @@ private object SharedCockroachNode {
         leaseName: String,
         clock: Clock,
         fixtureControl: SharedCockroachFixtureControl?,
+        initialFixtureDatabasePoolSize: Int = FIXTURE_DATABASE_READY_POOL_SIZE,
         leaseOwner: SharedProcessIdentity? = null,
         fixtureBuildRuleCacheEntries: List<File> = emptyList(),
         invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive: Boolean = false,
     ): ManagedNodeAcquisition {
+        require(initialFixtureDatabasePoolSize in 0..FIXTURE_DATABASE_POOL_SIZE) {
+            "Initial fixture database-pool size must be between 0 and " +
+                "$FIXTURE_DATABASE_POOL_SIZE, but was $initialFixtureDatabasePoolSize."
+        }
         var leaseWritten = false
         try {
             while (true) {
@@ -359,7 +425,11 @@ private object SharedCockroachNode {
                     )
                     leaseWritten = true
                     try {
-                        launchDaemon(claim, fixtureControl)
+                        launchDaemon(
+                            claim,
+                            fixtureControl,
+                            initialFixtureDatabasePoolSize,
+                        )
                     } catch (failure: Throwable) {
                         try {
                             deleteIfPresent(File(leasesDirectory, leaseName), "failed startup lease")
@@ -478,6 +548,7 @@ private object SharedCockroachNode {
     private fun launchDaemon(
         claim: SharedCockroachOwnerClaim,
         fixtureControl: SharedCockroachFixtureControl?,
+        initialFixtureDatabasePoolSize: Int,
     ) {
         val fixtureJar = File(
             CockroachSuiteFixtureRuntime::class.java.protectionDomain.codeSource.location.toURI(),
@@ -499,6 +570,7 @@ private object SharedCockroachNode {
             claim.workDirectory.absolutePath,
             claim.token,
             fixtureControl?.directory?.canonicalPath ?: "-",
+            initialFixtureDatabasePoolSize.toString(),
         )
             .directory(claim.workDirectory)
             .redirectOutput(File(claim.workDirectory, "daemon.out"))
@@ -863,20 +935,10 @@ private object SharedCockroachNode {
             )
         }
 
-        evidence.filter { process ->
-            process.processGroupId != null &&
-                process.identity.pid != process.processGroupId
-        }.forEach { process ->
-            try {
-                stopProcess(
-                    process.identity,
-                    File(workDirectory, "cockroach.out"),
-                    "recorded process-group member",
-                )
-            } catch (failure: Throwable) {
-                failures += failure
-            }
-        }
+        // Kill each verified owned process group once. Stopping every child first duplicated
+        // forcible signals and serial exit waits on the helper JVM's latency-critical close path;
+        // stopRecordedProcessGroup already verifies the durable leader identity, signals the
+        // complete group, and waits for every member captured below.
         evidence.filter { it.processGroupId != null }
             .groupBy { requireNotNull(it.processGroupId) }
             .forEach { (groupId, members) ->
@@ -2206,7 +2268,8 @@ internal fun prestartSharedCockroachForSession(
     sessionOwner: SharedProcessIdentity,
     fixtureBuildRuleCacheEntries: List<File>,
     invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive: Boolean = false,
-) {
+    initialFixtureDatabasePoolSize: Int = FIXTURE_DATABASE_READY_POOL_SIZE,
+): String {
     val leaseName = "kompile-session-${sessionOwner.pid}-${sessionOwner.startedAt.toEpochMilli()}"
     val acquisition = SharedCockroachNode.acquire(
         leaseName = leaseName,
@@ -2216,27 +2279,7 @@ internal fun prestartSharedCockroachForSession(
         fixtureBuildRuleCacheEntries = fixtureBuildRuleCacheEntries,
         invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive =
             invalidateFixtureBuildRuleCacheEntriesWhileOwnerLive,
+        initialFixtureDatabasePoolSize = initialFixtureDatabasePoolSize,
     )
-    if (java.lang.Boolean.getBoolean(WAIT_FOR_FULL_FIXTURE_POOL_PROPERTY)) {
-        waitForFullFixtureDatabasePool(acquisition.jdbcUrl)
-    }
-}
-
-private fun waitForFullFixtureDatabasePool(adminJdbcUrl: String) {
-    while (true) {
-        val poolSize = DriverManager.getConnection(adminJdbcUrl, "root", "").use { connection ->
-            connection.createStatement().use { statement ->
-                statement.executeQuery(
-                    "SELECT count(*) FROM $FIXTURE_DATABASE_POOL_TABLE",
-                ).use { rows ->
-                    check(rows.next()) {
-                        "Fixture database-pool count query did not return a row."
-                    }
-                    rows.getInt(1)
-                }
-            }
-        }
-        if (poolSize >= FIXTURE_DATABASE_POOL_SIZE) return
-        TimeUnit.MILLISECONDS.sleep(10L)
-    }
+    return acquisition.jdbcUrl
 }

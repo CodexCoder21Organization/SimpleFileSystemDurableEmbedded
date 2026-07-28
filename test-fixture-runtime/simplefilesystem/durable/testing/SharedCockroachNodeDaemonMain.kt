@@ -20,9 +20,10 @@ private const val HEARTBEAT_INTERVAL_MILLIS = 1_000L
 private val daemonProcessLocalStateLock = Any()
 
 fun main(args: Array<String>) {
-    require(args.size == 4) {
+    require(args.size == 5) {
         "SharedCockroachNodeDaemonMain requires <state-directory> <work-directory> " +
-            "<election-token> <control-directory-or-dash>, but received ${args.size} argument(s)."
+            "<election-token> <control-directory-or-dash> <initial-schema-ready-databases>, but " +
+            "received ${args.size} argument(s)."
     }
     val stateDirectory = File(args[0]).canonicalFile
     val workDirectory = requireManagedWorkDirectory(stateDirectory, File(args[1]))
@@ -31,6 +32,12 @@ fun main(args: Array<String>) {
         "Shared CockroachDB daemon election token must not be blank, but was '$token'."
     }
     val controlDirectory = args[3].takeUnless { it == "-" }?.let { File(it).canonicalFile }
+    val initialSchemaReadyDatabases = args[4].toIntOrNull()
+        ?.takeIf { it in 0..FIXTURE_DATABASE_POOL_SIZE }
+        ?: throw IllegalArgumentException(
+            "Shared CockroachDB initial schema-ready database count must be between 0 and " +
+                "$FIXTURE_DATABASE_POOL_SIZE, but was '${args[4]}'.",
+        )
     check(workDirectory.isDirectory || workDirectory.mkdirs()) {
         "Could not create shared CockroachDB daemon work directory ${workDirectory.absolutePath}."
     }
@@ -144,6 +151,21 @@ fun main(args: Array<String>) {
         )
         try {
             requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            if (initialSchemaReadyDatabases > 0 &&
+                controlDirectory != null &&
+                File(controlDirectory, "fail-warmup").isFile
+            ) {
+                // The explicit fault-injection control is known before CockroachDB startup, and
+                // warmUpDurableSchema reports it before touching JDBC. Publish that deterministic
+                // startup failure without spawning a database process that cannot become ready.
+                observeDurableSchemaWarmupControl(
+                    controlDirectory = controlDirectory,
+                    token = token,
+                    ownershipDirectory = stateDirectory,
+                ) {
+                    requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+                }
+            }
             cockroach = startCockroach(
                 stateDirectory,
                 workDirectory,
@@ -184,15 +206,19 @@ fun main(args: Array<String>) {
                 requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
             }
             requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
-            configureSingleNodeTestCluster(cockroach.jdbcUrl)
-            warmUpDurableSchema(
-                adminJdbcUrl = cockroach.jdbcUrl,
-                controlDirectory = controlDirectory,
-                token = token,
-                ownershipDirectory = stateDirectory,
-                targetPoolSize = FIXTURE_DATABASE_READY_POOL_SIZE,
-            ) {
-                requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+            if (initialSchemaReadyDatabases > 0) {
+                warmUpDurableSchema(
+                    adminJdbcUrl = cockroach.jdbcUrl,
+                    controlDirectory = controlDirectory,
+                    token = token,
+                    ownershipDirectory = stateDirectory,
+                    targetPoolSize = initialSchemaReadyDatabases,
+                    prepareCluster = {
+                        configureSingleNodeTestCluster(cockroach.jdbcUrl)
+                    },
+                ) {
+                    requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
+                }
             }
             requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
             publishReadyState(
@@ -202,16 +228,6 @@ fun main(args: Array<String>) {
                 daemonIdentity = daemonIdentity,
                 cockroach = cockroach,
             )
-            warmUpDurableSchema(
-                adminJdbcUrl = cockroach.jdbcUrl,
-                controlDirectory = controlDirectory,
-                token = token,
-                ownershipDirectory = stateDirectory,
-                targetPoolSize = FIXTURE_DATABASE_POOL_SIZE,
-                observeControlBarrier = false,
-            ) {
-                requireAttachedOwnership(stateDirectory, workDirectory, token, daemonIdentity)
-            }
             lifecycle.await()
             if (cockroachExit.isCompletedExceptionally) cockroachExit.join()
             ownershipFailure.get()?.let { throw it }

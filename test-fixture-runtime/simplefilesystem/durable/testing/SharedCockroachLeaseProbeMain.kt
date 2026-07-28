@@ -8,15 +8,32 @@ import simplefilesystem.durable.DurableSimpleFileSystemManager
 import sql.Database
 
 fun main(args: Array<String>) {
-    require(args.size == 2 || args.size == 5 || args.size == 6) {
+    require(args.size == 2 || args.size == 3 || args.size == 5 || args.size == 6) {
         "SharedCockroachLeaseProbeMain requires <ready-file> <release-file> or <ready-file> " +
+            "<release-file> <initial-schema-ready-databases> or <ready-file> " +
             "<release-file> <armed-file> <start-gate> <control-directory-or-dash> " +
-            "[lease-only], but received ${args.size} argument(s)."
+            "[lease-only|node-only|schema-ready], but received ${args.size} argument(s)."
     }
-    require(args.size != 6 || args[5] == "lease-only") {
-        "SharedCockroachLeaseProbeMain optional mode must be 'lease-only', but was '${args[5]}'."
+    require(
+        args.size != 6 ||
+            args[5] == "lease-only" ||
+            args[5] == "node-only" ||
+            args[5] == "schema-ready",
+    ) {
+        "SharedCockroachLeaseProbeMain optional mode must be 'lease-only', 'node-only', or " +
+            "'schema-ready', but was '${args[5]}'."
     }
-    val initializeDurableSchema = args.size != 6
+    val initializeDurableSchema = args.size != 6 && args.size != 3
+    val initialSchemaReadyDatabases = if (args.size == 3) {
+        args[2].toIntOrNull()
+            ?.takeIf { it in 1..FIXTURE_DATABASE_POOL_SIZE }
+            ?: throw IllegalArgumentException(
+                "Shared CockroachDB probe initial schema-ready database count must be between 1 " +
+                    "and $FIXTURE_DATABASE_POOL_SIZE, but was '${args[2]}'.",
+            )
+    } else {
+        FIXTURE_DATABASE_READY_POOL_SIZE
+    }
     val readyFile = File(args[0])
     val releaseFile = File(args[1])
     val control = if (args.size >= 5 && args[4] != "-") {
@@ -34,13 +51,30 @@ fun main(args: Array<String>) {
         )
         waitForFileCreation(File(args[3]))
     }
-    SharedCockroachCluster(fixtureControl = control).start().use { cluster ->
+    val cluster = when {
+        args.size == 6 && args[5] == "node-only" ->
+            sharedCockroachNodeLease(control)
+        args.size == 6 && args[5] == "schema-ready" ->
+            preinitializedSharedCockroachDatabaseLease(
+                control,
+                FIXTURE_DATABASE_READY_POOL_SIZE,
+            )
+        args.size == 6 ->
+            uninitializedSharedCockroachDatabaseLease(control)
+        initialSchemaReadyDatabases > FIXTURE_DATABASE_READY_POOL_SIZE ->
+            preinitializedSharedCockroachDatabaseLease(
+                control,
+                initialSchemaReadyDatabases,
+            )
+        else -> SharedCockroachCluster(fixtureControl = control)
+    }
+    cluster.start().use {
         if (initializeDurableSchema) {
             Database(
                 "org.postgresql.Driver",
-                cluster.jdbcUrl(),
-                cluster.username,
-                cluster.password,
+                it.jdbcUrl(),
+                it.username,
+                it.password,
             ).use { database ->
                 DurableSimpleFileSystemManager(
                     blobstoreService = InMemoryBlobstoreService(),
@@ -50,11 +84,11 @@ fun main(args: Array<String>) {
                 }
             }
         }
-        val diagnostics = cluster.diagnostics()
+        val diagnostics = it.diagnostics()
         writePropertiesAtomically(
             readyFile,
             versionedProperties().apply {
-                setProperty("jdbcUrl", cluster.jdbcUrl())
+                setProperty("jdbcUrl", it.jdbcUrl())
                 setProperty("stateDirectory", diagnostics.stateDirectory.absolutePath)
                 setProperty(
                     "userDirectory",

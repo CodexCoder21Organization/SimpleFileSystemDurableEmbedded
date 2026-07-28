@@ -18,7 +18,10 @@ fun main(args: Array<String>) {
 
     try {
         configureSingleNodeTestCluster(cluster.jdbcUrl())
-        warmUpDurableSchema(cluster.jdbcUrl())
+        warmUpDurableSchema(
+            cluster.jdbcUrl(),
+            targetPoolSize = FIXTURE_DATABASE_DISPATCH_POOL_SIZE,
+        )
         readyFile.parentFile?.let { parent ->
             check(parent.isDirectory || parent.mkdirs()) {
                 "Could not create the shared CockroachDB fixture directory ${parent.absolutePath}"

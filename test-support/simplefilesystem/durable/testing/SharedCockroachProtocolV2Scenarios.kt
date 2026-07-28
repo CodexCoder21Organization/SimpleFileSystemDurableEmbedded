@@ -3,7 +3,10 @@ package simplefilesystem.durable.testing
 import java.io.File
 import java.io.Closeable
 import java.io.RandomAccessFile
+import java.nio.channels.OverlappingFileLockException
+import java.nio.file.FileSystems
 import java.nio.file.Files
+import java.nio.file.StandardWatchEventKinds
 import java.time.Instant
 import java.util.Properties
 import java.util.concurrent.TimeUnit
@@ -15,8 +18,12 @@ object SharedCockroachProtocolV2Scenarios {
         "SIMPLE_FILESYSTEM_DURABLE_HOST_COCKROACH_ADMISSION_HELD"
 
     fun run(scenario: String) {
-        withHostCockroachTestAdmission {
+        if (scenario == "atomic-publication-required") {
             runSharedCockroachProtocolV2ScenarioTest(scenario)
+        } else {
+            withHostCockroachTestAdmission {
+                runSharedCockroachProtocolV2ScenarioTest(scenario)
+            }
         }
     }
 
@@ -28,12 +35,14 @@ object SharedCockroachProtocolV2Scenarios {
 }
 
 /**
- * BuildTest starts four child JVMs on each two-CPU shard. The host lock admits one private
- * fault-injection scenario or externally configured suite fixture at a time while retaining each
- * admitted test's internal thread/process concurrency. Managed tests already share one bounded
- * CockroachDB node and must remain concurrently admissible.
+ * BuildTest starts four child JVMs on each two-CPU shard. Two host slots admit at most one private
+ * fault-injection process tree per core while retaining each admitted test's internal
+ * thread/process concurrency. The filesystem-only atomic-publication scenario does not acquire a
+ * slot. Managed tests already share one bounded CockroachDB node and remain concurrently
+ * admissible.
  */
 private object HostCockroachTestAdmission {
+    private const val SLOT_COUNT = 2
     private val monitor = Any()
     private var referenceCount = 0
     private var access: RandomAccessFile? = null
@@ -42,25 +51,77 @@ private object HostCockroachTestAdmission {
     fun acquire(): Closeable {
         synchronized(monitor) {
             if (referenceCount == 0) {
-                val openedAccess = RandomAccessFile(
-                    File(
-                        System.getProperty("java.io.tmpdir"),
-                        "simplefilesystem-durable-cockroach-test-admission.lock",
-                    ),
-                    "rw",
-                )
-                try {
-                    admissionLock = openedAccess.channel.lock()
-                    access = openedAccess
-                } catch (failure: Throwable) {
-                    openedAccess.close()
-                    throw failure
+                val immediatelyAvailable = (0 until SLOT_COUNT).firstNotNullOfOrNull { slot ->
+                    tryAcquireSlot(slot)
                 }
+                val acquired = immediatelyAvailable ?: acquireNextAvailableSlot()
+                access = acquired.first
+                admissionLock = acquired.second
             }
             referenceCount += 1
         }
         return HostCockroachTestAdmissionLease()
     }
+
+    private fun tryAcquireSlot(
+        slot: Int,
+    ): Pair<RandomAccessFile, java.nio.channels.FileLock>? {
+        val openedAccess = openSlot(slot)
+        return try {
+            val lock = try {
+                openedAccess.channel.tryLock()
+            } catch (_: OverlappingFileLockException) {
+                null
+            }
+            if (lock == null) {
+                openedAccess.close()
+                null
+            } else {
+                openedAccess to lock
+            }
+        } catch (failure: Throwable) {
+            openedAccess.close()
+            throw failure
+        }
+    }
+
+    private fun acquireNextAvailableSlot(
+    ): Pair<RandomAccessFile, java.nio.channels.FileLock> {
+        val tempDirectory = File(System.getProperty("java.io.tmpdir"))
+        val releaseSignal = File(
+            tempDirectory,
+            "simplefilesystem-durable-cockroach-test-admission.signal",
+        )
+        if (!releaseSignal.exists()) {
+            releaseSignal.createNewFile()
+        }
+        FileSystems.getDefault().newWatchService().use { watcher ->
+            tempDirectory.toPath().register(
+                watcher,
+                StandardWatchEventKinds.ENTRY_CREATE,
+                StandardWatchEventKinds.ENTRY_MODIFY,
+            )
+            while (true) {
+                (0 until SLOT_COUNT).firstNotNullOfOrNull(::tryAcquireSlot)?.let {
+                    return it
+                }
+                val key = watcher.take()
+                key.pollEvents()
+                check(key.reset()) {
+                    "Could not continue watching ${tempDirectory.absolutePath} for a shared " +
+                        "CockroachDB host-admission slot."
+                }
+            }
+        }
+    }
+
+    private fun openSlot(slot: Int): RandomAccessFile = RandomAccessFile(
+        File(
+            System.getProperty("java.io.tmpdir"),
+            "simplefilesystem-durable-cockroach-test-admission-$slot.lock",
+        ),
+        "rw",
+    )
 
     fun release() {
         synchronized(monitor) {
@@ -84,6 +145,14 @@ private object HostCockroachTestAdmission {
                 } finally {
                     access = null
                 }
+            }
+            try {
+                File(
+                    System.getProperty("java.io.tmpdir"),
+                    "simplefilesystem-durable-cockroach-test-admission.signal",
+                ).setLastModified(System.currentTimeMillis())
+            } catch (caught: Throwable) {
+                failure?.addSuppressed(caught) ?: run { failure = caught }
             }
             failure?.let { throw it }
         }

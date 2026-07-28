@@ -31,6 +31,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
     val processes = mutableListOf<Process>()
     val releases = mutableListOf<File>()
     val observedIdentities = linkedSetOf<Pair<Long, Long>>()
+    val liveDatabaseDemandBeforeNodeCrash = 5
     var testFailure: Throwable? = null
     try {
         privateTemp = Files.createTempDirectory("durable-cross-process-node-").toFile()
@@ -50,6 +51,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
                 "simplefilesystem.durable.testing.SharedCockroachLeaseProbeMainKt",
                 readyFiles[index].absolutePath,
                 release.absolutePath,
+                liveDatabaseDemandBeforeNodeCrash.toString(),
             )
                 .redirectErrorStream(true)
                 .redirectOutput(File(privateTemp, "child-$index.log"))
@@ -154,6 +156,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "simplefilesystem.durable.testing.SharedCockroachLeaseProbeMainKt",
             stateRecoveryReady.absolutePath,
             stateRecoveryRelease.absolutePath,
+            liveDatabaseDemandBeforeNodeCrash.toString(),
         )
             .redirectErrorStream(true)
             .redirectOutput(File(privateTemp, "child-state-recovery.log"))
@@ -264,6 +267,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "simplefilesystem.durable.testing.SharedCockroachLeaseProbeMainKt",
             staleLeaseRecoveryReady.absolutePath,
             staleLeaseRecoveryRelease.absolutePath,
+            liveDatabaseDemandBeforeNodeCrash.toString(),
         )
             .redirectErrorStream(true)
             .redirectOutput(File(privateTemp, "child-stale-lease-recovery.log"))
@@ -334,6 +338,7 @@ fun testSharedCockroachCrossProcessElectionAndRecovery() {
             "simplefilesystem.durable.testing.SharedCockroachLeaseProbeMainKt",
             recoveryReady.absolutePath,
             recoveryRelease.absolutePath,
+            "1",
         )
             .redirectErrorStream(true)
             .redirectOutput(File(privateTemp, "child-recovery.log"))

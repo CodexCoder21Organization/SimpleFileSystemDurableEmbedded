@@ -30,15 +30,19 @@ Both dispatch paths finish starting the node before any test process begins. `sc
 owns a suite fixture and exports its JDBC URL, while direct `kompile --test .` dependency
 resolution executes the workspace-local fixture Maven artifact and assigns its initial lease to
 the live Kompile session. Forked test JVMs therefore encounter atomic readiness state without
-charging CockroachDB bootstrap to a test's clock. Before publishing readiness, both launch paths
-run the production schema bootstrap in a throwaway database so concurrent test databases reach a
-warm SQL layer. Per-test leases keep the memory-bounded process alive until every isolated logical
-database is finished. The daemon also expires dead lease owners itself, so an interrupted Kompile
-session cannot leave its detached process group running indefinitely. The final lease removes the
-daemon, node records, lease directory, and managed work directories; the state directory and its
-never-replaced lock file remain available for later runs. Direct dispatch retains uniquely named
-databases only until that disposable node stops; a caller-supplied longer-lived fixture drops each
-logical database when its test closes.
+charging CockroachDB bootstrap to a test's clock. Before dispatching tests, both launch paths
+prepare five individually published, production-schema-ready databases: one for each of the four
+workers plus the fixture-isolation test's nested acquisition. Per-test acquisition only claims one
+of those ready rows; it never creates and initializes a database on the test's clock. Released
+databases are reset lazily when next claimed. Private process-protocol scenarios prepare only the
+database capacity their assertions require and do not fill an unused background pool. Per-test
+leases keep the memory-bounded process alive until every isolated logical database is finished.
+The daemon also expires dead lease owners itself, so an interrupted Kompile session cannot leave
+its detached process group running indefinitely. The final lease removes the daemon, node records,
+lease directory, and managed work directories; the state directory and its never-replaced lock
+file remain available for later runs. Direct dispatch retains uniquely named databases only until
+that disposable node stops; a caller-supplied longer-lived fixture drops each logical database
+when its test closes.
 
 kotlin.build distributes prepared module caches only for direct `package.rule()` test
 dependencies. The process-owning fixture and protocol-scenario rules are exposed to tests as

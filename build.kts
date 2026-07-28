@@ -15,6 +15,8 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
+private const val KOMPILE_DISPATCH_FIXTURE_DATABASES = 5
+
 val dependencies = listOf(
     MavenPrebuilt2("simplefilesystem:simplefilesystem-api:0.3.0"),
     MavenPrebuilt2("blobstore.api:blobstore-api:0.0.2"),
@@ -99,13 +101,15 @@ fun buildCockroachSuiteFixtureFatJar(): File = assembleCockroachTestFixtureFatJa
 
 /**
  * Gives protocol-scenario tests their own declared build-rule dependency so additions to the
- * scenario runtime cannot be hidden by a previously resolved fixture annotation.
+ * scenario runtime cannot be hidden by a previously resolved fixture annotation. These tests
+ * create private fault-injection nodes, so assembling their runtime must not also prestart an
+ * unused shard-wide node.
  */
 @MavenArtifactCoordinates(
     "simplefilesystem.durable:simplefilesystem-durable-test-fixture-protocol-v2:",
 )
 fun buildCockroachProtocolV2ConcurrentScenarioFatJar(): File =
-    buildCockroachTestFixtureFatJar()
+    assembleCockroachTestFixtureFatJar()
 
 private fun processCommandArguments(process: ProcessHandle): List<String> {
     val procCommandLine = File("/proc/${process.pid()}/cmdline")
@@ -196,13 +200,13 @@ private fun prestartCockroachForKompileSession(fixtureJar: File) {
         "-XX:+UseSerialGC",
         "-XX:ActiveProcessorCount=1",
         "-XX:TieredStopAtLevel=1",
-        "-Dsimplefilesystem.durable.testing.waitForFullFixturePool=true",
         "-cp",
         fixtureJar.absolutePath,
         "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",
         sessionOwner.pid().toString(),
         sessionStartedAt.toEpochMilli().toString(),
         invalidateCacheWhileOwnerLive.toString(),
+        KOMPILE_DISPATCH_FIXTURE_DATABASES.toString(),
         *cacheEntries.map(File::getAbsolutePath).toTypedArray(),
     )
         .directory(workspace)

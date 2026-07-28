@@ -234,7 +234,9 @@ private class ScenarioHarness(
         if (owner.containsKey("startupDeadlineMillis")) {
             owner.setProperty("startupDeadlineMillis", expiredDeadline.toString())
         }
-        writePropertiesAtomically(ownerFile, owner)
+        withScenarioStateLock(stateDirectory) {
+            writePropertiesAtomically(ownerFile, owner)
+        }
         marker(File(control, "cockroach-before-readiness-release-$token"))
         removeMarker("pause-cockroach-before-readiness")
 
@@ -462,7 +464,11 @@ private class ScenarioHarness(
     fun deterministicContention() = protect {
         val gate = File(runFiles, "contention-start-gate")
         val contenders = (0 until 4).map { index ->
-            startProbe("contender-$index", startGate = gate).also { contender ->
+            startProbe(
+                "contender-$index",
+                startGate = gate,
+                databaseMode = "lease-only",
+            ).also { contender ->
                 waitForFile(contender.armedFile)
             }
         }
@@ -501,6 +507,7 @@ private class ScenarioHarness(
                 name = "managed-admission-$index",
                 startGate = gate,
                 inheritHostAdmission = false,
+                databaseMode = "lease-only",
             ).also { contender ->
                 waitForFile(contender.armedFile)
             }
@@ -575,7 +582,7 @@ private class ScenarioHarness(
     fun warmupPublication() = protect {
         marker("pause-warmup")
         marker("pause-waiter-after-readiness-check")
-        val blocked = startProbe("warmup-blocked")
+        val blocked = startProbe("warmup-blocked", databaseMode = "schema-ready")
         waitForPrefix(control, "warmup-arrived-")
         val stateDirectory = onlyStateDirectory()
         val waiterArrival = waitForPrefix(
@@ -594,6 +601,7 @@ private class ScenarioHarness(
             name = "warmup-failure",
             workspace = failureWorkspace,
             controlDirectory = failureControl,
+            databaseMode = "schema-ready",
         )
 
         releaseStateLockBarrier(waiterArrival)
@@ -656,6 +664,7 @@ private class ScenarioHarness(
             name = "startup-failure",
             workspace = failureWorkspace,
             controlDirectory = failureControl,
+            databaseMode = "schema-ready",
         )
 
         val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(SCENARIO_WAIT_SECONDS)
@@ -834,6 +843,7 @@ private class ScenarioHarness(
             sessionIdentity.pid.toString(),
             sessionIdentity.startedAt.toEpochMilli().toString(),
             "false",
+            "0",
             *fixtureCacheEntries.map(File::getAbsolutePath).toTypedArray(),
         )
             .directory(defaultWorkspace)
@@ -879,13 +889,15 @@ private class ScenarioHarness(
             "Prestarted node did not publish its session-owned lease ${lease.absolutePath}."
         }
         val malformedLease = File(stateDirectory, "leases/malformed-session-sentinel")
-        writePropertiesAtomically(
-            malformedLease,
-            versionedProperties().apply {
-                setProperty("pid", "not-a-session-pid")
-                setProperty("startedAtMillis", "0")
-            },
-        )
+        withScenarioStateLock(stateDirectory) {
+            writePropertiesAtomically(
+                malformedLease,
+                versionedProperties().apply {
+                    setProperty("pid", "not-a-session-pid")
+                    setProperty("startedAtMillis", "0")
+                },
+            )
+        }
 
         sessionOwner.destroyForcibly()
         check(sessionOwner.waitFor(PROCESS_EXIT_SECONDS, TimeUnit.SECONDS)) {
@@ -946,6 +958,7 @@ private class ScenarioHarness(
             sessionIdentity.pid.toString(),
             sessionIdentity.startedAt.toEpochMilli().toString(),
             "true",
+            "0",
             *fixtureCacheEntries.map(File::getAbsolutePath).toTypedArray(),
         )
             .directory(defaultWorkspace)
@@ -1039,13 +1052,15 @@ private class ScenarioHarness(
         )
         val deliberatelyWrongStart = unrelatedIdentity.startedAt.minusSeconds(60L)
         val fakeLease = File(stateDirectory, "leases/pid-reuse")
-        writePropertiesAtomically(
-            fakeLease,
-            versionedProperties().apply {
-                setProperty("pid", unrelatedIdentity.pid.toString())
-                setProperty("startedAtMillis", deliberatelyWrongStart.toEpochMilli().toString())
-            },
-        )
+        withScenarioStateLock(stateDirectory) {
+            writePropertiesAtomically(
+                fakeLease,
+                versionedProperties().apply {
+                    setProperty("pid", unrelatedIdentity.pid.toString())
+                    setProperty("startedAtMillis", deliberatelyWrongStart.toEpochMilli().toString())
+                },
+            )
+        }
         val fakeNodeDirectory = File(stateDirectory, "node-pid-reuse")
         requireDirectory(fakeNodeDirectory)
         writeIdentity(
@@ -1172,6 +1187,7 @@ private class ScenarioHarness(
         startGate: File = File(runFiles, "$name-start-gate").also(::marker),
         controlDirectory: File = control,
         inheritHostAdmission: Boolean = true,
+        databaseMode: String = "node-only",
     ): Probe {
         workspace?.let(::requireDirectory)
         requireDirectory(controlDirectory)
@@ -1191,7 +1207,7 @@ private class ScenarioHarness(
             armed.absolutePath,
             startGate.absolutePath,
             controlDirectory.absolutePath,
-            "lease-only",
+            databaseMode,
         )
         workspace?.let(processBuilder::directory)
         val process = processBuilder
