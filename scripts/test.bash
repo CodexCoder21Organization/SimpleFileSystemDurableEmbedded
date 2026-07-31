@@ -74,7 +74,7 @@ SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL=$(tr -d '\r\n' <"$FIXTURE_READ
 
 # A directory selector dispatches through a fixed four-test pool. On the two-core CI worker,
 # four simultaneous real database scenarios can consume their individual 30-second deadlines
-# while competing for CPU. Kompile 0.0.85 preserves sequential dispatch for explicit file
+# while competing for CPU. Kompile 0.0.93 preserves sequential dispatch for explicit file
 # selectors, so expand only the canonical full-suite request. The legacy conformance script
 # contains eight scenarios and is therefore selected once per function as well.
 REQUESTED_ARGS=("$@")
