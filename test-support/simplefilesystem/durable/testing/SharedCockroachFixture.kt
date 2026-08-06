@@ -108,13 +108,9 @@ internal fun readSharedCockroachFixture(): SharedCockroachFixtureRecord? {
     )
 }
 
-internal fun readLiveSharedCockroachFixture(): SharedCockroachFixtureRecord {
+internal fun readLiveSharedCockroachFixtureOrNull(): SharedCockroachFixtureRecord? {
     val file = sharedCockroachReadyFile()
-    val record = readSharedCockroachFixture() ?: throw IllegalStateException(
-        "The build phase did not publish a shared CockroachDB fixture at ${file.absolutePath}; " +
-            "test bodies never start CockroachDB, so run this test through scripts/test.bash or " +
-            "declare the simplefilesystem-durable-test-fixture build dependency.",
-    )
+    val record = readSharedCockroachFixture() ?: return null
     check(record.sessionOwner.liveHandle() != null) {
         "The shared CockroachDB fixture at ${file.absolutePath} belongs to session process " +
             "${record.sessionOwner.pid}, but that exact process is no longer live. The next build " +

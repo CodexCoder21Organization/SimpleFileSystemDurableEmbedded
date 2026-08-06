@@ -26,21 +26,26 @@ Blobstore in-memory implementation:
 scripts/test.bash --test . --log test_log_file.xml
 ```
 
-Both dispatch paths finish starting the node before any test JVM begins. `scripts/test.bash` starts
-the fixture before invoking Kompile and exports its JDBC URL, while direct Kompile and BuildTest
-dispatch starts it while resolving the workspace-local fixture Maven dependency. CockroachDB runs
-with `GOMAXPROCS=2`, which keeps its internal work moving on the two-CPU CI worker.
+`scripts/test.bash`, and any runner that executes the workspace-local fixture build dependency,
+starts CockroachDB before test dispatch and publishes its JDBC URL in one readiness record. A
+direct Kompile or BuildTest executor that begins without that record uses the same per-test-JVM
+filesystem lock, node state, and lease files as main: the first test JVM starts the real node and
+the final lease holder stops it. CockroachDB runs with `GOMAXPROCS=2`, which keeps its internal work
+moving on the two-CPU CI worker.
 
-One fixture process holds a workspace-scoped owner lock for the complete test-runner session and
-publishes one atomic readiness record. Forked test JVMs only read that record; they never start,
-elect, renew, pool, or stop the node. Each client creates a uniquely named logical database on the
-shared node and drops it when the client closes, so managed clients can run concurrently without a
-host-wide or query-admission queue.
+On the fast path, one fixture process holds a workspace-scoped owner lock for the complete
+test-runner session and publishes one atomic readiness record. Forked test JVMs only read that
+record and never participate in node ownership. The fallback is entered only when the record is
+absent and is limited to main's baseline lock/state/lease mechanism; it does not restore the
+detached daemon, session election, database pool, or admission protocols removed from this branch.
+Each client receives a uniquely named logical database, so clients remain isolated while sharing
+one node.
 
-The workspace state directory uses the v2 namespace plus a SHA-256 digest of the canonical checkout
-path, keeping independent checkouts isolated. The readiness record carries exact process IDs and
-start times for the session owner, fixture owner, and CockroachDB process. A later owner holding the
-same exclusive lock removes stale recorded state before starting a replacement fixture.
+The fast-path state directory uses the v2 namespace plus a SHA-256 digest of the canonical checkout
+path, keeping independent checkouts isolated. Its readiness record carries exact process IDs and
+start times for the session owner, fixture owner, and CockroachDB process. The fallback retains
+main's v1 temporary-directory namespace so independently dispatched test JVMs can find the same
+node and discard stale process records safely.
 
 ## Programmatic example
 

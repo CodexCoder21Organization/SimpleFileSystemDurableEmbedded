@@ -78,9 +78,9 @@ private fun assembleCockroachTestFixtureFatJar(): File = BuildJar(
  * JVM sees a ready node without participating in an election or lifecycle protocol.
  *
  * Tests resolve this rule through its workspace-local Maven coordinate instead of a direct
- * `package.rule()` dependency. BuildTest deliberately prepares and distributes only direct rule
- * dependencies; a process-owning prestart must execute independently in each shard's live runner
- * session and must never be restored from another host's packaged build cache.
+ * `package.rule()` dependency. When a runner executes this rule in its live test session, tests use
+ * the published readiness record. BuildTest can prepare and distribute the artifact without
+ * preserving that process, so runtime acquisition also has main's per-test-JVM fallback.
  */
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 fun buildCockroachTestFixtureFatJar(): File {

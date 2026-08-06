@@ -1,5 +1,7 @@
 package simplefilesystem.durable.testing
 
+import community.kotlin.clocks.simple.Clock
+import community.kotlin.clocks.simple.SystemClock
 import java.io.Closeable
 import java.sql.DriverManager
 import java.util.UUID
@@ -10,15 +12,19 @@ private const val SHARED_COCKROACH_JDBC_URL_ENV =
     "SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL"
 
 /**
- * Attaches one isolated logical database to the real CockroachDB node started during the build
- * phase. Runtime acquisition never starts, elects, renews, or stops the shared node.
+ * Attaches one isolated logical database to a real CockroachDB node. A live build-phase readiness
+ * record is the fast path; direct test dispatch without that record uses main's per-test-JVM
+ * lock/state/lease fallback.
  */
-class SharedCockroachCluster : Closeable {
+class SharedCockroachCluster(
+    private val clock: Clock = SystemClock(),
+) : Closeable {
     private val databaseName = "durable_test_${UUID.randomUUID().toString().replace("-", "")}"
     private var adminJdbcUrl: String? = null
     private var testJdbcUrl: String? = null
     private var fixtureDiagnostics: SharedCockroachFixtureDiagnostics? = null
     private var readyBeforeStart: Boolean? = null
+    private var fallbackNodeLease = false
 
     val username: String = "root"
     val password: String = ""
@@ -28,17 +34,23 @@ class SharedCockroachCluster : Closeable {
         check(adminJdbcUrl == null) {
             "This SharedCockroachCluster was already started."
         }
-        val record = readLiveSharedCockroachFixture()
+        val record = readLiveSharedCockroachFixtureOrNull()
         val configuredJdbcUrl = System.getenv(SHARED_COCKROACH_JDBC_URL_ENV)
             ?.takeIf(String::isNotBlank)
-        if (configuredJdbcUrl != null) {
-            check(configuredJdbcUrl == record.jdbcUrl) {
-                "The configured shared CockroachDB JDBC URL '$configuredJdbcUrl' does not match " +
-                    "the build-phase fixture record '${record.jdbcUrl}' at " +
-                    "${sharedCockroachReadyFile().absolutePath}."
+        val sharedJdbcUrl = if (record != null) {
+            if (configuredJdbcUrl != null) {
+                check(configuredJdbcUrl == record.jdbcUrl) {
+                    "The configured shared CockroachDB JDBC URL '$configuredJdbcUrl' does not match " +
+                        "the build-phase fixture record '${record.jdbcUrl}' at " +
+                        "${sharedCockroachReadyFile().absolutePath}."
+                }
+            }
+            configuredJdbcUrl ?: record.jdbcUrl
+        } else {
+            FallbackCockroachNode.acquire(databaseName, clock).also {
+                fallbackNodeLease = true
             }
         }
-        val sharedJdbcUrl = configuredJdbcUrl ?: record.jdbcUrl
         try {
             Class.forName("org.postgresql.Driver")
             DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
@@ -48,17 +60,26 @@ class SharedCockroachCluster : Closeable {
             }
             adminJdbcUrl = sharedJdbcUrl
             testJdbcUrl = jdbcUrlForDatabase(sharedJdbcUrl, databaseName)
-            fixtureDiagnostics = record.toDiagnostics()
-            readyBeforeStart = true
+            fixtureDiagnostics = record?.toDiagnostics()
+            readyBeforeStart = record != null
             return this
         } catch (failure: Throwable) {
-            runCatching {
-                DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
-                    connection.createStatement().use { statement ->
-                        statement.execute("DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} CASCADE")
+            if (fallbackNodeLease) {
+                runCatching { FallbackCockroachNode.release(databaseName) }
+                    .exceptionOrNull()
+                    ?.let(failure::addSuppressed)
+                fallbackNodeLease = false
+            } else {
+                runCatching {
+                    DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
+                        connection.createStatement().use { statement ->
+                            statement.execute(
+                                "DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} CASCADE",
+                            )
+                        }
                     }
-                }
-            }.exceptionOrNull()?.let(failure::addSuppressed)
+                }.exceptionOrNull()?.let(failure::addSuppressed)
+            }
             throw failure
         }
     }
@@ -71,8 +92,8 @@ class SharedCockroachCluster : Closeable {
 
     fun diagnostics(): SharedCockroachFixtureDiagnostics = fixtureDiagnostics
         ?: throw IllegalStateException(
-            "Shared fixture diagnostics are unavailable because this SharedCockroachCluster has " +
-                "not been started.",
+            "Build-phase fixture diagnostics are unavailable because this SharedCockroachCluster " +
+                "has not been started through the build-phase readiness fast path.",
         )
 
     fun fixtureWasReadyBeforeStart(): Boolean = readyBeforeStart
@@ -89,9 +110,13 @@ class SharedCockroachCluster : Closeable {
         val sharedJdbcUrl = adminJdbcUrl ?: return
         var failure: Throwable? = null
         try {
-            DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
-                connection.createStatement().use { statement ->
-                    statement.execute("DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} CASCADE")
+            if (!fallbackNodeLease) {
+                DriverManager.getConnection(sharedJdbcUrl, username, password).use { connection ->
+                    connection.createStatement().use { statement ->
+                        statement.execute(
+                            "DROP DATABASE IF EXISTS ${quoteIdentifier(databaseName)} CASCADE",
+                        )
+                    }
                 }
             }
         } catch (caught: Throwable) {
@@ -101,6 +126,15 @@ class SharedCockroachCluster : Closeable {
             testJdbcUrl = null
             fixtureDiagnostics = null
             readyBeforeStart = null
+            if (fallbackNodeLease) {
+                try {
+                    FallbackCockroachNode.release(databaseName)
+                } catch (cleanupFailure: Throwable) {
+                    failure?.addSuppressed(cleanupFailure) ?: run { failure = cleanupFailure }
+                } finally {
+                    fallbackNodeLease = false
+                }
+            }
         }
         failure?.let { throw it }
     }

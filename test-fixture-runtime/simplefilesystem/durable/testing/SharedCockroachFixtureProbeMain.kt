@@ -21,7 +21,10 @@ fun main(args: Array<String>) {
     )
     armedFile.writeText("armed")
     waitForFile(startGate)
-    val before = readLiveSharedCockroachFixture()
+    val before = checkNotNull(readLiveSharedCockroachFixtureOrNull()) {
+        "The build-phase fixture probe requires an existing readiness record at " +
+            "${sharedCockroachReadyFile().absolutePath}."
+    }
     val after = ensureSharedCockroachFixtureForSession(sessionOwner, emptyList())
     SharedCockroachCluster().start().use { cluster ->
         val diagnostics = cluster.diagnostics()
