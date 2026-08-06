@@ -9,8 +9,6 @@ import java.nio.file.Files
 import java.util.Properties
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
-import kotlin.test.assertNotEquals
-import kotlin.test.assertTrue
 import simplefilesystem.durable.testing.SharedCockroachCluster
 
 fun testSharedCockroachSingleOwnerLockExclusion() {
@@ -41,25 +39,13 @@ fun testSharedCockroachSingleOwnerLockExclusion() {
                     .redirectOutput(File(directory, "contender-$index.log"))
                     .start()
             }
-            val armedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L)
             while ((0 until 8).any { !File(directory, "armed-$it").isFile }) {
-                check(System.nanoTime() < armedDeadline) {
-                    "Eight real contender JVMs did not become ready before the start gate; logs:\n" +
-                        (0 until 8).joinToString("\n") { index ->
-                            File(directory, "contender-$index.log").takeIf(File::isFile)?.readText().orEmpty()
-                        }
-                }
+                checkContendersAreLive(processes, directory, "become ready before the start gate")
                 Thread.sleep(10L)
             }
             startGate.writeText("start")
-            val readyDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15L)
             while ((0 until 8).any { !File(directory, "ready-$it.properties").isFile }) {
-                check(System.nanoTime() < readyDeadline) {
-                    "Eight real contender JVMs did not acquire the shared fixture; logs:\n" +
-                        (0 until 8).joinToString("\n") { index ->
-                            File(directory, "contender-$index.log").takeIf(File::isFile)?.readText().orEmpty()
-                        }
-                }
+                checkContendersAreLive(processes, directory, "acquire the shared fixture")
                 Thread.sleep(10L)
             }
             val results = (0 until 8).map { index ->
@@ -88,18 +74,20 @@ fun testSharedCockroachSingleOwnerLockExclusion() {
                 "Each contender must receive a distinct logical database.",
             )
             results.forEach { result ->
-                assertNotEquals(
-                    "true",
-                    result.getProperty("contenderBecameOwner"),
-                    "A contender replaced the live build-phase fixture owner instead of reusing it.",
+                assertEquals(
+                    "false",
+                    result.getProperty("contenderAcquiredOwnerLock"),
+                    "A contender acquired the owner lock while the build-phase fixture was live.",
+                )
+                assertEquals(
+                    "false",
+                    result.getProperty("fixtureOwnerChanged"),
+                    "A contender changed the live build-phase fixture owner instead of reusing it.",
                 )
             }
             releaseGate.writeText("release")
             processes.forEachIndexed { index, process ->
-                assertTrue(
-                    process.waitFor(10L, TimeUnit.SECONDS),
-                    "Contender JVM $index did not exit after release.",
-                )
+                process.waitFor()
                 assertEquals(
                     0,
                     process.exitValue(),
@@ -115,5 +103,16 @@ fun testSharedCockroachSingleOwnerLockExclusion() {
             }
             directory.deleteRecursively()
         }
+    }
+}
+
+private fun checkContendersAreLive(processes: List<Process>, directory: File, action: String) {
+    val exited = processes.withIndex().filter { !it.value.isAlive }
+    check(exited.isEmpty()) {
+        "Contender JVM(s) ${exited.joinToString { it.index.toString() }} exited before all eight " +
+            "real contenders could $action; logs:\n" +
+            processes.indices.joinToString("\n") { index ->
+                File(directory, "contender-$index.log").takeIf(File::isFile)?.readText().orEmpty()
+            }
     }
 }

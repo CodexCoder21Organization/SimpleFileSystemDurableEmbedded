@@ -170,10 +170,14 @@ private fun fixtureBuildRuleCacheEntries(sessionOwner: ProcessHandle): List<File
 private fun prestartCockroachForKompileSession(fixtureJar: File) {
     val workspace = File(".").canonicalFile
     val sessionOwner = currentKompileSessionOwner()
+    val cacheEntries = if (processCommandArguments(sessionOwner).any { it == "--build-only" }) {
+        fixtureBuildRuleCacheEntries(sessionOwner)
+    } else {
+        emptyList()
+    }
     val sessionStartedAt = requireNotNull(sessionOwner.info().startInstant().orElse(null)) {
         "The Kompile CLI session process ${sessionOwner.pid()} did not expose its start time."
     }
-    val cacheEntries = fixtureBuildRuleCacheEntries(sessionOwner)
     val javaBinary = File(System.getProperty("java.home"), "bin/java")
     val process = ProcessBuilder(
         javaBinary.absolutePath,

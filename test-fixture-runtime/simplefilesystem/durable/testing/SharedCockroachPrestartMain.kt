@@ -31,6 +31,11 @@ internal fun ensureSharedCockroachFixtureForSession(
     }
     liveFixtureForSession(sessionOwner)?.let { return it }
     val javaBinary = File(System.getProperty("java.home"), "bin/java")
+    val ownerLog = File(sharedCockroachStateDirectory(), "fixture-owner.log").apply {
+        check(parentFile.isDirectory || parentFile.mkdirs()) {
+            "Could not create shared CockroachDB fixture directory ${parentFile.absolutePath}."
+        }
+    }
     val candidate = ProcessBuilder(
         javaBinary.absolutePath,
         "-XX:+UseSerialGC",
@@ -45,7 +50,8 @@ internal fun ensureSharedCockroachFixtureForSession(
         *cacheEntries.map(File::getAbsolutePath).toTypedArray(),
     )
         .directory(File(".").canonicalFile)
-        .inheritIO()
+        .redirectErrorStream(true)
+        .redirectOutput(ProcessBuilder.Redirect.appendTo(ownerLog))
         .start()
     val deadlineNanos = System.nanoTime() + TimeUnit.SECONDS.toNanos(120L)
     try {
@@ -61,7 +67,8 @@ internal fun ensureSharedCockroachFixtureForSession(
                 throw IllegalStateException(
                     "Shared CockroachDB fixture owner candidate ${candidate.pid()} exited with " +
                         "code ${candidate.exitValue()} before publishing " +
-                        "${sharedCockroachReadyFile().absolutePath}.",
+                        "${sharedCockroachReadyFile().absolutePath}. Its output was written to " +
+                        "${ownerLog.absolutePath}.\n${ownerLog.readText()}",
                 )
             }
             check(System.nanoTime() < deadlineNanos) {

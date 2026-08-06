@@ -1,6 +1,7 @@
 package simplefilesystem.durable.testing
 
 import java.io.File
+import java.io.RandomAccessFile
 import java.sql.DriverManager
 import java.util.Properties
 
@@ -24,6 +25,9 @@ fun main(args: Array<String>) {
     val after = ensureSharedCockroachFixtureForSession(sessionOwner, emptyList())
     SharedCockroachCluster().start().use { cluster ->
         val diagnostics = cluster.diagnostics()
+        val contenderAcquiredOwnerLock = RandomAccessFile(diagnostics.lockFile, "rw").use { access ->
+            access.channel.tryLock()?.use { true } ?: false
+        }
         val identity = DriverManager.getConnection(
             cluster.jdbcUrl(),
             cluster.username,
@@ -43,8 +47,9 @@ fun main(args: Array<String>) {
                 setProperty("cockroachPid", diagnostics.cockroachPid.toString())
                 setProperty("clusterId", identity.first)
                 setProperty("databaseName", identity.second)
+                setProperty("contenderAcquiredOwnerLock", contenderAcquiredOwnerLock.toString())
                 setProperty(
-                    "contenderBecameOwner",
+                    "fixtureOwnerChanged",
                     (before.fixtureOwner != after.fixtureOwner).toString(),
                 )
             },
