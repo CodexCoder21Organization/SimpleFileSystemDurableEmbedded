@@ -219,28 +219,6 @@ private fun startCockroach(workDirectory: File): ManagedCockroachProcess {
     }
 }
 
-internal fun configureSingleNodeTestCluster(jdbcUrl: String) {
-    DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
-        connection.createStatement().use { statement ->
-            listOf(
-                "kv.range_split.by_load_enabled",
-                "sql.stats.automatic_collection.enabled",
-                "sql.metrics.statement_details.enabled",
-                "sql.metrics.transaction_details.enabled",
-                "sql.metrics.index_usage_stats.enabled",
-                "sql.stats.flush.enabled",
-                "admission.kv.enabled",
-                "admission.sql_kv_response.enabled",
-                "admission.sql_sql_response.enabled",
-                "admission.elastic_cpu.enabled",
-                "admission.disk_bandwidth_tokens.elastic.enabled",
-            ).forEach { setting ->
-                statement.execute("SET CLUSTER SETTING $setting = false")
-            }
-        }
-    }
-}
-
 private fun canConnect(jdbcUrl: String): Boolean = try {
     Class.forName("org.postgresql.Driver")
     val boundedUrl = jdbcUrl + if (jdbcUrl.contains('?')) "&connectTimeout=2" else "?connectTimeout=2"

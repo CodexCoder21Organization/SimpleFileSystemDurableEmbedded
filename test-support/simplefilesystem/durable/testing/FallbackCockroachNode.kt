@@ -117,7 +117,7 @@ internal object FallbackCockroachNode {
                 "The shared CockroachDB node wrote ${listeningUrlFile.absolutePath}, but a JDBC " +
                     "connection to ${state.jdbcUrl} could not be established"
             }
-            configureFallbackSingleNodeTestCluster(state.jdbcUrl)
+            configureSingleNodeTestCluster(state.jdbcUrl)
             writeState(state)
             return state
         } catch (failure: Throwable) {
@@ -225,28 +225,6 @@ internal object FallbackCockroachNode {
         }
     } catch (_: Exception) {
         false
-    }
-
-    private fun configureFallbackSingleNodeTestCluster(jdbcUrl: String) {
-        DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
-            connection.createStatement().use { statement ->
-                listOf(
-                    "kv.range_split.by_load_enabled",
-                    "sql.stats.automatic_collection.enabled",
-                    "sql.metrics.statement_details.enabled",
-                    "sql.metrics.transaction_details.enabled",
-                    "sql.metrics.index_usage_stats.enabled",
-                    "sql.stats.flush.enabled",
-                    "admission.kv.enabled",
-                    "admission.sql_kv_response.enabled",
-                    "admission.sql_sql_response.enabled",
-                    "admission.elastic_cpu.enabled",
-                    "admission.disk_bandwidth_tokens.elastic.enabled",
-                ).forEach { setting ->
-                    statement.execute("SET CLUSTER SETTING $setting = false")
-                }
-            }
-        }
     }
 
     private fun processIdentityMatches(handle: ProcessHandle, startedAt: Instant): Boolean =
@@ -368,6 +346,28 @@ internal object FallbackCockroachNode {
             throw IllegalStateException(
                 "Could not delete $description at ${file.absolutePath}",
             )
+        }
+    }
+}
+
+internal fun configureSingleNodeTestCluster(jdbcUrl: String) {
+    DriverManager.getConnection(jdbcUrl, "root", "").use { connection ->
+        connection.createStatement().use { statement ->
+            listOf(
+                "kv.range_split.by_load_enabled",
+                "sql.stats.automatic_collection.enabled",
+                "sql.metrics.statement_details.enabled",
+                "sql.metrics.transaction_details.enabled",
+                "sql.metrics.index_usage_stats.enabled",
+                "sql.stats.flush.enabled",
+                "admission.kv.enabled",
+                "admission.sql_kv_response.enabled",
+                "admission.sql_sql_response.enabled",
+                "admission.elastic_cpu.enabled",
+                "admission.disk_bandwidth_tokens.elastic.enabled",
+            ).forEach { setting ->
+                statement.execute("SET CLUSTER SETTING $setting = false")
+            }
         }
     }
 }
