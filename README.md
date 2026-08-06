@@ -41,6 +41,12 @@ detached daemon, session election, database pool, or admission protocols removed
 Each client receives a uniquely named logical database, so clients remain isolated while sharing
 one node.
 
+The fast-path contract scenarios do not rely on whichever runner launched them. Each scenario
+starts the same public prestart entry point in its own temporary workspace, waits for that owner's
+readiness record, runs its clients only against that record, and stops the owner during cleanup.
+The fallback scenario likewise uses its own temporary workspace and explicitly removes every
+fast-path input, so these opposite preconditions cannot leak between concurrent tests.
+
 The fast-path state directory uses the v2 namespace plus a SHA-256 digest of the canonical checkout
 path, keeping independent checkouts isolated. Its readiness record carries exact process IDs and
 start times for the session owner, fixture owner, and CockroachDB process. The fallback retains

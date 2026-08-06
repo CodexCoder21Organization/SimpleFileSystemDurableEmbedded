@@ -41,17 +41,20 @@ internal data class SharedCockroachFixtureRecord(
     val jdbcUrl: String,
     val workDirectory: File,
 ) {
-    fun toDiagnostics(): SharedCockroachFixtureDiagnostics = SharedCockroachFixtureDiagnostics(
-        protocolVersion = SHARED_COCKROACH_FIXTURE_PROTOCOL,
-        stateDirectory = sharedCockroachStateDirectory(),
-        lockFile = sharedCockroachLockFile(),
-        sessionOwnerPid = sessionOwner.pid,
-        sessionOwnerStartedAtMillis = sessionOwner.startedAtMillis,
-        fixtureOwnerPid = fixtureOwner.pid,
-        fixtureOwnerStartedAtMillis = fixtureOwner.startedAtMillis,
-        cockroachPid = cockroach.pid,
-        cockroachStartedAtMillis = cockroach.startedAtMillis,
-    )
+    fun toDiagnostics(
+        workspace: File = File("."),
+    ): SharedCockroachFixtureDiagnostics =
+        SharedCockroachFixtureDiagnostics(
+            protocolVersion = SHARED_COCKROACH_FIXTURE_PROTOCOL,
+            stateDirectory = sharedCockroachStateDirectory(workspace),
+            lockFile = sharedCockroachLockFile(workspace),
+            sessionOwnerPid = sessionOwner.pid,
+            sessionOwnerStartedAtMillis = sessionOwner.startedAtMillis,
+            fixtureOwnerPid = fixtureOwner.pid,
+            fixtureOwnerStartedAtMillis = fixtureOwner.startedAtMillis,
+            cockroachPid = cockroach.pid,
+            cockroachStartedAtMillis = cockroach.startedAtMillis,
+        )
 }
 
 internal fun sharedCockroachStateDirectory(workspace: File = File(".")): File {
@@ -65,9 +68,11 @@ internal fun sharedCockroachStateDirectory(workspace: File = File(".")): File {
     )
 }
 
-internal fun sharedCockroachLockFile(): File = File(sharedCockroachStateDirectory(), "owner.lock")
+internal fun sharedCockroachLockFile(workspace: File = File(".")): File =
+    File(sharedCockroachStateDirectory(workspace), "owner.lock")
 
-internal fun sharedCockroachReadyFile(): File = File(sharedCockroachStateDirectory(), "fixture.properties")
+internal fun sharedCockroachReadyFile(workspace: File = File(".")): File =
+    File(sharedCockroachStateDirectory(workspace), "fixture.properties")
 
 internal fun processIdentity(handle: ProcessHandle, description: String): SharedProcessIdentity {
     val startedAtMillis = handle.info().startInstant().orElse(null)?.toEpochMilli()
@@ -77,8 +82,8 @@ internal fun processIdentity(handle: ProcessHandle, description: String): Shared
     return SharedProcessIdentity(handle.pid(), startedAtMillis)
 }
 
-internal fun readSharedCockroachFixture(): SharedCockroachFixtureRecord? {
-    val file = sharedCockroachReadyFile()
+internal fun readSharedCockroachFixture(workspace: File = File(".")): SharedCockroachFixtureRecord? {
+    val file = sharedCockroachReadyFile(workspace)
     if (!file.isFile) return null
     val properties = Properties().apply { file.inputStream().use(::load) }
     val protocol = required(properties, "protocol", file)
@@ -87,12 +92,12 @@ internal fun readSharedCockroachFixture(): SharedCockroachFixtureRecord? {
             "this checkout requires '$SHARED_COCKROACH_FIXTURE_PROTOCOL'."
     }
     val workspacePath = required(properties, "workspacePath", file)
-    val expectedWorkspacePath = File(".").canonicalFile.absolutePath
+    val expectedWorkspacePath = workspace.canonicalFile.absolutePath
     check(workspacePath == expectedWorkspacePath) {
         "Shared CockroachDB fixture record ${file.absolutePath} belongs to workspace " +
             "'$workspacePath', but the current workspace is '$expectedWorkspacePath'."
     }
-    val stateDirectory = sharedCockroachStateDirectory()
+    val stateDirectory = sharedCockroachStateDirectory(workspace)
     val workDirectory = File(required(properties, "workDirectory", file)).canonicalFile
     check(workDirectory.toPath().startsWith(stateDirectory.canonicalFile.toPath())) {
         "Shared CockroachDB fixture record ${file.absolutePath} contains work directory " +
@@ -108,9 +113,11 @@ internal fun readSharedCockroachFixture(): SharedCockroachFixtureRecord? {
     )
 }
 
-internal fun readLiveSharedCockroachFixtureOrNull(): SharedCockroachFixtureRecord? {
-    val file = sharedCockroachReadyFile()
-    val record = readSharedCockroachFixture() ?: return null
+internal fun readLiveSharedCockroachFixtureOrNull(
+    workspace: File = File("."),
+): SharedCockroachFixtureRecord? {
+    val file = sharedCockroachReadyFile(workspace)
+    val record = readSharedCockroachFixture(workspace) ?: return null
     check(record.sessionOwner.liveHandle() != null) {
         "The shared CockroachDB fixture at ${file.absolutePath} belongs to session process " +
             "${record.sessionOwner.pid}, but that exact process is no longer live. The next build " +

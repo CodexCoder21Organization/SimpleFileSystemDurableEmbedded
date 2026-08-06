@@ -69,6 +69,7 @@ fun testSharedCockroachFallsBackWithoutBuildFixture() {
         probeSource.absolutePath,
         resultFile.absolutePath,
     )
+        .directory(privateTemp)
         .redirectErrorStream(true)
         .redirectOutput(outputFile)
         .also {

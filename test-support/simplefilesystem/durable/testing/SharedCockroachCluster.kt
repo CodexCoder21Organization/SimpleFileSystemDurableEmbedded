@@ -3,6 +3,7 @@ package simplefilesystem.durable.testing
 import community.kotlin.clocks.simple.Clock
 import community.kotlin.clocks.simple.SystemClock
 import java.io.Closeable
+import java.io.File
 import java.sql.DriverManager
 import java.util.UUID
 import org.apache.commons.dbcp2.BasicDataSource
@@ -18,6 +19,9 @@ private const val SHARED_COCKROACH_JDBC_URL_ENV =
  */
 class SharedCockroachCluster(
     private val clock: Clock = SystemClock(),
+    private val workspace: File = File("."),
+    private val configuredSharedJdbcUrl: String? =
+        System.getenv(SHARED_COCKROACH_JDBC_URL_ENV)?.takeIf(String::isNotBlank),
 ) : Closeable {
     private val databaseName = "durable_test_${UUID.randomUUID().toString().replace("-", "")}"
     private var adminJdbcUrl: String? = null
@@ -34,15 +38,14 @@ class SharedCockroachCluster(
         check(adminJdbcUrl == null) {
             "This SharedCockroachCluster was already started."
         }
-        val record = readLiveSharedCockroachFixtureOrNull()
-        val configuredJdbcUrl = System.getenv(SHARED_COCKROACH_JDBC_URL_ENV)
-            ?.takeIf(String::isNotBlank)
+        val record = readLiveSharedCockroachFixtureOrNull(workspace)
+        val configuredJdbcUrl = configuredSharedJdbcUrl
         val sharedJdbcUrl = if (record != null) {
             if (configuredJdbcUrl != null) {
                 check(configuredJdbcUrl == record.jdbcUrl) {
                     "The configured shared CockroachDB JDBC URL '$configuredJdbcUrl' does not match " +
                         "the build-phase fixture record '${record.jdbcUrl}' at " +
-                        "${sharedCockroachReadyFile().absolutePath}."
+                        "${sharedCockroachReadyFile(workspace).absolutePath}."
                 }
             }
             configuredJdbcUrl ?: record.jdbcUrl
@@ -60,7 +63,7 @@ class SharedCockroachCluster(
             }
             adminJdbcUrl = sharedJdbcUrl
             testJdbcUrl = jdbcUrlForDatabase(sharedJdbcUrl, databaseName)
-            fixtureDiagnostics = record?.toDiagnostics()
+            fixtureDiagnostics = record?.toDiagnostics(workspace)
             readyBeforeStart = record != null
             return this
         } catch (failure: Throwable) {
