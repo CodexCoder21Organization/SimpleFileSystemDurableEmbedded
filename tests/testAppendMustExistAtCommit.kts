@@ -1,5 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 @file:WithArtifact("build.kotlin.annotations:build-kotlin-annotations:0.0.2")
 @file:WithArtifact("blobstore.api:blobstore-api:0.0.2")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
@@ -20,12 +20,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 import simplefilesystem.durable.testing.ControlledBlobstoreService
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import sql.Database
 
 fun testAppendMustExistAtCommit() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val blockAppend = AtomicBoolean(false)
             val appendReachedBlobstore = CountDownLatch(1)

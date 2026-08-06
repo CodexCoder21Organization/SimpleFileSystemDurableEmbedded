@@ -1,5 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 @file:WithArtifact("build.kotlin.annotations:build-kotlin-annotations:0.0.2")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
 @file:WithArtifact("sql:sql-api:0.0.1")
@@ -22,12 +22,11 @@ import simplefilesystem.DirectoryNotEmptyException
 import simplefilesystem.FileEntryType
 import simplefilesystem.InvalidMoveException
 import simplefilesystem.PathTypeMismatchException
-import sql.Database
 
 fun testAtomicMoveAndRecursiveDelete() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val manager = DurableSimpleFileSystemManager(InMemoryBlobstoreService(), database, ManualClock(8L))
             val uuid = manager.createFilesystem("trees", 1_000L).uuid

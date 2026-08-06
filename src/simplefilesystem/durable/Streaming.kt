@@ -9,6 +9,7 @@ import simplefilesystem.QuotaArithmeticOverflowException
 import sql.Database
 import java.io.InputStream
 import java.security.MessageDigest
+import java.util.ArrayDeque
 import java.util.UUID
 
 internal class StagedBlockSink(
@@ -77,8 +78,11 @@ internal class StagedBlockSink(
         commitFailure?.let { throw it }
         checkCommitAllowed()
         return try {
-            manager.requireActiveFilesystem(filesystemUuid)
-            if (pendingSize > 0) flushBlock()
+            val pendingBlock = if (pendingSize > 0) {
+                PendingStagedBlock(ordinal, pending.copyOf(pendingSize))
+            } else {
+                null
+            }
             val contentHash = digest.digest().toUpperHex()
             val stage = StagedGeneration(
                 sessionUuid = sessionUuid,
@@ -89,9 +93,9 @@ internal class StagedBlockSink(
                 contentHash = contentHash,
             )
             val metadata = if (append) {
-                manager.commitAppend(stage, appendMustExist)
+                manager.commitAppend(stage, appendMustExist, pendingBlock)
             } else {
-                manager.commitGeneration(stage, unconditional)
+                manager.commitGeneration(stage, unconditional, pendingBlock)
             }
             committedMetadata = metadata
             state = SinkState.COMMITTED
@@ -274,6 +278,8 @@ internal class GenerationSource(
 ) : Source {
     private var remaining: Long = byteCount
     private var nextOrdinal: Int = firstOrdinal
+    private var nextLeaseRenewalAtMillis: Long = manager.sessionLeaseRenewalThreshold()
+    private val pendingBlocks = ArrayDeque<BlockRecord>()
     private var current: InputStream? = null
     private var closed: Boolean = false
     private var readerReleased: Boolean = false
@@ -319,8 +325,18 @@ internal class GenerationSource(
 
     private fun openNextBlock(): InputStream? {
         if (nextOrdinal > lastOrdinal) return null
-        manager.renewReaderSession(readerUuid)
-        val block = manager.block(generationUuid, nextOrdinal++) ?: return null
+        nextLeaseRenewalAtMillis = manager.renewReaderSessionIfDue(
+            readerUuid,
+            nextLeaseRenewalAtMillis,
+        )
+        if (pendingBlocks.isEmpty()) {
+            pendingBlocks.addAll(
+                manager.blockPage(generationUuid, nextOrdinal, lastOrdinal),
+            )
+        }
+        val block = pendingBlocks.pollFirst() ?: return null
+        if (block.ordinal != nextOrdinal) return null
+        nextOrdinal += 1
         val stream = manager.blobstoreService.getBlob(BLOB_PIN_OWNER, block.blobHash)
         var toSkip = skipForNextBlock
         skipForNextBlock = 0L

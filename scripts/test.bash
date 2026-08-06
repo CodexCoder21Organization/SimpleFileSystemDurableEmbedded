@@ -21,12 +21,20 @@ FIXTURE_JAR="$FIXTURE_DIRECTORY/cockroach-suite-fixture.jar"
 FIXTURE_READY_FILE="$FIXTURE_DIRECTORY/jdbc-url"
 FIXTURE_LOG="$FIXTURE_DIRECTORY/fixture.log"
 FIXTURE_PID=""
+# SHA-256 cache key for the process-owning fixture build rule. Remove only this lane-local result
+# index; assembled artifacts stay cached.
+FIXTURE_BUILD_RULE_CACHE_KEYS=(
+  "6c6010b439cafd36cf71e51b5b01af46a2e46dcd791949f8853ef9463528c7d1"
+)
 
 cleanup_fixture() {
   if [ -n "$FIXTURE_PID" ] && kill -0 "$FIXTURE_PID" 2>/dev/null; then
     kill "$FIXTURE_PID"
     wait "$FIXTURE_PID" 2>/dev/null || true
   fi
+  for CACHE_KEY in "${FIXTURE_BUILD_RULE_CACHE_KEYS[@]}"; do
+    rm -f -- "$CACHE_PATH/buildRuleResultIndex/$CACHE_KEY.json"
+  done
   rm -rf "$FIXTURE_DIRECTORY"
 }
 trap cleanup_fixture EXIT
@@ -36,10 +44,10 @@ trap 'exit 143' TERM
 "$JAR_PATH" \
   --cache-location "$CACHE_PATH" \
   -w "$REPO_PATH" \
-  simplefilesystem.durable.buildCockroachTestFixtureFatJar \
+  simplefilesystem.durable.buildCockroachSuiteFixtureFatJar \
   "$FIXTURE_JAR" >/dev/null
 
-java -Xmx128m -jar "$FIXTURE_JAR" "$FIXTURE_READY_FILE" >"$FIXTURE_LOG" 2>&1 &
+java -Xmx128m -jar "$FIXTURE_JAR" "$FIXTURE_READY_FILE" "$$" - >"$FIXTURE_LOG" 2>&1 &
 FIXTURE_PID=$!
 
 for _ in $(seq 1 1200); do
@@ -65,7 +73,7 @@ SIMPLE_FILESYSTEM_DURABLE_TEST_COCKROACH_JDBC_URL=$(tr -d '\r\n' <"$FIXTURE_READ
 
 # A directory selector dispatches through a fixed four-test pool. On the two-core CI worker,
 # four simultaneous real database scenarios can consume their individual 30-second deadlines
-# while competing for CPU. Kompile 0.0.85 preserves sequential dispatch for explicit file
+# while competing for CPU. Kompile 0.0.93 preserves sequential dispatch for explicit file
 # selectors, so expand only the canonical full-suite request. The legacy conformance script
 # contains eight scenarios and is therefore selected once per function as well.
 REQUESTED_ARGS=("$@")

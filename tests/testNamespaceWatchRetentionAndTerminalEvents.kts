@@ -1,5 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 @file:WithArtifact("simplefilesystem:simplefilesystem-api:0.3.0")
 @file:WithArtifact("build.kotlin.annotations:build-kotlin-annotations:0.0.2")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
@@ -20,12 +20,11 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import simplefilesystem.PathWatchResyncRequiredException
 import simplefilesystem.PathWatchTerminalReason
-import sql.Database
 
 fun testNamespaceWatchRetentionAndTerminalEvents() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val database = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val database = cluster.openDatabase()
         try {
             val clock = ManualClock(300L)
             val manager = DurableSimpleFileSystemManager(

@@ -1,5 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
 @file:WithArtifact("sql:sql-api:0.0.1")
 @file:WithArtifact("sql:sql:0.0.2")
@@ -17,12 +17,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import simplefilesystem.durable.testing.SharedCockroachCluster
-import sql.Database
 
 fun testConcurrentSchemaBootstrap() {
     val cluster = SharedCockroachCluster().start()
     val databases = (0 until 8).map {
-        Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        cluster.openDatabase()
     }
     val executor = Executors.newFixedThreadPool(databases.size)
     val ready = CountDownLatch(databases.size)
@@ -67,7 +66,7 @@ fun testConcurrentSchemaBootstrap() {
                         SET schema_version = 1 WHERE singleton = true""".trimIndent(),
             )
             val migrationDatabases = (0 until databases.size).map {
-                Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+                cluster.openDatabase()
             }
             try {
                 val migrationReady = CountDownLatch(migrationDatabases.size)

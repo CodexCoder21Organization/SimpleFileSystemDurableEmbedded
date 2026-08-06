@@ -17,7 +17,7 @@ if [ ! -f "$JAR_PATH" ]; then
     curl -fLo "$COURSIER_PATH" "https://github.com/coursier/launchers/raw/master/coursier"
     chmod +x "$COURSIER_PATH"
   fi
-  CLASSPATH=$("$COURSIER_PATH" fetch --repository https://kotlin.directory/ --repository central kompile.cli:kompile-cli:0.0.85 --classpath)
+  CLASSPATH=$("$COURSIER_PATH" fetch --repository https://kotlin.directory/ --repository central kompile.cli:kompile-cli:0.0.93 --classpath)
   apply_launcher="$SCRIPT_PATH/../jars/.KompileCli.launcher"
   printf '%s\n' '#!/bin/bash' "CLASSPATH='$CLASSPATH'" 'exec java $JAVA_OPTS -cp "$CLASSPATH" kompile.cli.CliKt "$@"' > "$apply_launcher"
   chmod +x "$apply_launcher"

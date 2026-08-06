@@ -26,12 +26,32 @@ Blobstore in-memory implementation:
 scripts/test.bash --test . --log test_log_file.xml
 ```
 
-The test-support library also starts that shared node lazily when tests are dispatched directly
-instead of through `scripts/test.bash`. A cross-process lock ensures the independently forked test
-JVMs converge on one memory-bounded CockroachDB process, while per-test leases keep the process
-alive until every isolated logical database is finished. Direct dispatch retains those uniquely
-named databases only until the disposable in-memory node stops after its final lease; a
-caller-supplied longer-lived fixture drops each logical database when its test closes.
+`scripts/test.bash`, and any runner that executes the workspace-local fixture build dependency,
+starts CockroachDB before test dispatch and publishes its JDBC URL in one readiness record. A
+direct Kompile or BuildTest executor that begins without that record uses the same per-test-JVM
+filesystem lock, node state, and lease files as main: the first test JVM starts the real node and
+the final lease holder stops it. CockroachDB runs with `GOMAXPROCS=2`, which keeps its internal work
+moving on the two-CPU CI worker.
+
+On the fast path, one fixture process holds a workspace-scoped owner lock for the complete
+test-runner session and publishes one atomic readiness record. Forked test JVMs only read that
+record and never participate in node ownership. The fallback is entered only when the record is
+absent and is limited to main's baseline lock/state/lease mechanism; it does not restore the
+detached daemon, session election, database pool, or admission protocols removed from this branch.
+Each client receives a uniquely named logical database, so clients remain isolated while sharing
+one node.
+
+The fast-path contract scenarios do not rely on whichever runner launched them. Each scenario
+starts the same public prestart entry point in its own temporary workspace, waits for that owner's
+readiness record, runs its clients only against that record, and stops the owner during cleanup.
+The fallback scenario likewise uses its own temporary workspace and explicitly removes every
+fast-path input, so these opposite preconditions cannot leak between concurrent tests.
+
+The fast-path state directory uses the v2 namespace plus a SHA-256 digest of the canonical checkout
+path, keeping independent checkouts isolated. Its readiness record carries exact process IDs and
+start times for the session owner, fixture owner, and CockroachDB process. The fallback retains
+main's v1 temporary-directory namespace so independently dispatched test JVMs can find the same
+node and discard stale process records safely.
 
 ## Programmatic example
 

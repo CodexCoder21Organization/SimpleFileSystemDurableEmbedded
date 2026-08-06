@@ -1,5 +1,5 @@
 @file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-embedded:")
-@file:WithArtifact("simplefilesystem.durable.buildCockroachTestFixtureFatJar()")
+@file:WithArtifact("simplefilesystem.durable:simplefilesystem-durable-test-fixture:")
 @file:WithArtifact("community.kotlin.blobstore.inmemory:blobstore-in-memory:0.0.3")
 @file:WithArtifact("sql:sql-api:0.0.1")
 @file:WithArtifact("sql:sql:0.0.2")
@@ -23,13 +23,12 @@ import kotlin.test.assertTrue
 import okio.Buffer
 import simplefilesystem.FilesystemNotFoundException
 import simplefilesystem.durable.testing.ControlledBlobstoreService
-import sql.Database
 
 fun testCockroachRetryAndGlobalLockOrder() {
     val cluster = SharedCockroachCluster().start()
     try {
-        val primaryDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
-        val writerDatabase = Database("org.postgresql.Driver", cluster.jdbcUrl(), cluster.username, cluster.password)
+        val primaryDatabase = cluster.openDatabase()
+        val writerDatabase = cluster.openDatabase()
         try {
             val clock = ManualClock(80_000L)
             val blobs = ControlledBlobstoreService()
