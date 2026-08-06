@@ -21,11 +21,10 @@ FIXTURE_JAR="$FIXTURE_DIRECTORY/cockroach-suite-fixture.jar"
 FIXTURE_READY_FILE="$FIXTURE_DIRECTORY/jdbc-url"
 FIXTURE_LOG="$FIXTURE_DIRECTORY/fixture.log"
 FIXTURE_PID=""
-# SHA-256 cache keys for the two build-rule invocation strings in build.kts that can prestart the
-# managed fixture. Remove only these lane-local result indexes; assembled artifacts stay cached.
+# SHA-256 cache key for the process-owning fixture build rule. Remove only this lane-local result
+# index; assembled artifacts stay cached.
 FIXTURE_BUILD_RULE_CACHE_KEYS=(
   "6c6010b439cafd36cf71e51b5b01af46a2e46dcd791949f8853ef9463528c7d1"
-  "258e67621f998da08dde3db4ad475dc29bf45d8b85bf17451ba07ec7424b4f16"
 )
 
 cleanup_fixture() {
@@ -48,7 +47,7 @@ trap 'exit 143' TERM
   simplefilesystem.durable.buildCockroachSuiteFixtureFatJar \
   "$FIXTURE_JAR" >/dev/null
 
-java -Xmx128m -jar "$FIXTURE_JAR" "$FIXTURE_READY_FILE" >"$FIXTURE_LOG" 2>&1 &
+java -Xmx128m -jar "$FIXTURE_JAR" "$FIXTURE_READY_FILE" "$$" - >"$FIXTURE_LOG" 2>&1 &
 FIXTURE_PID=$!
 
 for _ in $(seq 1 1200); do

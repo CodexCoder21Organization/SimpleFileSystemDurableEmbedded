@@ -15,8 +15,6 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 
-private const val KOMPILE_DISPATCH_FIXTURE_DATABASES = 5
-
 val dependencies = listOf(
     MavenPrebuilt2("simplefilesystem:simplefilesystem-api:0.3.0"),
     MavenPrebuilt2("blobstore.api:blobstore-api:0.0.2"),
@@ -62,9 +60,8 @@ val fixtureRuntimeDependencies = dependencies + testSupportDependencies
 @MavenArtifactCoordinates("simplefilesystem.durable:simplefilesystem-durable-test-fixture-runtime:")
 fun buildCockroachTestFixtureRuntime(): File = buildSimpleKotlinMavenArtifact2(
     coordinates = "simplefilesystem.durable:simplefilesystem-durable-test-fixture-runtime:0.1.2",
-    // This artifact deliberately compiles every repository-owned .kt source tree together. The
-    // fixture runtime invokes the current checkout's production warmup and protocol support, while
-    // this kompile toolchain cannot put sibling build-rule outputs on a *2 builder's classpath.
+    // This toolchain cannot put sibling build-rule outputs on a *2 builder's classpath, so the
+    // fixture jar compiles the repository-owned production and fixture source trees together.
     src = File("."),
     compileDependencies = fixtureRuntimeDependencies,
 )
@@ -76,8 +73,9 @@ private fun assembleCockroachTestFixtureFatJar(): File = BuildJar(
 )
 
 /**
- * Builds the fixture runtime and starts its managed node while Kompile is still resolving test
- * dependencies. The node is therefore warm before any forked test JVM's timeout begins.
+ * Builds the fixture runtime and starts its single owner while Kompile is resolving test
+ * dependencies. The owner holds one workspace lock for the complete runner session, so every test
+ * JVM sees a ready node without participating in an election or lifecycle protocol.
  *
  * Tests resolve this rule through its workspace-local Maven coordinate instead of a direct
  * `package.rule()` dependency. BuildTest deliberately prepares and distributes only direct rule
@@ -98,18 +96,6 @@ fun buildCockroachTestFixtureFatJar(): File {
  * scripts/test.bash owns this process explicitly and exports its JDBC URL to every test.
  */
 fun buildCockroachSuiteFixtureFatJar(): File = assembleCockroachTestFixtureFatJar()
-
-/**
- * Gives protocol-scenario tests their own declared build-rule dependency so additions to the
- * scenario runtime cannot be hidden by a previously resolved fixture annotation. These tests
- * create private fault-injection nodes, so assembling their runtime must not also prestart an
- * unused shard-wide node.
- */
-@MavenArtifactCoordinates(
-    "simplefilesystem.durable:simplefilesystem-durable-test-fixture-protocol-v2:",
-)
-fun buildCockroachProtocolV2ConcurrentScenarioFatJar(): File =
-    assembleCockroachTestFixtureFatJar()
 
 private fun processCommandArguments(process: ProcessHandle): List<String> {
     val procCommandLine = File("/proc/${process.pid()}/cmdline")
@@ -174,22 +160,16 @@ private fun fixtureBuildRuleCacheEntries(sessionOwner: ProcessHandle): List<File
             File(sessionWorkingDirectory, cacheArgument)
         }
     }
-    return listOf(
-        "simplefilesystem.durable.buildCockroachTestFixtureFatJar()",
-        "simplefilesystem.durable.buildCockroachProtocolV2ConcurrentScenarioFatJar()",
-    ).map { invocation ->
-        val key = MessageDigest.getInstance("SHA-256")
-            .digest(invocation.toByteArray(StandardCharsets.UTF_8))
-            .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
-        File(cacheDirectory.canonicalFile, "buildRuleResultIndex/$key.json")
-    }
+    val invocation = "simplefilesystem.durable.buildCockroachTestFixtureFatJar()"
+    val key = MessageDigest.getInstance("SHA-256")
+        .digest(invocation.toByteArray(StandardCharsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    return listOf(File(cacheDirectory.canonicalFile, "buildRuleResultIndex/$key.json"))
 }
 
 private fun prestartCockroachForKompileSession(fixtureJar: File) {
     val workspace = File(".").canonicalFile
     val sessionOwner = currentKompileSessionOwner()
-    val invalidateCacheWhileOwnerLive =
-        processCommandArguments(sessionOwner).any { it == "--build-only" }
     val sessionStartedAt = requireNotNull(sessionOwner.info().startInstant().orElse(null)) {
         "The Kompile CLI session process ${sessionOwner.pid()} did not expose its start time."
     }
@@ -205,8 +185,6 @@ private fun prestartCockroachForKompileSession(fixtureJar: File) {
         "simplefilesystem.durable.testing.SharedCockroachPrestartMainKt",
         sessionOwner.pid().toString(),
         sessionStartedAt.toEpochMilli().toString(),
-        invalidateCacheWhileOwnerLive.toString(),
-        KOMPILE_DISPATCH_FIXTURE_DATABASES.toString(),
         *cacheEntries.map(File::getAbsolutePath).toTypedArray(),
     )
         .directory(workspace)

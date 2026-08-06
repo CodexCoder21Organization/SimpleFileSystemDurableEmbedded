@@ -26,53 +26,21 @@ Blobstore in-memory implementation:
 scripts/test.bash --test . --log test_log_file.xml
 ```
 
-Both dispatch paths finish starting the node before any test process begins. `scripts/test.bash`
-owns a suite fixture and exports its JDBC URL, while direct `kompile --test .` dependency
-resolution executes the workspace-local fixture Maven artifact and assigns its initial lease to
-the live Kompile session. Forked test JVMs therefore encounter atomic readiness state without
-charging CockroachDB bootstrap to a test's clock. Before dispatching tests, both launch paths
-prepare five individually published, production-schema-ready databases: one for each of the four
-workers plus the fixture-isolation test's nested acquisition. Per-test acquisition only claims one
-of those ready rows; it never creates and initializes a database on the test's clock. Released
-databases are reset lazily when next claimed. Private process-protocol scenarios prepare only the
-database capacity their assertions require and do not fill an unused background pool. Per-test
-leases keep the memory-bounded process alive until every isolated logical database is finished.
-The daemon also expires dead lease owners itself, so an interrupted Kompile session cannot leave
-its detached process group running indefinitely. The final lease removes the daemon, node records,
-lease directory, and managed work directories; the state directory and its never-replaced lock
-file remain available for later runs. Direct dispatch retains uniquely named databases only until
-that disposable node stops; a caller-supplied longer-lived fixture drops each logical database
-when its test closes.
+Both dispatch paths finish starting the node before any test JVM begins. `scripts/test.bash` starts
+the fixture before invoking Kompile and exports its JDBC URL, while direct Kompile and BuildTest
+dispatch starts it while resolving the workspace-local fixture Maven dependency. CockroachDB runs
+with `GOMAXPROCS=2`, which keeps its internal work moving on the two-CPU CI worker.
 
-kotlin.build distributes prepared module caches only for direct `package.rule()` test
-dependencies. The process-owning fixture and protocol-scenario rules are exposed to tests as
-workspace-local Maven coordinates instead, so each shard executes prestart in its own live
-`BuildTestRunner` session. Artifact construction remains cached within that shard, while a cache
-snapshot can never substitute another host's already-terminated process lease.
+One fixture process holds a workspace-scoped owner lock for the complete test-runner session and
+publishes one atomic readiness record. Forked test JVMs only read that record; they never start,
+elect, renew, pool, or stop the node. Each client creates a uniquely named logical database on the
+shared node and drops it when the client closes, so managed clients can run concurrently without a
+host-wide or query-admission queue.
 
-The daemon atomically records a versioned warmup attestation immediately before readiness. Node,
-warmup, lease, heartbeat, failure, owner, and work-directory records are parsed independently:
-malformed evidence is preserved and reported rather than treated as missing or stale. Raw PID or
-listening-URL files never establish readiness and cannot bypass schema warmup. Publication fails
-closed when the filesystem cannot provide `ATOMIC_MOVE`.
-
-Managed state uses a `v<protocolVersion>` namespace under `java.io.tmpdir`, scoped by the first 16
-hexadecimal characters of SHA-256 over the canonical workspace root. Launcher-level tests verify
-that Kompile child JVMs in one run inherit the same canonical working directory, so those children
-rendezvous while independent checkouts cannot share fixture records. The workspace-scoped v2
-namespace is disjoint from main's legacy global v1 namespace, so old and new checkouts can run
-concurrently without parsing or modifying each other's records. Every durable record carries the
-protocol version. Foreign-version records are atomically moved unchanged into a versioned
-quarantine, where they cannot poison acquisition or prevent known-version leases from releasing.
-
-The daemon ownership handshake prevents CockroachDB from starting until the daemon has atomically
-attached its PID, process-start time, daemon-led process group, and absolute startup deadline to
-the still-live pre-spawn election claim. Every subsequently spawned CockroachDB child inherits that
-durably recorded group, including the interval immediately after process creation and before child
-identity publication. Heartbeats and readiness checks enforce the startup deadline until readiness
-exists. A subsequent acquire or release detects a dead owner or stale heartbeat, independently
-collects every durable process identity, verifies PID plus start time and group leadership, reaps
-all verified members, confirms them dead, and only then removes recovery evidence.
+The workspace state directory uses the v2 namespace plus a SHA-256 digest of the canonical checkout
+path, keeping independent checkouts isolated. The readiness record carries exact process IDs and
+start times for the session owner, fixture owner, and CockroachDB process. A later owner holding the
+same exclusive lock removes stale recorded state before starting a replacement fixture.
 
 ## Programmatic example
 
